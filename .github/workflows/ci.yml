@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ liburing-dev libyaml-cpp-dev
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Build (AddressSanitizer)
+        run: |
+          cmake -B build_asan -DCMAKE_BUILD_TYPE=Debug -DSANITIZE_ADDRESS=ON
+          cmake --build build_asan -j$(nproc)
+          ctest --test-dir build_asan --output-on-failure

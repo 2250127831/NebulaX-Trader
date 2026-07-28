@@ -1,0 +1,54 @@
+# NebulaX-Trader 全局配置
+# 支持多配置文件切换，启动时通过 --config 指定
+
+market:
+  # 行情数据源类型
+  # simulator : 本地模拟行情（调试/测试用）
+  # websocket : WebSocket 接入虚拟股市
+  # api       : REST API 拉取行情
+  type: simulator
+
+  # 行情源连接参数
+  host: "127.0.0.1"
+  port: 8080
+
+  # io_uring 异步 IO 配置
+  uring_entries: 256
+
+strategy:
+  # 策略名称（对应 strategy/ 目录下的实现）
+  # trend     : 趋势跟踪
+  # momentum  : 动量策略
+  name: trend
+
+  # 并行 Worker 数（对应 SPMC 消费者数）
+  workers: 4
+
+  # 策略参数
+  fast_period: 10
+  slow_period: 30
+
+risk:
+  # 单品种最大持仓
+  max_position: 10000
+
+  # 单日最大亏损（美元）
+  max_daily_loss: 100000.0
+
+execution:
+  # 执行算法
+  # straight  : 直接下单
+  # iceberg   : 冰山单
+  # twap      : 时间加权平均
+  algo: straight
+
+  # 下单超时（毫秒）
+  timeout_ms: 1000
+
+  # 重试次数
+  max_retries: 3
+
+worker:
+  # 线程绑定 CPU（避免线程切换抖动）
+  # 留空表示不绑核
+  cpu_affinity: []

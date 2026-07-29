@@ -39,7 +39,6 @@ target_link_libraries(core PUBLIC yaml-cpp)
 add_library(market
     market/gateway/market_data_gateway.h
     market/parser/tick_parser.h
-    market/simulator/market_simulator.h
 )
 
 target_link_libraries(market PUBLIC core)

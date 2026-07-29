@@ -30,7 +30,7 @@ NebulaX-Trader 是一个基于 C++ 构建的低延迟量化交易基础设施项
 
 现代量化交易系统通常需要同时满足：
 
-- 高吞吐行情处理；
+- 高吞吐 Tick 处理；
 - 微秒级延迟响应；
 - 稳定的尾延迟；
 - 多策略并行运行；
@@ -84,7 +84,7 @@ NebulaX-Trader 希望通过工程实践探索完整交易链路中的性能优�
 
 ## 多策略交易架构
 
-支持多个策略同时消费行情：
+支持多个策略同时消费 Tick：
 
 - 趋势策略；
 - 动量策略；
@@ -122,7 +122,9 @@ NebulaX-Trader
 ├── README.md
 ├── .gitignore
 ├── docs/
-│   ├── VERSION_PLAN.md
+│   ├── VERSION_PLAN.md                    # 版本规划
+│   ├── MARKET_DATA_DECISION.md            # Tick 数据源选型决策
+│   ├── PACKET_LOSS_NOTES.md              # 补包机制思考记录
 │   ├── design/                          # 详细设计文档
 │   │   └── .gitkeep
 │   ├── benchmark/                       # 性能测试报告
@@ -156,8 +158,6 @@ NebulaX-Trader
 │   │   └── market_data_gateway.h        # 行情网关（io_uring 接入）
 │   ├── parser/
 │   │   └── tick_parser.h                # Tick 解析器
-│   └── simulator/
-│       └── market_simulator.h           # 市场模拟器（本地测试用）
 ├── strategy/
 │   ├── base/
 │   │   └── strategy.h                   # 策略基类
@@ -205,15 +205,9 @@ NebulaX-Trader
 
 负责：
 
-- 行情接入；
-- Tick解析；
-- 市场数据模拟。
-
-
-未来支持：
-
-- 多行情源；
-- 高性能网络接入。
+- 行情接入（UDP 原始二进制流）；
+- ITCH/STEP/LWSP 协议解析；
+- 高性能网络接入（io_uring）。
 
 
 ---
@@ -307,7 +301,7 @@ Order Management System。
 各版本内容：
 
 - V1：高性能交易流水线（单策略、核心链路）
-- V2：并行行情处理（SPMC 多消费者）
+- V2：并行 Tick 处理（SPMC 多消费者）
 - V3：多策略 Tick 广播
 - V4：多市场行情接入
 - V5：低延迟系统优化（CPU / Cache / eBPF）
@@ -339,29 +333,29 @@ Order Management System。
 
 # 技术栈
 
-## Language
+## 语言
 
 - C++20
 
 
-## Build
+## 构建
 
 - CMake
 
 
-## Platform
+## 平台
 
 - Linux
 
 
-## Performance Tools
+## 性能工具
 
 - perf
 - FlameGraph
 - eBPF
 
 
-## Networking
+## 网络
 
 - io_uring
 - (Future) DPDK
@@ -369,38 +363,9 @@ Order Management System。
 
 ---
 
-# Related Project
+# 关联项目
 
-[NebulaX](https://github.com/2250127831/NebulaX)
-
-High Performance Matching Engine
-
-关注：
-
-- 订单簿设计；
-- 撮合算法；
-- 交易所内部低延迟优化。
-
-
-NebulaX-Trader 与 NebulaX 共同组成完整交易系统：
-
-
-```
-             ╔═══════════════════╗
-             ║   NebulaX-Trader  ║
-             ║   (交易终端)       ║
-             ╚════════╤══════════╝
-                      │ Order
-             ╔════════╧══════════╗
-             ║   Exchange        ║
-             ║   (交易所)         ║
-             ╚════════╤══════════╝
-                      │
-             ╔════════╧══════════╗
-             ║   NebulaX         ║
-             ║   (撮合引擎)       ║
-             ╚═══════════════════╝
-```
+[NebulaX](https://github.com/2250127831/NebulaX) — High Performance Matching Engine
 
 
 ---

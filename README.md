@@ -117,17 +117,23 @@ NebulaX-Trader 希望通过工程实践探索完整交易链路中的性能优�
 
 ```
 NebulaX-Trader
-├── main.cpp                          # 程序主入口
+├── main.cpp                              # 程序主入口
 ├── CMakeLists.txt
 ├── README.md
 ├── .gitignore
+├── LICENSE
+├── .github/
+│   └── workflows/
+│       └── ci.yml                        # CI 配置（GitHub Actions）
+├── config/
+│   └── default.yaml                      # 默认全局配置（YAML）
 ├── docs/
-│   ├── VERSION_PLAN.md                    # 版本规划
-│   ├── MARKET_DATA_DECISION.md            # Tick 数据源选型决策
-│   ├── PACKET_LOSS_NOTES.md              # 补包机制思考记录
-│   ├── design/                          # 详细设计文档
+│   ├── VERSION_PLAN.md                   # 版本规划
+│   ├── MARKET_DATA_DECISION.md           # Tick 数据源选型决策
+│   ├── PACKET_LOSS_NOTES.md             # 补包机制思考记录
+│   ├── design/                           # 详细设计文档
 │   │   └── .gitkeep
-│   ├── benchmark/                       # 性能测试报告
+│   ├── benchmark/                        # 性能测试报告
 │   │   ├── v1/
 │   │   │   └── .gitkeep
 │   │   └── v2/
@@ -135,29 +141,27 @@ NebulaX-Trader
 │   └── images/
 │       ├── V1架构图.png
 │       └── 目标架构图.png
-├── .github/
-│   └── workflows/
-│       └── ci.yml                        # CI 配置（GitHub Actions）
-├── config/                              # 配置文件
-│   └── default.yaml                      # 默认全局配置（YAML）
-├── scripts/                             # 工具脚本
+├── scripts/                              # 工具脚本
 │   └── .gitkeep
 ├── core/
-│   ├── types.h                          # 核心数据结构（Tick / Order）
-│   ├── config.h                         # 配置结构体定义
-│   ├── config_loader.cpp                # YAML 配置解析器
+│   ├── types.h                           # 核心数据结构（Tick / Order）
+│   ├── config.h                          # 配置结构体定义
+│   ├── config_loader.cpp                 # YAML 配置解析器
 │   ├── memory/
-│   │   └── memory_pool.h               # 内存池
+│   │   └── memory_pool.h                # 内存池
 │   ├── queue/
-│   │   ├── spsc_byte_ring.h             # SPSC 无锁环形队列（迁移自 NebulaX）
-│   │   └── spmc_ring.h                  # SPMC 无锁环形队列
+│   │   ├── spsc_byte_ring.h              # SPSC 无锁环形队列（迁移自 NebulaX）
+│   │   └── spmc_ring.h                   # SPMC 无锁环形队列
+│   ├── net/
+│   │   ├── i_market_data_receiver.h       # 行情接收抽象层（IMarketDataReceiver）
+│   │   └── io_uring_receiver.h            # io_uring 后端实现（V1 默认）
 │   └── utils/
-│       └── align.h                      # Cache line 对齐工具
+│       └── align.h                       # Cache line 对齐工具
 ├── market/
 │   ├── gateway/
-│   │   └── market_data_gateway.h        # 行情网关（io_uring 接入）
-│   ├── parser/
-│   │   └── tick_parser.h                # Tick 解析器
+│   │   └── market_data_gateway.h         # 行情网关（基于 IMarketDataReceiver）
+│   └── parser/
+│       └── tick_parser.h                 # Tick 解析器
 ├── strategy/
 │   ├── base/
 │   │   └── strategy.h                   # 策略基类
@@ -300,12 +304,12 @@ Order Management System。
 
 各版本内容：
 
-- V1：高性能交易流水线（单策略、核心链路）
-- V2：并行 Tick 处理（SPMC 多消费者）
-- V3：多策略 Tick 广播
-- V4：多市场行情接入
-- V5：低延迟系统优化（CPU / Cache / eBPF）
-- V6：Kernel Bypass 网络
+- V1：单线程交易闭环（io_uring，Benchmark 基线）
+- V2：并行 Pipeline（SPMC / 多连接）
+- V3：多策略平台（Strategy Manager / 风控）
+- V4：网络接收层抽象（IMarketDataReceiver + AF_XDP）
+- V5：L2 真实行情接入（上证/深证 UDP 原始流）
+- V6：DPDK 高性能网络后端（三种后端 Benchmark）
 
 
 ---

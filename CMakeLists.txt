@@ -32,6 +32,7 @@ add_library(core
     core/utils/align.h
     core/net/i_market_data_receiver.h
     core/net/io_uring_receiver.h
+    core/ipc/flow_control.h
 )
 
 target_include_directories(core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

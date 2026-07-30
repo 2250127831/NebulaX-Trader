@@ -14,3 +14,6 @@ Thumbs.db
 
 # Docs generated
 docs/benchmark/**/*.png
+
+# Test data (ITCH binaries, etc.)
+test_data/

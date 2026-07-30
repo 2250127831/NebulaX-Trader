@@ -134,10 +134,7 @@ NebulaX-Trader
 │   ├── design/                           # 详细设计文档
 │   │   └── .gitkeep
 │   ├── benchmark/                        # 性能测试报告
-│   │   ├── v1/
-│   │   │   └── .gitkeep
-│   │   └── v2/
-│   │       └── .gitkeep
+│   │   └── trader_benchmark_usage.md      # 压测客户端使用说明
 │   └── images/
 │       ├── V1架构图.png
 │       └── 目标架构图.png
@@ -155,6 +152,8 @@ NebulaX-Trader
 │   ├── net/
 │   │   ├── i_market_data_receiver.h       # 行情接收抽象层（IMarketDataReceiver）
 │   │   └── io_uring_receiver.h            # io_uring 后端实现（V1 默认）
+│   ├── ipc/
+│   │   └── flow_control.h                # 压测流量控制共享内存
 │   └── utils/
 │       └── align.h                       # Cache line 对齐工具
 ├── market/

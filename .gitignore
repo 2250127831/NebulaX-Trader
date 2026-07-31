@@ -1,6 +1,10 @@
 # Build
 build/
+build_asan/
 cmake-build-*/
+
+# CodeGraph 索引
+.codegraph/
 
 # IDE
 .vscode/

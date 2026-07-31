@@ -14,19 +14,10 @@
 #include <arpa/inet.h>
 #include <cerrno>
 
-// ── ITCH 5.0 消息体长度（不含 9 字节头）──
-static constexpr int MSG_BODY_LEN(char t) {
-    switch (t) {
-        case 'A': return 40; case 'B': return 35; case 'C': return 35;
-        case 'D': return 11; case 'E': return 31; case 'F': return 39;
-        case 'H': return 19; case 'L': return 25; case 'N': return 21;
-        case 'O': return 19; case 'P': return 43; case 'Q': return 39;
-        case 'R': return 37; case 'S': return 7;  case 'T': return 19;
-        case 'U': return 11; case 'X': return 19; case 'Y': return 19;
-        default:  return 0;
-    }
-}
-
+// ── ITCH 5.0 消息边界 ──
+// 每条消息以 2 字节 big-endian 长度前缀开头（length = 含 type 的消息体长度，不含前缀本身）。
+// 完整消息 = 2 字节前缀 + length。
+// 发送按此边界切分，逐条作为独立 UDP 包发出。
 struct Config {
     const char* file  = "test_data/itch_sample.bin";
     const char* host  = "127.0.0.1";
@@ -98,14 +89,15 @@ int main(int argc, char* argv[]) {
     auto t_start = std::chrono::steady_clock::now();
     uint64_t slowdown_ns = 0;
 
-    while (pos + 9 <= static_cast<size_t>(file_size)) {
-        uint8_t type = buf[pos + 8];
-        int body_len = MSG_BODY_LEN(char(type));
-        if (body_len == 0) {  // 未知类型，滑动窗口
+    while (pos + 2 <= static_cast<size_t>(file_size)) {
+        // ITCH 5.0: 2 字节 big-endian 长度前缀 = 含 type 的消息体长度
+        uint16_t body_len = ntohs(*(const uint16_t*)(buf + pos));
+        if (body_len < 1 || body_len > 200) {
+            // 损坏的前缀：跳过 1 字节继续尝试对齐
             ++pos; ++extra_bytes;
             continue;
         }
-        size_t msg_len = 9 + static_cast<size_t>(body_len);
+        size_t msg_len = 2 + static_cast<size_t>(body_len);
         if (pos + msg_len > static_cast<size_t>(file_size)) break;
 
         ssize_t r = sendto(sock, buf + pos, msg_len, 0,

@@ -8,6 +8,15 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ── 外部依赖 ──
 find_package(yaml-cpp REQUIRED)
 
+# io_uring（照搬 NebulaX 配置：pkg-config，静态优先）
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBURING REQUIRED liburing)
+if(LIBURING_STATIC_LIBRARIES)
+    set(URING_LIBS ${LIBURING_STATIC_LIBRARIES})
+else()
+    set(URING_LIBS ${LIBURING_LIBRARIES})
+endif()
+
 # ── 编译选项 ──
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic -march=native -mtune=native)
@@ -31,12 +40,18 @@ add_library(core
     core/memory/memory_pool.h
     core/utils/align.h
     core/net/i_market_data_receiver.h
+    core/net/i_market_data_sender.h
+    core/net/io_uring_poller.h
     core/net/io_uring_receiver.h
+    core/net/io_uring_receiver.cpp
+    core/net/io_uring_sender.h
+    core/net/io_uring_sender.cpp
     core/ipc/flow_control.h
 )
 
 target_include_directories(core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(core PUBLIC yaml-cpp)
+target_link_libraries(core PUBLIC yaml-cpp ${URING_LIBS})
+target_include_directories(core PUBLIC ${LIBURING_INCLUDE_DIRS})
 
 # ── 行情模块 ──
 add_library(market
@@ -117,3 +132,20 @@ add_executable(it_tick_pipeline
 )
 target_link_libraries(it_tick_pipeline PRIVATE core market strategy)
 add_test(NAME it_tick_pipeline COMMAND it_tick_pipeline)
+
+add_executable(ut_uring
+    tests/integration/test_io_uring.cpp
+)
+target_link_libraries(ut_uring PRIVATE core)
+add_test(NAME ut_uring COMMAND ut_uring)
+
+# 端到端验证：benchmark 发送 + IoUringReceiver 接收逐字节比对
+add_executable(ut_benchmark_verify
+    tests/integration/test_benchmark_verify.cpp
+)
+target_link_libraries(ut_benchmark_verify PRIVATE core)
+add_test(NAME ut_benchmark_verify
+    COMMAND ut_benchmark_verify
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_test_small.bin
+        8080
+        $<TARGET_FILE:trader_benchmark>)

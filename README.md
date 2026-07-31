@@ -182,7 +182,9 @@ NebulaX-Trader
     │   ├── test_spsc.cpp                # SPSC 单元测试
     │   └── test_spmc.cpp                # SPMC 单元测试
     └── integration/
-        └── test_tick_pipeline.cpp       # 全链路流水线集成测试
+        ├── test_tick_pipeline.cpp       # 全链路流水线集成测试
+        ├── test_io_uring.cpp            # IoUringReceiver/Sender 回环收发测试
+        └── test_benchmark_verify.cpp    # 端到端：benchmark 发送↔接收逐字节比对
 ```
 
 

@@ -1,24 +1,30 @@
-# 端到端验证：benchmark 发送 ↔ IoUringReceiver 接收
+# 端到端验证：benchmark 发送 ↔ 接收抽象接口
 
 ## 作用
 
-验证完整链路的字节一致性：真实压测脚本 `trader_benchmark` 读取 ITCH 二进制流经 UDP 发送，`IoUringReceiver` 接收，逐字节核对收到的二进制流与源文件**内容完全一致**。
+验证完整链路的字节一致性：真实压测脚本 `trader_benchmark` 读取 ITCH 二进制流经 UDP 发送，接收端通过抽象接口 `IMarketDataReceiver` 接收，逐字节核对收到的二进制流与源文件**内容完全一致**。
 
 覆盖：
 - `trader_benchmark` 的 ITCH 消息切分与发送
-- `IoUringReceiver` 的 io_uring 接收（含固定缓冲区、POLL_FIRST）
+- **接口抽象**：测试主体只操作 `IMarketDataReceiver*`，具体后端由 `make_receiver()` 工厂实例化
+- 后端实现（当前为 `IoUringReceiver`：固定缓冲区、POLL_FIRST）
 - UDP 传输（无丢包前提下字节完整）
 
 ## 测试形态
 
 `tests/integration/test_benchmark_verify.cpp`（`ut_benchmark_verify`）：
 
-1. 用 `IoUringReceiver` 绑定测试端口（阻塞模式）
-2. 置 flow_control `ready`，fork + exec `trader_benchmark` 子进程发送
-3. 子进程发完即止；父进程阻塞收满 `期望字节数`
-4. 逐字节比对收到的字节流与"期望流"
+1. 通过抽象接口 `IMarketDataReceiver*` 创建接收端（`make_receiver()` 工厂，换后端只改这一处）
+2. **接收线程**先以非阻塞模式预热一次 recv（submit SQE 进内核），置 `armed` 就绪屏障
+3. 主线程等 `armed` 屏障后才 fork + exec `trader_benchmark` 子进程发送
+4. 接收线程阻塞收满 `期望字节数`；主线程等 `done` 有 8s 超时，超时则 `stop()` 打断
+5. 逐字节比对收到的字节流与期望流
 
-**期望流**：用与 benchmark 相同的 `MSG_BODY_LEN` 逻辑，从源文件重建 benchmark 应发送的字节流（`rebuild_expected()`）。
+**期望流**：用与 benchmark 相同的**长度前缀逻辑**（2 字节 big-endian）从源文件重建，`rebuild_expected()`。修复解析后，期望流 = 源文件完整字节流。
+
+### 接收就绪屏障（时序安全）
+
+接收线程**先提交 SQE 进内核、再放行主线程 fork**，保证无论接收端准备多久，子进程都不可能早于"内核已在收包"之前发包。相比"fork 后边收边等"，这是设计保证而非碰巧安全。
 
 ## 关键设计点
 
@@ -44,8 +50,8 @@
 # 全量测试（含此测试）
 ctest --test-dir build --output-on-failure
 
-# 单独运行
-./build/ut_benchmark_verify test_data/itch_test_small.bin 8080 ./build/trader_benchmark
+# 单独运行（第 4 参可选指定后端，默认 io_uring）
+./build/ut_benchmark_verify test_data/itch_test_small.bin 8080 ./build/trader_benchmark io_uring
 ```
 
 ## 测试数据

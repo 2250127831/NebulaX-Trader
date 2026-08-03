@@ -64,13 +64,10 @@ public:
                 msg_buf[3] = pkt[pos + 1];    // [len 2 低字节]
                 memcpy(msg_buf + 4, pkt + pos + 2, body_len);  // 消息体
 
-                // 推入 ring（满则忙等，等消费者释放）
-                size_t off = 0;
-                while (off < msg_len + 2) {
-                    size_t w = ring_.push(msg_buf + off, msg_len + 2 - off);
-                    if (w == 0) { __builtin_ia32_pause(); continue; }
-                    off += w;
-                }
+                // 推入 ring: 一次 push 整条消息(消息级, 让 push 处理跨回绕空洞)。
+                // push 返回 0 = 空间不足(含空洞跨越后仍不足), 忙等消费者释放。
+                while (ring_.push(msg_buf, msg_len + 2) == 0)
+                    __builtin_ia32_pause();
 
                 pos += msg_len;
                 ++unpacked;

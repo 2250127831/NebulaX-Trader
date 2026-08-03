@@ -42,27 +42,37 @@ public:
         // 保证看到消费者已 release 的进度), 计算空闲空间。
         size_t head = head_.load(std::memory_order_acquire);
         size_t tail = tail_.load(std::memory_order_relaxed);
-        // 用有符号差判断满: tail - head 可能因时序略超 capacity(下溢为巨大数),
-        // 直接按 >= capacity 视为满, 返回 0 等待消费者释放(避免覆盖未读数据)。
-        int64_t used = static_cast<int64_t>(tail) - static_cast<int64_t>(head);
-        if (used >= static_cast<int64_t>(capacity_) || used < 0) return 0;
-        size_t free = capacity_ - static_cast<size_t>(used);
-        if (free == 0 || len == 0) return 0;
+        size_t mask = capacity_ - 1;
+        size_t pos  = tail & mask;
 
-        size_t actual = (len < free) ? len : free;
-        size_t mask   = capacity_ - 1;
-        size_t pos    = tail & mask;
+        // 不跨回绕: 整条放尾部剩余, 正常写
+        if (pos + len <= capacity_) {
+            size_t free = capacity_ - (tail - head);
+            if (free < len || len == 0) return 0;
+            memcpy(buf_ + pos, data, len);
+            tail_.store(tail + len, std::memory_order_release);
+            return len;
+        }
 
-        size_t n1 = capacity_ - pos;
-        if (n1 > actual) n1 = actual;
-        if (n1 > 0) memcpy(buf_ + pos, data, n1);
-
-        size_t n2 = actual - n1;
-        if (n2 > 0)
-            memcpy(buf_, static_cast<const uint8_t*>(data) + n1, n2);
-
-        tail_.store(tail + actual, std::memory_order_release);
-        return actual;
+        // 跨回绕: 空洞方案。尾部剩余空间标为空洞, tail 跨越到物理开头写整条。
+        // 约定(与消费者共享):
+        //   - 尾部剩余 >= 4: 写空洞头 [seq=0][len=0], 消费者读 len==0 跳过
+        //   - 尾部剩余 <  4: 不写(生产者不用 <4 的尾部), 消费者读到尾部<4 直接跳过
+        // 消息不跨回绕 → 消费者读连续数据, 无拼段竞态(根治 flaky)。
+        size_t aligned = (tail / capacity_ + 1) * capacity_;   // 下一圈开头
+        if (aligned + len > head + capacity_) return 0;         // 物理开头空间不足
+        size_t tail_room = capacity_ - pos;
+        if (tail_room >= 4) {
+            // 空洞头: [seq 0][len 0], 只填 len=0(消费者据此识别), seq 填 0
+            buf_[pos + 0] = 0;
+            buf_[pos + 1] = 0;
+            buf_[pos + 2] = 0;   // len 高字节
+            buf_[pos + 3] = 0;   // len 低字节 = 0 (空洞)
+        }
+        // tail_room < 4: 不写, 消费者读到尾部<4 即跳过(生产者不用 <4 尾部)
+        memcpy(buf_, data, len);            // 消息写物理开头
+        tail_.store(aligned + len, std::memory_order_release);
+        return len;
     }
 
     // ── consumer: 零拷贝读 ──

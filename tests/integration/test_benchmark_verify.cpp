@@ -18,6 +18,9 @@
 #include "market/pipeline/mold_udp_unpacker.h"
 #include "market/book/order_book_consumer.h"
 #include "strategy/kline/kline_aggregator.h"
+#include "strategy/trend/trend_strategy.h"
+#include "strategy/momentum/momentum_strategy.h"
+#include "strategy/combo/signal_combiner.h"
 #include "strategy/tick/price_breakout_strategy.h"
 #include "strategy/tick/tick_momentum_strategy.h"
 #include "strategy/tick/trade_direction_strategy.h"
@@ -130,7 +133,16 @@ int main(int argc, char* argv[]) {
     PriceBreakoutStrategy pbs;
     TradeDirectionStrategy tds;
     TickMomentumStrategy tms;
-    KLineAggregator kagg(60000000000ull);
+    KLineAggregator kagg(0, 10);   // 按数量: 每 10 笔成交一根 K线(与时间无关, 回放小数据也成形)
+    TrendStrategy trend;            // 低频主策略候选(趋势, 需长周期均线)
+    MomentumStrategy mom;           // 低频主策略(动量, 需 6 根 K线即成形)
+    SignalCombiner combiner;        // 主从分层: 主定方向, 从定强度
+    kagg.set_sink([&](const KLine& bar) { trend.on_bar(bar); mom.on_bar(bar); });  // K线 → 低频主策略
+
+    // 通道 B 策略(线程间共享, 提前声明)
+    OrderBookConsumer obc;
+    OrderBookImbalanceStrategy obi;
+    OrderFlowImbalanceStrategy ofi;
 
     // ── 交易侧: 信号 → 执行引擎(风控 + OMS) → 真发送到模拟交易所 ──
     OrderManager om;
@@ -209,28 +221,33 @@ int main(int argc, char* argv[]) {
     // 交易侧: 信号翻转时经执行引擎真发送(风控→OMS→模拟交易所→回报)
     std::thread strategy_th([&]() {
         MarketEvent ev;
-        OrderSide last_side[4] = {OrderSide::NONE, OrderSide::NONE,
-                                  OrderSide::NONE, OrderSide::NONE};
-        Strategy* strats[4] = {&vbs, &pbs, &tds, &tms};
+        OrderSide last_order_side = OrderSide::NONE;   // 已下单方向(同向不重下)
         // 退出条件: 解析已完成(parse_done) 且 通道A空(pending==0)
         while (!parse_done.load(std::memory_order_acquire) || channel_a.pending(0) > 0) {
             if (channel_a.pop(0, ev)) {
                 vbs.on_event(ev); pbs.on_event(ev); tds.on_event(ev); tms.on_event(ev);
-                kagg.on_trade(ev);
+                kagg.on_trade(ev);      // 成交 → K线聚合
                 ++trade_count;
                 uint64_t l = last_seq.load();
                 if (l != 0 && ev.seq_id != l + 1)
                     seq_contiguous.store(false, std::memory_order_relaxed);
                 last_seq.store(ev.seq_id, std::memory_order_relaxed);
 
-                // 交易侧: 信号从 NONE 翻转/变化时下单(避免每 tick 重复下单)
-                for (int i = 0; i < 4; ++i) {
-                    Signal s = strats[i]->signal();
-                    if (s.side != last_side[i]) {
-                        last_side[i] = s.side;
-                        if (s.side != OrderSide::NONE)
-                            ex.submit_signal(s, (uint64_t)i + 1);
+                // 回放中实时决策: 主从组合(主=量突定方向, 从=OFI/OBI 定强度)
+                // 从策略(通道B)稍后追上; 一旦有强度, 决策生效 → 下单
+                combiner.set_primary(vbs.signal());
+                combiner.add_slave(ofi.signal());
+                combiner.add_slave(obi.signal());
+                Signal decision = combiner.combine();
+                combiner.clear_slaves();
+                if (decision.side != OrderSide::NONE && decision.strength > 0) {
+                    if (decision.side != last_order_side) {   // 方向变化才下(避免重复)
+                        uint64_t oid = ex.submit_signal(decision, 1);
+                        if (oid != 0)   // 实际下单才记录方向(强度弱 qty=0 时不下)
+                            last_order_side = decision.side;
                     }
+                } else {
+                    last_order_side = OrderSide::NONE;   // 无信号 → 复位(可重新下单)
                 }
             } else if (!parse_done.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -238,12 +255,10 @@ int main(int argc, char* argv[]) {
                 break;   // parse_done 且通道A空 → 退出
             }
         }
+        kagg.flush();   // 回放结束: 强制推出最后一根 K线, 让主策略看到完整数据
     });
 
     // ── 通道 B 消费线程: 委托事件 → 订单簿重建 → OBI + OFI 策略 ──
-    OrderBookConsumer obc;
-    OrderBookImbalanceStrategy obi;
-    OrderFlowImbalanceStrategy ofi;
     std::atomic<bool> book_ready{false};
     std::atomic<size_t> book_events{0};
     std::thread book_th([&]() {
@@ -394,6 +409,14 @@ int main(int argc, char* argv[]) {
            (int)vbs.signal().side, (int)pbs.signal().side,
            (int)tds.signal().side, (int)tms.signal().side,
            (int)obi.signal().side, (int)ofi.signal().side);
+    combiner.set_primary(vbs.signal());
+    combiner.add_slave(ofi.signal());
+    combiner.add_slave(obi.signal());
+    Signal dc = combiner.combine();
+    combiner.clear_slaves();
+    printf("主从组合:   主(量突)=%d 从(OFI)=%d 从(OBI)=%d 决策=%d 强度=%lld\n",
+           (int)vbs.signal().side, (int)ofi.signal().side,
+           (int)obi.signal().side, (int)dc.side, (long long)dc.strength);
     printf("通道B:      委托事件=%zu OFI累计=%lld\n",
            book_events.load(), (long long)ofi.ofi());
 

@@ -78,6 +78,7 @@ target_include_directories(market PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(strategy
     strategy/base/strategy.h
     strategy/base/signal.h
+    strategy/combo/signal_combiner.h
     strategy/momentum/momentum_strategy.h
     strategy/trend/trend_strategy.h
     strategy/kline/kline_aggregator.h
@@ -177,6 +178,12 @@ add_executable(ut_ofi
 )
 target_link_libraries(ut_ofi PRIVATE core strategy)
 add_test(NAME ut_ofi COMMAND ut_ofi)
+
+add_executable(ut_signal_combiner
+    tests/unit/test_signal_combiner.cpp
+)
+target_link_libraries(ut_signal_combiner PRIVATE core strategy)
+add_test(NAME ut_signal_combiner COMMAND ut_signal_combiner)
 
 add_executable(ut_execution
     tests/unit/test_execution.cpp

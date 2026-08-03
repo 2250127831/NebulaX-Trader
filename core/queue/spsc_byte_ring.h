@@ -38,9 +38,15 @@ public:
 
     size_t push(const void* data, size_t len)
     {
+        // SPSC 下 head 只被消费者 read_release 单调推进。push 读 head(acquire,
+        // 保证看到消费者已 release 的进度), 计算空闲空间。
         size_t head = head_.load(std::memory_order_acquire);
         size_t tail = tail_.load(std::memory_order_relaxed);
-        size_t free = capacity_ - (tail - head);
+        // 用有符号差判断满: tail - head 可能因时序略超 capacity(下溢为巨大数),
+        // 直接按 >= capacity 视为满, 返回 0 等待消费者释放(避免覆盖未读数据)。
+        int64_t used = static_cast<int64_t>(tail) - static_cast<int64_t>(head);
+        if (used >= static_cast<int64_t>(capacity_) || used < 0) return 0;
+        size_t free = capacity_ - static_cast<size_t>(used);
         if (free == 0 || len == 0) return 0;
 
         size_t actual = (len < free) ? len : free;

@@ -159,8 +159,12 @@ int main(int argc, char* argv[]) {
     });
 
     // ── 生产线程（主线程）: 拆包器拆 → 推共享 ring ──
-    unpacker.feed(pkts.data(), pkts.size());
-    bp.notify();  // 唤醒解析线程
+    unpacker.feed(pkts.data(), pkts.size());   // 同步推入 ring(满则等解析腾空间)
+    bp.notify();                                // 唤醒解析线程
+
+    // 等解析线程消费完(ring 空)再 stop, 避免 feed 尾部消息漏解析。
+    while (!shared_ring.empty())
+        std::this_thread::yield();
 
     stop.store(true, std::memory_order_release);
     bp.notify();

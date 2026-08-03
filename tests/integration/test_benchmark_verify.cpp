@@ -96,14 +96,29 @@ int main(int argc, char* argv[]) {
     std::string bench_path = argv[3];
     std::string backend = (argc >= 5) ? argv[4] : "io_uring";
 
-    // ── 读源文件(裸 ITCH 完整消息流) ──
+    // ── 读源文件(裸 ITCH) + 过滤 R 消息 ──
+    // 压测客户端过滤 R(不订阅), 期望流 = 去掉 R 后的消息
     FILE* f = fopen(itch_file.c_str(), "rb");
     CHECK(f != nullptr);
     if (!f) return 1;
     fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> source(fsize);
-    CHECK(fread(source.data(), 1, fsize, f) == (size_t)fsize);
+    std::vector<uint8_t> raw(fsize);
+    CHECK(fread(raw.data(), 1, fsize, f) == (size_t)fsize);
     fclose(f);
+
+    std::vector<uint8_t> source;  // 过滤 R 后的期望流
+    {
+        size_t pos = 0;
+        while (pos + 2 <= raw.size()) {
+            uint16_t bl = (static_cast<uint16_t>(raw[pos]) << 8) | raw[pos+1];
+            if (bl < 1 || bl > 200) { ++pos; continue; }
+            size_t ml = 2 + bl;
+            if (pos + ml > raw.size()) break;
+            if (raw[pos + 2] != 'R')  // 过滤 R(Stock Directory)
+                source.insert(source.end(), raw.begin()+pos, raw.begin()+pos+ml);
+            pos += ml;
+        }
+    }
     printf("源文件 %ld 字节\n", fsize);
 
     auto receiver = make_receiver(backend, port);

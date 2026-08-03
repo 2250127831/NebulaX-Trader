@@ -107,28 +107,27 @@ int main(int argc, char* argv[]) {
     printf("MoldUDP64 包流 %zu 字节, 总消息 seq 到 %zu\n", pkts.size(), total_seq);
     CHECK(total_seq == expected_msgs);  // seq 全局连续 = 消息数
 
-    // ── 管道: QueueManager 创建共享 ring → 拆包器写 → 解析读 ──
-    // 用户分配 ring 空间，管理器持有队列，unpacker/bp 共享引用
+    // ── 管道: QueueManager 创建共享 ring + 通道A → 拆包器写 → 解析分流 → 策略消费 ──
     uint8_t* ring_buf = new uint8_t[1 << 20];
     size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
                                           ring_buf, 1 << 20);
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
-    ByteRingParser bp(shared_ring);
+    // 通道 A: 成交事件广播（低频策略消费）
+    auto* ev_slots = new MarketEvent[1 << 16];
+    size_t chan_a_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
+                                            ev_slots, 1 << 16, 1);
+    auto& channel_a = QueueManager::get<SPMCEventQueue<16>>(chan_a_id);
+
+    ByteRingParser bp(shared_ring, channel_a);
     MoldUdpUnpacker unpacker(shared_ring);  // 共享同一个 ring
     std::atomic<size_t> parsed_count{0};
     std::atomic<bool> stop{false};
     std::atomic<bool> seq_contiguous{true};
     std::atomic<uint64_t> last_seq{0};
-    bp.set_sink([&](const MarketEvent& ev) {
-        // 验证 seq 全局连续
-        if (last_seq.load() != 0 && ev.seq_id != last_seq.load() + 1)
-            seq_contiguous.store(false, std::memory_order_relaxed);
-        last_seq.store(ev.seq_id, std::memory_order_relaxed);
-    });
 
-    // ── 消费线程: 解析（从共享 ring 读）──
-    std::thread consume_th([&] {
+    // ── 解析线程: 从共享 ring 读, 成交事件分流进通道 A ──
+    std::thread parse_th([&] {
         while (!stop.load(std::memory_order_acquire)) {
             size_t n = bp.parse_available();
             parsed_count += n;
@@ -137,16 +136,28 @@ int main(int argc, char* argv[]) {
         parsed_count += bp.parse_available();
     });
 
-    // ── 生产线程（主线程）: 模拟 recv 每个 UDP 包 → 拆包器拆 → 推共享 ring ──
-    // pkts 是连续的 MoldUDP64 包流。真实 recv 一次拿一个包；这里按包切分喂 unpacker。
-    // 由于 MoldUDP64 包无包长度字段，但 unpacker 内部按"20字节头 + count"能拆出完整包。
-    // 简化：把 pkts 整体喂给 unpacker（它按包头 count 拆出每条消息加 seq）。
+    // ── 策略消费线程: 从通道 A 收成交事件, 验证 seq 连续 ──
+    std::thread strategy_th([&] {
+        MarketEvent ev;
+        while (!stop.load(std::memory_order_acquire) || channel_a.pending(0) > 0) {
+            if (channel_a.pop(0, ev)) {
+                if (last_seq.load() != 0 && ev.seq_id != last_seq.load() + 1)
+                    seq_contiguous.store(false, std::memory_order_relaxed);
+                last_seq.store(ev.seq_id, std::memory_order_relaxed);
+            } else if (!stop.load()) {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    // ── 生产线程（主线程）: 拆包器拆 → 推共享 ring ──
     unpacker.feed(pkts.data(), pkts.size());
     bp.notify();  // 唤醒解析线程
 
     stop.store(true, std::memory_order_release);
     bp.notify();
-    consume_th.join();
+    parse_th.join();
+    strategy_th.join();
 
     printf("解析消息数 = %zu, 期望 = %zu, seq连续=%d\n",
            parsed_count.load(), expected_msgs, seq_contiguous.load());

@@ -128,6 +128,12 @@ int main(int argc, char* argv[]) {
             }
             size_t msg_len = 2 + static_cast<size_t>(body_len);
             if (pos + msg_len > static_cast<size_t>(file_size)) break;
+            // 过滤 R 消息（Stock Directory）：交易系统不订阅，不发送
+            if (buf[pos + 2] == 'R') {
+                pos += msg_len;
+                --i;  // 本条不算，继续攒满 msgs_this_packet 条
+                continue;
+            }
             pkt.insert(pkt.end(), buf + pos, buf + pos + msg_len);
             pos += msg_len;
             ++pkt_count;

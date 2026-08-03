@@ -42,12 +42,6 @@ public:
         return true;
     }
 
-    // locate → symbol（未建立映射返回空串）
-    std::string symbol(uint64_t locate) const {
-        auto it = symbols_.find(locate);
-        return it == symbols_.end() ? "" : it->second;
-    }
-
 private:
     void handle_add(const MarketEvent& ev);
     void handle_delete(const MarketEvent& ev);
@@ -57,7 +51,6 @@ private:
     void handle_execute(const MarketEvent& ev);
 
     std::unordered_map<uint64_t, OrderBook> books_;       // locate → 订单簿
-    std::unordered_map<uint64_t, std::string> symbols_;   // locate → symbol
     Tick last_tick_{};
     bool has_tick_ = false;
     uint64_t tick_seq_ = 0;  // Tick 序列号（来自事件计数）

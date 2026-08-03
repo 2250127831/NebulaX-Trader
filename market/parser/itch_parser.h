@@ -42,12 +42,6 @@ public:
     // 带 seq 版本：seq 是 recv 从 MoldUDP64 包头 + 包内偏移推算的消息序号。
     bool feed(const uint8_t* msg, size_t len, uint16_t seq);
 
-    // locate → symbol（未建立映射返回空串）
-    std::string symbol(uint64_t locate) const {
-        auto it = symbols_.find(locate);
-        return it == symbols_.end() ? "" : it->second;
-    }
-
     uint64_t message_count() const { return msg_count_; }
 
 private:
@@ -56,7 +50,6 @@ private:
         return static_cast<int64_t>(itch_price) / kUsdToCents;
     }
 
-    void parse_R(const uint8_t* m, size_t len);   // Stock Directory
     void parse_A(const uint8_t* m, size_t len);   // Add Order（含 F）
     void parse_D(const uint8_t* m, size_t len);   // Delete
     void parse_X(const uint8_t* m, size_t len);   // Cancel
@@ -72,7 +65,6 @@ private:
     }
 
     Sink sink_;
-    std::unordered_map<uint64_t, std::string> symbols_;  // locate → symbol
     uint64_t msg_count_ = 0;
     uint16_t cur_seq_ = 0;   // 当前消息序号（feed 带 seq 时设置）
 };

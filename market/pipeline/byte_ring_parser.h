@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/market_event.h"
+#include "core/queue/spmc_event_queue.h"
 #include "core/queue/spsc_byte_ring.h"
 #include "market/parser/itch_parser.h"
 
@@ -36,17 +37,23 @@
 class ByteRingParser {
 public:
     using Ring = SPSCByteRing;
-
-    using Sink = std::function<void(const MarketEvent&)>;
-    void set_sink(Sink sink) { parser_.set_sink(std::move(sink)); }
+    using EventQueue = SPMCEventQueue<16>;
 
     // ── eventfd 唤醒（学撮合引擎 poll + eventfd 方案）──
     // 解析线程 poll(wake_fd) 阻塞等数据；生产者 push 完 write(wake_fd) 唤醒。
     // V2 多消费者：所有消费者 poll 同一个 wake_fd，写一次全醒（广播）。
-    // 构造传入共享 ring 引用（由 QueueManager 持有，unpacker 写、bp 读）。
-    explicit ByteRingParser(SPSCByteRing& ring)
-        : ring_(ring) {
+    // 构造传入共享 ring（unpacker 写、bp 读）+ 通道 A（成交事件广播给策略）。
+    // 解析出成交事件(TRADE/EXECUTE) → push 通道 A；其他类型留给通道 B(后续)。
+    ByteRingParser(SPSCByteRing& ring, EventQueue& channel_a)
+        : ring_(ring), channel_a_(channel_a) {
         wake_fd_ = eventfd(0, EFD_NONBLOCK);
+        parser_.set_sink([this](const MarketEvent& ev) {
+            if (ev.type == MarketEvent::Type::TRADE ||
+                ev.type == MarketEvent::Type::EXECUTE) {
+                channel_a_.push(ev);   // 成交事件 → 通道 A（低频策略消费）
+            }
+            // 其他类型（ADD/DELETE/CANCEL 等委托）→ 留给通道 B(后续逐笔委托)
+        });
     }
     ~ByteRingParser() {
         if (wake_fd_ >= 0) { uint64_t one = 1; ssize_t r = write(wake_fd_, &one, sizeof(one)); (void)r; close(wake_fd_); }
@@ -144,6 +151,7 @@ public:
 
 private:
     Ring& ring_;
+    EventQueue& channel_a_;       // 成交事件广播通道（低频策略消费）
     ItchParser parser_;
     int wake_fd_ = -1;
 };

@@ -42,17 +42,19 @@ public:
     // ── eventfd 唤醒（学撮合引擎 poll + eventfd 方案）──
     // 解析线程 poll(wake_fd) 阻塞等数据；生产者 push 完 write(wake_fd) 唤醒。
     // V2 多消费者：所有消费者 poll 同一个 wake_fd，写一次全醒（广播）。
-    // 构造传入共享 ring（unpacker 写、bp 读）+ 通道 A（成交事件广播给策略）。
-    // 解析出成交事件(TRADE/EXECUTE) → push 通道 A；其他类型留给通道 B(后续)。
-    ByteRingParser(SPSCByteRing& ring, EventQueue& channel_a)
-        : ring_(ring), channel_a_(channel_a) {
+    // 构造传入共享 ring（unpacker 写、bp 读）+ 通道 A（成交）+ 通道 B（委托）。
+    //   成交事件(TRADE/EXECUTE) → 通道 A（低频策略消费）
+    //   委托事件(ADD/DELETE/CANCEL/REPLACE) → 通道 B（订单簿/逐笔委托策略消费）
+    ByteRingParser(SPSCByteRing& ring, EventQueue& channel_a, EventQueue& channel_b)
+        : ring_(ring), channel_a_(channel_a), channel_b_(channel_b) {
         wake_fd_ = eventfd(0, EFD_NONBLOCK);
         parser_.set_sink([this](const MarketEvent& ev) {
             if (ev.type == MarketEvent::Type::TRADE ||
                 ev.type == MarketEvent::Type::EXECUTE) {
                 channel_a_.push(ev);   // 成交事件 → 通道 A（低频策略消费）
+            } else {
+                channel_b_.push(ev);   // 委托事件 → 通道 B（订单簿/逐笔策略消费）
             }
-            // 其他类型（ADD/DELETE/CANCEL 等委托）→ 留给通道 B(后续逐笔委托)
         });
     }
     ~ByteRingParser() {
@@ -152,6 +154,7 @@ public:
 private:
     Ring& ring_;
     EventQueue& channel_a_;       // 成交事件广播通道（低频策略消费）
+    EventQueue& channel_b_;       // 委托事件广播通道（订单簿/逐笔策略消费）
     ItchParser parser_;
     int wake_fd_ = -1;
 };

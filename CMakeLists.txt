@@ -41,6 +41,8 @@ add_library(core
     core/queue/queue_manager.h
     core/market_event.h
     core/memory/memory_pool.h
+    core/memory/order_pool.h
+    core/memory/order_map.h
     core/utils/align.h
     core/net/i_market_data_receiver.h
     core/net/i_market_data_sender.h
@@ -84,6 +86,7 @@ add_library(strategy
     strategy/tick/price_breakout_strategy.h
     strategy/tick/trade_direction_strategy.h
     strategy/tick/tick_momentum_strategy.h
+    strategy/tick/order_book_imbalance_strategy.h
 )
 
 target_link_libraries(strategy PUBLIC core)
@@ -161,6 +164,12 @@ add_executable(ut_signal_strength
 )
 target_link_libraries(ut_signal_strength PRIVATE core strategy)
 add_test(NAME ut_signal_strength COMMAND ut_signal_strength)
+
+add_executable(ut_order_book
+    tests/unit/test_order_book.cpp
+)
+target_link_libraries(ut_order_book PRIVATE core market)
+add_test(NAME ut_order_book COMMAND ut_order_book)
 
 add_executable(ut_execution
     tests/unit/test_execution.cpp

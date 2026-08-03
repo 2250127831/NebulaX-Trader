@@ -16,11 +16,13 @@
 #include "core/net/io_uring_sender.h"
 #include "market/pipeline/byte_ring_parser.h"
 #include "market/pipeline/mold_udp_unpacker.h"
+#include "market/book/order_book_consumer.h"
 #include "strategy/kline/kline_aggregator.h"
 #include "strategy/tick/price_breakout_strategy.h"
 #include "strategy/tick/tick_momentum_strategy.h"
 #include "strategy/tick/trade_direction_strategy.h"
 #include "strategy/tick/volume_breakout_strategy.h"
+#include "strategy/tick/order_book_imbalance_strategy.h"
 #include "execution/execution_engine.h"
 #include "oms/order_manager.h"
 #include "oms/order_protocol.h"
@@ -115,8 +117,13 @@ int main(int argc, char* argv[]) {
                                             ev_slots, 1 << 20, 1);
     auto& channel_a = QueueManager::get<SPMCEventQueue<16>>(chan_a_id);
 
+    auto* ord_slots = new MarketEvent[1 << 20];  // 1M 槽
+    size_t chan_b_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
+                                            ord_slots, 1 << 20, 1);
+    auto& channel_b = QueueManager::get<SPMCEventQueue<16>>(chan_b_id);
+
     MoldUdpUnpacker unpacker(shared_ring);
-    ByteRingParser parser(shared_ring, channel_a);
+    ByteRingParser parser(shared_ring, channel_a, channel_b);
 
     VolumeBreakoutStrategy vbs;
     PriceBreakoutStrategy pbs;
@@ -226,8 +233,36 @@ int main(int argc, char* argv[]) {
                 }
             } else if (!parse_done.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
+            } else {
+                break;   // parse_done 且通道A空 → 退出
             }
         }
+    });
+
+    // ── 通道 B 消费线程: 委托事件 → 订单簿重建(高性能簿) → OBI 策略 ──
+    OrderBookConsumer obc;
+    OrderBookImbalanceStrategy obi;
+    std::atomic<bool> book_ready{false};
+    std::atomic<size_t> book_events{0};
+    std::thread book_th([&]() {
+        MarketEvent ev;
+        while (!parse_done.load(std::memory_order_acquire) || channel_b.pending(0) > 0) {
+            if (channel_b.pop(0, ev)) {
+                obc.on_event(ev);   // 委托 → 订单簿重建
+                ++book_events;
+                // 盘口变化 → OBI 策略
+                const OrderBook* book = obc.book(ev.locate);
+                if (book) {
+                    obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
+                                book->best_ask(), book->best_ask_volume(), ev.timestamp);
+                }
+            } else if (!parse_done.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            } else {
+                break;   // parse_done 且通道空 → 退出
+            }
+        }
+        book_ready.store(true, std::memory_order_release);
     });
 
     // ── 成交回报线程: 收模拟交易所 FILL → 驱动 OMS/Risk ──
@@ -308,6 +343,12 @@ int main(int argc, char* argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     strategy_th.join();
 
+    // 通道 B 消费线程: 委托事件 → 订单簿重建 → OBI 策略
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    book_th.join();
+    CHECK(book_ready.load());
+    CHECK(book_events.load() > 0);
+
     // 成交回报: 等最后一批 FILL 到达 → 停回报线程 → 停发送端
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     fill_stop.store(true, std::memory_order_release);
@@ -325,9 +366,10 @@ int main(int argc, char* argv[]) {
     printf("解析消息数: %zu\n", parsed_total.load());
     printf("成交事件数: %zu\n", trade_count.load());
     printf("seq 连续:   %s\n", seq_contiguous.load() ? "yes" : "NO");
-    printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d (0=BUY 1=SELL 2=NONE)\n",
+    printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d OBI盘口=%d (0=BUY 1=SELL 2=NONE)\n",
            (int)vbs.signal().side, (int)pbs.signal().side,
-           (int)tds.signal().side, (int)tms.signal().side);
+           (int)tds.signal().side, (int)tms.signal().side, (int)obi.signal().side);
+    printf("通道B:      委托事件=%zu\n", book_events.load());
 
     // ── 交易侧: 订单经模拟交易所真实往返(发送→回报→OMS/Risk) ──
     size_t n_orders   = om.order_count();

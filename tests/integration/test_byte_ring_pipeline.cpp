@@ -119,7 +119,13 @@ int main(int argc, char* argv[]) {
                                             ev_slots, 1 << 16, 1);
     auto& channel_a = QueueManager::get<SPMCEventQueue<16>>(chan_a_id);
 
-    ByteRingParser bp(shared_ring, channel_a);
+    // 通道 B: 委托事件广播（订单簿/逐笔策略消费）
+    auto* ord_slots = new MarketEvent[1 << 16];
+    size_t chan_b_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
+                                            ord_slots, 1 << 16, 1);
+    auto& channel_b = QueueManager::get<SPMCEventQueue<16>>(chan_b_id);
+
+    ByteRingParser bp(shared_ring, channel_a, channel_b);
     MoldUdpUnpacker unpacker(shared_ring);  // 共享同一个 ring
     std::atomic<size_t> parsed_count{0};
     std::atomic<bool> stop{false};

@@ -26,6 +26,10 @@
 // 本类不关心事件怎么来，只处理事件。
 class OrderBookConsumer {
 public:
+    // 共享池：所有标的簿共用，避免每标的独立大池爆内存
+    OrderBookConsumer(size_t pool_capacity = 1 << 20)
+        : shared_pool_(pool_capacity) {}
+
     // 处理一个事件（生产者在解析器回调里调用）
     void on_event(const MarketEvent& ev);
 
@@ -43,6 +47,7 @@ public:
     }
 
 private:
+    OrderBook& book_for(uint64_t locate);   // 取指定标的簿（共享池新建）
     void handle_add(const MarketEvent& ev);
     void handle_delete(const MarketEvent& ev);
     void handle_cancel(const MarketEvent& ev);
@@ -50,8 +55,10 @@ private:
     void handle_trade(const MarketEvent& ev, bool has_price);
     void handle_execute(const MarketEvent& ev);
 
-    std::unordered_map<uint64_t, OrderBook> books_;       // locate → 订单簿
+    OrderPool shared_pool_;                               // 共享挂单池（所有标的簿共用）
+    std::unordered_map<uint64_t, OrderBook> books_;       // locate → 订单簿（共享池构造）
     Tick last_tick_{};
     bool has_tick_ = false;
-    uint64_t tick_seq_ = 0;  // Tick 序列号（来自事件计数）
+    uint64_t tick_seq_ = 0;   // Tick 序列号（来自事件计数）
+    uint64_t order_seq_ = 0;  // 挂单序列号（时间优先 FIFO，跨事件递增）
 };

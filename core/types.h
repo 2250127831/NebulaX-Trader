@@ -43,6 +43,26 @@ struct Order {
     uint64_t   timestamp;     // 下单时间戳
 };
 
+// ── 订单簿挂单节点 ──
+// 高性能订单簿的池化存储单元（迁移自 NebulaX matching Order）。
+// 与下单 Order 语义不同：这是行情层盘口的挂单，由 OrderPool 池化管理、
+// 按价格档 intrusive 链表组织，零堆分配。
+// 64 字节对齐，整节点一个 cache line（同 NebulaX static_assert）。
+struct OrderSlot {
+    uint64_t order_ref = 0;       // 挂单引用号（ITCH order_ref / 撮合单号）
+    OrderSide  side     = OrderSide::NONE;
+    int64_t    price    = 0;      // 挂单价（定点整数，分）
+    uint64_t   shares   = 0;      // 原始挂单量
+    uint64_t   remaining = 0;     // 剩余未成交量（撤/成交后递减）
+    uint64_t   sequence = 0;      // 时间优先（FIFO 顺序，同 NebulaX）
+
+    // ── intrusive linked list (pool-managed) ──
+    uint32_t prev_idx = UINT32_MAX;   // 同价档前一个挂单
+    uint32_t next_idx = UINT32_MAX;   // 同价档后一个挂单
+    uint32_t pool_next_free = UINT32_MAX;  // 池空闲链表链接（仅释放时有效）
+};
+static_assert(sizeof(OrderSlot) == 64, "OrderSlot must be 64 bytes for cache line alignment");
+
 // 定点价格 → double（仅展示层用，业务计算不要用浮点）
 inline double price_to_double(int64_t price) {
     return static_cast<double>(price) / static_cast<double>(Tick::kTickSize);

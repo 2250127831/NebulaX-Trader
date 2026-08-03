@@ -82,6 +82,13 @@ int main(int argc, char* argv[]) {
     std::string bench_path = argv[3];
     std::string backend = (argc >= 5) ? argv[4] : "io_uring";
 
+    // ── 清理环境: 杀掉残留 benchmark 子进程(上次测试超时 kill 后成孤儿占端口) ──
+    // 必须在 fork 之前做, 避免误杀本次 fork 的 benchmark。
+    // 用 -x 精确匹配进程名(不含命令行参数), 避免误杀本测试
+    // (本测试命令行含 "./build/trader_benchmark" 参数, -f 会误伤自身)。
+    system("pkill -x trader_benchmark");
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 等进程释放端口
+
     // ── 清理环境: 移除残留共享内存(避免复用旧计数器) ──
     shm_unlink(FLOW_SHM_PATH);
 

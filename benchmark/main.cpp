@@ -29,9 +29,12 @@ struct Config {
     const char* host  = "127.0.0.1";
     int port          = 8080;
     int order_port    = 9090;   // 模拟交易所端口：收订单、回成交回报
+    int order_ret_port = 9091;  // 成交回报发送目标端口(--no-shm 时用)
     uint64_t max_backlog = 10000;
     size_t pack_max  = 100;  // 每包消息条数上限（实际每包 1~pack_max 条随机）
-    bool help         = false;
+    uint64_t pace_us = 0;    // 每包间隔(微秒)，--no-shm 限速用(默认 0 = 全速)
+    bool no_shm = false;     // 不挂共享内存(压测脚本模式，与 trader 无握手)
+    bool help    = false;
 };
 
 static Config parse_args(int argc, char* argv[]) {
@@ -41,8 +44,11 @@ static Config parse_args(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--host")    == 0 && i+1 < argc) cfg.host = argv[++i];
         else if (strcmp(argv[i], "--port")    == 0 && i+1 < argc) cfg.port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--order-port") == 0 && i+1 < argc) cfg.order_port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--order-ret-port") == 0 && i+1 < argc) cfg.order_ret_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--backlog") == 0 && i+1 < argc) cfg.max_backlog = atol(argv[++i]);
         else if (strcmp(argv[i], "--pack-max") == 0 && i+1 < argc) cfg.pack_max = atol(argv[++i]);
+        else if (strcmp(argv[i], "--pace-us") == 0 && i+1 < argc) cfg.pace_us = atol(argv[++i]);
+        else if (strcmp(argv[i], "--no-shm") == 0) cfg.no_shm = true;
         else cfg.help = true;
     }
     return cfg;
@@ -56,13 +62,17 @@ static void usage() {
            "  --order-port <port> Simulated exchange port (default: 9090)\n"
            "  --backlog <n>      Max backlog before slowing down (default: 10000)\n"
            "  --pack-max <n>     Max messages per UDP packet (default: 100)\n"
-           "                     实际每包 1~pack-max 条随机，模拟真实行情打包\n");
+           "                     实际每包 1~pack-max 条随机，模拟真实行情打包\n"
+           "  --pace-us <us>     Per-packet sleep (us). Throttle without shm.\n"
+           "  --no-shm           No shared-memory handshake (pressure script mode).\n"
+           "                     Trader started first, wait, then fire at full/pace.\n");
 }
 
 // ── 模拟交易所线程 ──
-// 理想状态：收到订单立即全额成交，回报发回交易系统的成交回报端口(共享内存指定)。
+// 理想状态：收到订单立即全额成交，回报发回交易系统的成交回报端口。
+// 回报端口来源: 有共享内存→读 fc->order_ret_port; 无共享内存(--no-shm)→参数 ret_port。
 // 定长协议见 oms/order_protocol.h。
-static void run_sim_exchange(int order_port, FlowControl* fc,
+static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
                              std::atomic<bool>& stop,
                              std::atomic<uint64_t>& orders_received) {
     int osock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -96,11 +106,12 @@ static void run_sim_exchange(int order_port, FlowControl* fc,
         uint8_t fill[kFillMsgLen];
         encode_fill(o.order_id, o.quantity, o.price, fill);
 
-        uint64_t ret_port = fc->order_ret_port.load(std::memory_order_acquire);
-        if (ret_port == 0) continue;
+        uint64_t rp = (fc != nullptr)
+            ? fc->order_ret_port.load(std::memory_order_acquire) : ret_port;
+        if (rp == 0) continue;
         sockaddr_in ret{};
         ret.sin_family = AF_INET;
-        ret.sin_port   = htons(static_cast<uint16_t>(ret_port));
+        ret.sin_port   = htons(static_cast<uint16_t>(rp));
         inet_pton(AF_INET, "127.0.0.1", &ret.sin_addr);
         sendto(osock, fill, kFillMsgLen, 0,
                reinterpret_cast<sockaddr*>(&ret), sizeof(ret));
@@ -120,14 +131,22 @@ int main(int argc, char* argv[]) {
     close(fd);
     if (buf == MAP_FAILED) { perror("mmap"); return 1; }
 
-    // ── 共享内存 FlowControl ──
-    int shm_fd = shm_open(FLOW_SHM_PATH, O_CREAT | O_RDWR, 0644);
-    if (shm_fd < 0) { perror("shm_open"); return 1; }
-    if (ftruncate(shm_fd, sizeof(FlowControl)) < 0) { perror("ftruncate"); return 1; }
-    auto* fc = static_cast<FlowControl*>(mmap(nullptr, sizeof(FlowControl),
-        PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
-    close(shm_fd);
-    if (fc == MAP_FAILED) { perror("mmap shm"); return 1; }
+    // ── 共享内存 FlowControl（--no-shm 时不挂，压测脚本模式）──
+    FlowControl* fc = nullptr;
+    if (!cfg.no_shm) {
+        int shm_fd = shm_open(FLOW_SHM_PATH, O_CREAT | O_RDWR, 0644);
+        if (shm_fd < 0) { perror("shm_open"); return 1; }
+        if (ftruncate(shm_fd, sizeof(FlowControl)) < 0) { perror("ftruncate"); return 1; }
+        fc = static_cast<FlowControl*>(mmap(nullptr, sizeof(FlowControl),
+            PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
+        close(shm_fd);
+        if (fc == MAP_FAILED) { perror("mmap shm"); return 1; }
+        // 重置共享内存计数器(避免复用上次残留值导致限速死锁)。
+        // 注意: 不碰 ready——ready 由调用方(trader/测试)设置，这里只清计数。
+        fc->sent.store(0, std::memory_order_release);
+        fc->received.store(0, std::memory_order_release);
+        fc->done.store(false, std::memory_order_release);
+    }
 
     // ── UDP Socket ──
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -142,13 +161,23 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> order_stop{false};
     std::atomic<uint64_t> orders_received{0};
     std::thread sim_exchange(run_sim_exchange, cfg.order_port, fc,
+                             cfg.order_ret_port,
                              std::ref(order_stop), std::ref(orders_received));
 
-    // ── 等待 NX-Trader 就绪 ──
-    printf("Waiting for NX-Trader ...\n");
-    while (!fc->ready.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    printf("NX-Trader ready.  Start replay...\n");
+    // ── 等待 NX-Trader 就绪（--no-shm 时直接发，无握手）──
+    if (fc) {
+        printf("Waiting for NX-Trader ... (ready=%d)\n",
+               (int)fc->ready.load(std::memory_order_acquire));
+        fflush(stdout);
+        int ready_wait_cnt = 0;
+        while (!fc->ready.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (++ready_wait_cnt % 100 == 0)
+                printf("  still waiting ready... (cnt=%d)\n", ready_wait_cnt), fflush(stdout);
+        }
+        printf("NX-Trader ready.  Start replay...\n");
+        fflush(stdout);
+    }
 
     // ── 全量发送（模拟真实交易所 MoldUDP64 封装）──
     // 每包 = [MoldUDP64头: session(10) + seq(8) + count(2)] + [消息们]
@@ -208,11 +237,17 @@ int main(int argc, char* argv[]) {
             uint16_t be_cnt = htobe16(pkt_count);        // count: 2 字节
             memcpy(hdr + 18, &be_cnt, 2);
 
-            // 发送前: 忙等上一包被接收(发一个等一个确认)。
-            // 发送端永不领先超过 1 包 → 内核 UDP 缓冲永不溢出 → 任何数据量都不丢。
-            // 吞吐 = 接收确认 RTT(本地微秒级)，即最佳速度回放。
-            while (fc->received.load(std::memory_order_acquire) < fc->sent.load(std::memory_order_relaxed)) {
-                std::this_thread::yield();
+            // 发送前限速:
+            //   有共享内存: 忙等上一包被接收(发一个等一个确认)，发送端永不领先>1包，
+            //              内核 UDP 缓冲永不溢出 → 零丢包，吞吐 = 接收确认 RTT。
+            //   无共享内存(--no-shm): 固定每包 sleep(pace_us)，压测脚本模式，
+            //              与 trader 无握手，发完即退。
+            if (fc) {
+                while (fc->received.load(std::memory_order_acquire) < fc->sent.load(std::memory_order_relaxed)) {
+                    std::this_thread::yield();
+                }
+            } else if (cfg.pace_us > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(cfg.pace_us));
             }
 
             ssize_t r = sendto(sock, pkt.data(), pkt.size(), 0,
@@ -220,7 +255,7 @@ int main(int argc, char* argv[]) {
             pkt.clear();
             pkt.resize(20);  // 复位头预留
             if (r > 0) {
-                fc->sent.fetch_add(1, std::memory_order_release);
+                if (fc) fc->sent.fetch_add(1, std::memory_order_release);
                 ++total_sent;
             }
         } else {
@@ -238,6 +273,9 @@ int main(int argc, char* argv[]) {
     printf("  Total time:      %.3f s\n", sec);
     printf("  Send rate:       %.0f msg/s\n", total_sent / sec);
 
+    // 通知交易系统行情发完（有共享内存时，trader 据此退出）
+    if (fc) fc->done.store(true, std::memory_order_release);
+
     // 行情发完，给交易系统留时间把订单发过来并回执。
     // 理想状态：模拟交易所全额成交，回报在交易系统侧落地。
     printf("  Waiting for order fills (2s)...\n");
@@ -248,7 +286,7 @@ int main(int argc, char* argv[]) {
            (unsigned long long)orders_received.load());
 
     munmap(buf, file_size);
-    munmap(fc, sizeof(FlowControl));
+    if (fc) munmap(fc, sizeof(FlowControl));
     close(sock);
     return 0;
 }

@@ -133,13 +133,15 @@ int main(int argc, char* argv[]) {
     std::atomic<uint64_t> last_seq{0};
 
     // ── 解析线程: 从共享 ring 读, 成交事件分流进通道 A ──
+    // 退出条件: stop 且 ring 空(消费完所有数据)。避免主线程置 stop 后
+    // 解析线程还没消费完 ring 就退出导致漏解析。
     std::thread parse_th([&] {
-        while (!stop.load(std::memory_order_acquire)) {
+        while (true) {
             size_t n = bp.parse_available();
             parsed_count += n;
+            if (bp.ring().empty() && stop.load(std::memory_order_acquire)) break;
             if (n == 0) bp.wait_for_data(200);
         }
-        parsed_count += bp.parse_available();
     });
 
     // ── 策略消费线程: 从通道 A 收成交事件, 验证 seq 连续 ──

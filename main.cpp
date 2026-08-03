@@ -54,14 +54,18 @@
 #include <unistd.h>
 
 static void usage(const char* prog) {
-    printf("Usage: %s [--config <path>]\n", prog);
+    printf("Usage: %s [--config <path>] [--no-shm]\n"
+           "  --no-shm   不挂共享内存(压测脚本模式): 无握手, 运行 idle_timeout_sec 后退出\n",
+           prog);
 }
 
 int main(int argc, char* argv[]) {
     // ── 解析参数 + 加载配置 ──
     std::string config_path = "config/default.yaml";
+    bool no_shm = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) config_path = argv[++i];
+        else if (strcmp(argv[i], "--no-shm") == 0) no_shm = true;
         else { usage(argv[0]); return 1; }
     }
     Config cfg;
@@ -78,24 +82,27 @@ int main(int argc, char* argv[]) {
            cfg.strategy.primary.c_str());
 
     // ── 清理共享内存残留（避免复用旧计数器）──
-    shm_unlink(FLOW_SHM_PATH);
+    if (!no_shm) shm_unlink(FLOW_SHM_PATH);
 
     // ── 行情接收端 ──
     auto receiver = std::make_unique<IoUringReceiver>(cfg.market.port);
     if (!receiver->start()) { printf("接收端启动失败\n"); return 1; }
 
-    // ── 共享内存 FlowControl（发给回放客户端/benchmark）──
-    int shm_fd = shm_open(FLOW_SHM_PATH, O_CREAT | O_RDWR, 0644);
-    if (shm_fd < 0) { perror("shm_open"); return 1; }
-    if (ftruncate(shm_fd, sizeof(FlowControl)) < 0) { perror("ftruncate"); return 1; }
-    auto* fc = static_cast<FlowControl*>(mmap(nullptr, sizeof(FlowControl),
-        PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
-    close(shm_fd);
-    if (fc == MAP_FAILED) { perror("mmap"); return 1; }
-    fc->ready.store(false, std::memory_order_release);
-    fc->sent.store(0, std::memory_order_release);
-    fc->received.store(0, std::memory_order_release);
-    fc->order_ret_port.store(cfg.execution.order_ret_port, std::memory_order_release);
+    // ── 共享内存 FlowControl（--no-shm 时不挂，压测脚本模式无握手）──
+    FlowControl* fc = nullptr;
+    if (!no_shm) {
+        int shm_fd = shm_open(FLOW_SHM_PATH, O_CREAT | O_RDWR, 0644);
+        if (shm_fd < 0) { perror("shm_open"); return 1; }
+        if (ftruncate(shm_fd, sizeof(FlowControl)) < 0) { perror("ftruncate"); return 1; }
+        fc = static_cast<FlowControl*>(mmap(nullptr, sizeof(FlowControl),
+            PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0));
+        close(shm_fd);
+        if (fc == MAP_FAILED) { perror("mmap"); return 1; }
+        fc->ready.store(false, std::memory_order_release);
+        fc->sent.store(0, std::memory_order_release);
+        fc->received.store(0, std::memory_order_release);
+        fc->order_ret_port.store(cfg.execution.order_ret_port, std::memory_order_release);
+    }
 
     // ── 双通道 + 共享 ring ──
     auto ring_buf = std::make_unique<uint8_t[]>(cfg.market.ring_bytes);
@@ -175,20 +182,21 @@ int main(int argc, char* argv[]) {
         while (!stop.load(std::memory_order_acquire)) {
             ssize_t n = receiver->recv(buf, sizeof(buf));
             if (n > 0) {
-                fc->received.fetch_add(1, std::memory_order_release);
+                if (fc) fc->received.fetch_add(1, std::memory_order_release);
                 unpacker.feed(buf, (size_t)n);
             } else break;
         }
     });
 
     // ── 解析线程：通道A(成交) / 通道B(委托) ──
+    // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。排空 ring 后置 parse_done。
     std::thread parse_th([&]() {
-        while (!stop.load(std::memory_order_acquire)) {
+        while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
             parser.parse_available();
             if (!parser.ring().empty()) continue;
-            if (!stop.load()) parser.wait_for_data(200);
+            parser.wait_for_data(200);
         }
-        parser.parse_available();
+        parser.parse_available();   // 排空剩余
         parse_done.store(true, std::memory_order_release);
     });
 
@@ -303,17 +311,18 @@ int main(int argc, char* argv[]) {
 
     // ── 就绪 → 等回放客户端开始发数据 ──
     printf("接收端就绪，等待回放客户端...\n");
-    fc->ready.store(true, std::memory_order_release);
+    if (fc) fc->ready.store(true, std::memory_order_release);
 
-    // 运行直到回放结束：received 计数停止增长 idle_timeout_sec 秒视为数据发完。
-    // （回放客户端发完行情即停，received 不再增长；Ctrl-C 也可退出）
-    uint64_t last_recv = 0;
-    uint64_t idle_sec = 0;
-    while (idle_sec < cfg.execution.idle_timeout_sec) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        uint64_t r = fc->received.load(std::memory_order_acquire);
-        if (r != last_recv) { last_recv = r; idle_sec = 0; }
-        else ++idle_sec;
+    // 运行直到回放结束：
+    //   shm 模式:  回放客户端发完(置 done)即退出。不用 received/sent 超时推断，
+    //              (benchmark 限速等 received，超时推断会因 received 停滞误判退出
+    //               而 benchmark 永远等 received 死锁。done 是显式握手。)
+    //   no-shm 模式: 运行 idle_timeout_sec 秒(压测脚本: 起 trader → 等 → 发数据 → 汇总)。
+    if (fc) {
+        while (!fc->done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } else {
+        std::this_thread::sleep_for(std::chrono::seconds(cfg.execution.idle_timeout_sec));
     }
 
     // ── 停止 ──
@@ -330,7 +339,7 @@ int main(int argc, char* argv[]) {
     fill_th.join();
     order_sender->stop();
 
-    fc->ready.store(false, std::memory_order_release);
+    if (fc) fc->ready.store(false, std::memory_order_release);
 
     // ── 汇总 ──
     printf("\n=== 运行汇总 ===\n");
@@ -352,6 +361,6 @@ int main(int argc, char* argv[]) {
 
     delete[] chan_a_slots;
     delete[] chan_b_slots;
-    munmap(fc, sizeof(FlowControl));
+    if (fc) munmap(fc, sizeof(FlowControl));
     return 0;
 }

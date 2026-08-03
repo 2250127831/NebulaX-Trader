@@ -103,14 +103,12 @@ public:
 
             uint16_t seq, body_len;
             if (n == 4) {
-                // 头完整：直接读
+                // 头完整：直接读(实验A: 头帧不跨回绕)
                 seq      = (static_cast<uint16_t>(p[0]) << 8) | p[1];
                 body_len = (static_cast<uint16_t>(p[2]) << 8) | p[3];
             } else if (used >= 4) {
-                // 空洞方案下消息头永不跨回绕(生产者跨越)。
-                // n<4 且 used>=4 = 生产者已跨越, 尾部是空洞(不足4字节的部分),
-                // 或生产者还没写完。跳到物理开头。
-                // head 跳到下一圈开头(与生产者 aligned 一致)。
+                // 实验A: 头帧不跨回绕。n<4 且 used>=4 = 尾部空洞(尾部剩余<4,
+                // 生产者跳过尾部, 头+体到物理开头)。跳到物理开头。
                 size_t aligned = (ring_.head() / ring_.capacity() + 1) * ring_.capacity();
                 if (aligned > ring_.tail()) break;   // 生产者还没跨越, 等
                 ring_.read_release(aligned - ring_.head());
@@ -119,31 +117,32 @@ public:
                 break;  // 数据不足，等生产者
             }
 
-            // 空洞头: len==0 表示"尾部是空洞, 跳过到物理开头"。
-            if (body_len == 0) {
-                size_t aligned = (ring_.head() / ring_.capacity() + 1) * ring_.capacity();
-                if (aligned > ring_.tail()) break;   // 生产者还没跨越, 等
-                ring_.read_release(aligned - ring_.head());
-                continue;
-            }
-
             if (body_len < 1 || body_len > 200) {
                 ring_.read_release(n);  // 损坏前缀：释放已读的连续部分
                 continue;
             }
             size_t msg_len = 4 + body_len;  // [seq 2][len 2][消息体]
 
-            // 2. 整条消息必须完整在 ring 里才消费。空洞方案下消息不跨回绕,
-            //    read_acquire(msg_len) 要么完整(连续), 要么数据不足(break 等)。
+            // 2. 整条消息必须完整在 ring 里才消费。
             if (used < msg_len) break;
 
-            // 3. 读整条消息。空洞方案下消息物理连续, 无跨回绕。
+            // 3. 读整条消息。实验A: 头帧完整, 消息体可能跨回绕。
             n = ring_.read_acquire(reinterpret_cast<const void*&>(p), msg_len);
             if (n == msg_len) {
                 parser_.feed(p + 4, body_len, seq);  // 零拷贝：整条连续
                 ring_.read_release(msg_len);         // 处理完才释放整条
             } else {
-                break;  // 空洞方案下不应跨回绕; 数据不足等生产者
+                // 消息体跨回绕: 拼段(尾部体部分 + 物理开头体部分)。
+                // 头帧在 p[0..3], 体在 p[4..] 尾部 + raw_buffer 开头。
+                size_t n1 = n;              // 头帧+部分体(尾部连续)
+                size_t n2 = msg_len - n1;   // 物理开头的体部分
+                // 验证: 头部+体都在已发布区(生产者已写物理开头)
+                if (ring_.tail() - ring_.head() < msg_len) break;
+                uint8_t tmp[512];
+                memcpy(tmp, p, n1);
+                memcpy(tmp + n1, ring_.raw_buffer(), n2);
+                parser_.feed(tmp + 4, body_len, seq);
+                ring_.read_release(msg_len);
             }
             ++parsed;
         }

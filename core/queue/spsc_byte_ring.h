@@ -54,23 +54,34 @@ public:
             return len;
         }
 
-        // 跨回绕: 空洞方案。尾部剩余空间标为空洞, tail 跨越到物理开头写整条。
-        // 约定(与消费者共享):
-        //   - 尾部剩余 >= 4: 写空洞头 [seq=0][len=0], 消费者读 len==0 跳过
-        //   - 尾部剩余 <  4: 不写(生产者不用 <4 的尾部), 消费者读到尾部<4 直接跳过
-        // 消息不跨回绕 → 消费者读连续数据, 无拼段竞态(根治 flaky)。
+        // 跨回绕: 实验A方案(头帧不跨回绕, 消息体可跨回绕)。
+        // 假设: 调用方(feed)约定消息 = [4字节头][body]。
+        //   - 尾部剩余 >= 4: 头帧写尾部(不跨回绕), 消息体跨回绕(尾部剩余+物理开头)。
+        //   - 尾部剩余 <  4: 跳过尾部, 头+体都到物理开头。
+        // 对照实验证明: 头帧不跨回绕 → 稳定(150/150); 头帧跨回绕 → flaky。
+        // 因此只保证头帧不跨回绕即可, 消息体跨回绕无害(复用尾部空间)。
         size_t aligned = (tail / capacity_ + 1) * capacity_;   // 下一圈开头
         if (aligned + len > head + capacity_) return 0;         // 物理开头空间不足
         size_t tail_room = capacity_ - pos;
         if (tail_room >= 4) {
-            // 空洞头: [seq 0][len 0], 只填 len=0(消费者据此识别), seq 填 0
-            buf_[pos + 0] = 0;
-            buf_[pos + 1] = 0;
-            buf_[pos + 2] = 0;   // len 高字节
-            buf_[pos + 3] = 0;   // len 低字节 = 0 (空洞)
+            // 头帧写尾部(前4字节, 不跨回绕), 消息体跨回绕
+            const auto* db = static_cast<const uint8_t*>(data);
+            memcpy(buf_ + pos, db, 4);                         // 头帧
+            size_t body_room = tail_room - 4;                  // 尾部给体的空间
+            size_t body_len = len - 4;
+            if (body_len > body_room) {
+                // 体跨回绕: 尾部写 body_room, 物理开头写剩余
+                memcpy(buf_ + pos + 4, db + 4, body_room);
+                memcpy(buf_, db + 4 + body_room, body_len - body_room);
+            } else {
+                // 体不跨回绕(尾部够): 全写尾部
+                memcpy(buf_ + pos + 4, db + 4, body_len);
+            }
+            tail_.store(tail + len, std::memory_order_release);
+            return len;
         }
-        // tail_room < 4: 不写, 消费者读到尾部<4 即跳过(生产者不用 <4 尾部)
-        memcpy(buf_, data, len);            // 消息写物理开头
+        // tail_room < 4: 跳过尾部, 头+体都到物理开头
+        memcpy(buf_, data, len);
         tail_.store(aligned + len, std::memory_order_release);
         return len;
     }

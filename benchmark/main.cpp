@@ -101,7 +101,6 @@ int main(int argc, char* argv[]) {
     uint64_t extra_bytes = 0;
     uint64_t global_msg_seq = 0;   // 全局消息序号：每发一条消息 +1
     auto t_start = std::chrono::steady_clock::now();
-    uint64_t slowdown_ns = 0;
 
     // 包缓冲：20 字节头 + 消息们
     std::vector<uint8_t> pkt;
@@ -149,6 +148,15 @@ int main(int argc, char* argv[]) {
             uint16_t be_cnt = htobe16(pkt_count);        // count: 2 字节
             memcpy(hdr + 18, &be_cnt, 2);
 
+            // 发送前: 轮询计数器, 等对面收完到 backlog 允许范围。
+            // backlog = sent - received; 超过 max_backlog 就等 received 追上来。
+            uint64_t sent = fc->sent.load(std::memory_order_relaxed);
+            uint64_t recv = fc->received.load(std::memory_order_acquire);
+            while (static_cast<int64_t>(sent - recv) >= static_cast<int64_t>(cfg.max_backlog)) {
+                std::this_thread::yield();
+                recv = fc->received.load(std::memory_order_acquire);
+            }
+
             ssize_t r = sendto(sock, pkt.data(), pkt.size(), 0,
                                reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
             pkt.clear();
@@ -156,20 +164,6 @@ int main(int argc, char* argv[]) {
             if (r > 0) {
                 fc->sent.fetch_add(1, std::memory_order_release);
                 ++total_sent;
-
-                if ((total_sent & 0xFF) == 0) {
-                    uint64_t sent = fc->sent.load(std::memory_order_relaxed);
-                    uint64_t recv = fc->received.load(std::memory_order_acquire);
-                    int64_t backlog = static_cast<int64_t>(sent - recv);
-
-                    if (backlog > static_cast<int64_t>(cfg.max_backlog))
-                        slowdown_ns += 100;
-                    else if (backlog < 100 && slowdown_ns > 0)
-                        slowdown_ns -= slowdown_ns > 100 ? 100 : slowdown_ns;
-                }
-
-                if (slowdown_ns > 0)
-                    std::this_thread::sleep_for(std::chrono::nanoseconds(slowdown_ns));
             }
         } else {
             pkt.clear();

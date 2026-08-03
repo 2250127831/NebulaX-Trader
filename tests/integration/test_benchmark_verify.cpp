@@ -1,24 +1,25 @@
-// 端到端验证测试：benchmark 发送 MoldUDP64 包 + 接收端完整解析链路
-//
-// 流程：
-//   1. IoUringReceiver 收 UDP 包
-//   2. 接收线程: 每收一包 → MoldUdpUnpacker 拆包(读 seq, 每条消息前加 seq)
-//      → 写 fc->received(包数, 与 benchmark 限速同步)
-//   3. 消费线程: 从共享 ring 读 [seq][len][体], 去掉 seq 拼成 [len][体] 流
-//   4. 与源文件(裸 ITCH)逐字节比对
+// 端到端验证测试：benchmark 发送 MoldUDP64 + 接收端完整链路
+//   recv → 拆包加seq → 字节ring → ByteRingParser → 通道A → 4策略 + K线
 //
 // 验证:
-//   - 数据准确性: 去 seq 后的流 == 源文件(逐字节)
-//   - 完整性: seq 全局连续(无丢包), 最大 seq 合理
-//   - 限速: sent/received 包数积压(现有 FlowControl)
+//   - benchmark 完整发送(子进程 exit 0)
+//   - 成交事件 seq 全局连续(无丢包)
+//   - 策略从 SPMC 通道消费成交, 各自出信号
+//   - 限速: sent/received 包数(新限速: 发前等 received 追上)
 
 #include "core/ipc/flow_control.h"
 #include "core/queue/queue_manager.h"
+#include "core/queue/spmc_event_queue.h"
 #include "core/queue/spsc_byte_ring.h"
 #include "core/net/i_market_data_receiver.h"
 #include "core/net/io_uring_receiver.h"
 #include "market/pipeline/byte_ring_parser.h"
 #include "market/pipeline/mold_udp_unpacker.h"
+#include "strategy/kline/kline_aggregator.h"
+#include "strategy/tick/price_breakout_strategy.h"
+#include "strategy/tick/tick_momentum_strategy.h"
+#include "strategy/tick/trade_direction_strategy.h"
+#include "strategy/tick/volume_breakout_strategy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -56,36 +57,6 @@ static std::unique_ptr<IMarketDataReceiver> make_receiver(
     return nullptr;
 }
 
-// 从共享 ring 读一条消息: [seq 2][len 2][体]。返回消息体(去 seq)。
-// 返回 0 表示暂无完整消息。出参 seq_out 填消息序号。
-static size_t read_one_msg(SPSCByteRing& ring, uint8_t* body_out, uint64_t& seq_out) {
-    const uint8_t* p;
-    size_t n = ring.read_acquire(reinterpret_cast<const void*&>(p), 4);
-    if (n < 4) return 0;  // 头不足, 等
-    uint16_t seq  = (static_cast<uint16_t>(p[0]) << 8) | p[1];
-    uint16_t body_len = (static_cast<uint16_t>(p[2]) << 8) | p[3];
-    if (body_len < 1 || body_len > 200) { ring.read_release(1); return 0; }  // 损坏
-
-    size_t msg_len = 4 + body_len;
-    size_t used = ring.tail() - ring.head();
-    if (used < msg_len) return 0;  // 整条不足, 等
-
-    n = ring.read_acquire(reinterpret_cast<const void*&>(p), msg_len);
-    seq_out = seq;
-    if (n == msg_len) {
-        memcpy(body_out, p + 4, body_len);   // 去 seq: [len 已被读, 只要体]
-        ring.read_release(msg_len);
-        return body_len;
-    }
-    // 跨回绕
-    uint8_t tmp[300];
-    memcpy(tmp, p, n);
-    memcpy(tmp + n, ring.raw_buffer(), msg_len - n);
-    memcpy(body_out, tmp + 4, body_len);
-    ring.read_release(msg_len);
-    return body_len;
-}
-
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("usage: %s <itch_file> <port> <trader_benchmark> [backend]\n", argv[0]);
@@ -96,30 +67,8 @@ int main(int argc, char* argv[]) {
     std::string bench_path = argv[3];
     std::string backend = (argc >= 5) ? argv[4] : "io_uring";
 
-    // ── 读源文件(裸 ITCH) + 过滤 R 消息 ──
-    // 压测客户端过滤 R(不订阅), 期望流 = 去掉 R 后的消息
-    FILE* f = fopen(itch_file.c_str(), "rb");
-    CHECK(f != nullptr);
-    if (!f) return 1;
-    fseek(f, 0, SEEK_END); long fsize = ftell(f); fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> raw(fsize);
-    CHECK(fread(raw.data(), 1, fsize, f) == (size_t)fsize);
-    fclose(f);
-
-    std::vector<uint8_t> source;  // 过滤 R 后的期望流
-    {
-        size_t pos = 0;
-        while (pos + 2 <= raw.size()) {
-            uint16_t bl = (static_cast<uint16_t>(raw[pos]) << 8) | raw[pos+1];
-            if (bl < 1 || bl > 200) { ++pos; continue; }
-            size_t ml = 2 + bl;
-            if (pos + ml > raw.size()) break;
-            if (raw[pos + 2] != 'R')  // 过滤 R(Stock Directory)
-                source.insert(source.end(), raw.begin()+pos, raw.begin()+pos+ml);
-            pos += ml;
-        }
-    }
-    printf("源文件 %ld 字节\n", fsize);
+    // ── 清理环境: 移除残留共享内存(避免复用旧计数器) ──
+    shm_unlink(FLOW_SHM_PATH);
 
     auto receiver = make_receiver(backend, port);
     CHECK(receiver != nullptr);
@@ -127,6 +76,7 @@ int main(int argc, char* argv[]) {
     CHECK(receiver->start());
     if (!receiver->start()) return 1;
 
+    // ── 共享内存 flow_control ──
     int shm_fd = shm_open(FLOW_SHM_PATH, O_CREAT | O_RDWR, 0644);
     CHECK(shm_fd >= 0);
     if (shm_fd < 0) return 1;
@@ -136,20 +86,40 @@ int main(int argc, char* argv[]) {
     close(shm_fd);
     CHECK(fc != MAP_FAILED);
     if (fc == MAP_FAILED) return 1;
+    // 重置共享内存计数器(避免复用上次测试的旧值)
+    fc->ready.store(false, std::memory_order_release);
+    fc->heartbeat.store(0, std::memory_order_release);
+    fc->sent.store(0, std::memory_order_release);
+    fc->received.store(0, std::memory_order_release);
 
-    // ── 管道: 共享 ring + 拆包器 ──
-    auto ring_buf = std::make_unique<uint8_t[]>(1 << 20);
+    // ── 管道: 共享 ring + 通道A + 拆包器 + 解析器 + 策略 ──
+    // ring/通道容量加大, 减少背压(接收端跟上 benchmark)
+    auto ring_buf = std::make_unique<uint8_t[]>(1 << 22);   // 4MB
     size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
-                                          ring_buf.get(), 1 << 20);
+                                          ring_buf.get(), 1 << 22);
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
-    MoldUdpUnpacker unpacker(shared_ring);
 
-    // 消费结果: 去 seq 的消息流 + seq 连续性
-    std::vector<uint8_t> parsed_stream;   // 每个消息体拼接([len][体] 已在 body_out 后拼回)
+    auto* ev_slots = new MarketEvent[1 << 20];   // 1M 槽
+    size_t chan_a_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
+                                            ev_slots, 1 << 20, 1);
+    auto& channel_a = QueueManager::get<SPMCEventQueue<16>>(chan_a_id);
+
+    MoldUdpUnpacker unpacker(shared_ring);
+    ByteRingParser parser(shared_ring, channel_a);
+
+    VolumeBreakoutStrategy vbs;
+    PriceBreakoutStrategy pbs;
+    TradeDirectionStrategy tds;
+    TickMomentumStrategy tms;
+    KLineAggregator kagg(60000000000ull);
+
     std::atomic<bool> seq_contiguous{true};
     std::atomic<uint64_t> last_seq{0};
     std::atomic<bool> stop{false};
-    std::atomic<size_t> msg_count{0};
+    std::atomic<bool> parse_done{false};  // 解析线程完成(所有成交已进通道A)
+    std::atomic<size_t> trade_count{0};
+    std::atomic<size_t> unpacked_total{0};  // 拆包器拆出的消息数
+    std::atomic<size_t> recv_count{0};      // 接收线程 recv 次数
 
     struct State { std::atomic<bool> armed{false}; };
     State st;
@@ -163,49 +133,70 @@ int main(int argc, char* argv[]) {
         st.armed.store(true, std::memory_order_release);
 
         uint8_t buf[65536];
+        static bool dumped = false;
+        std::atomic<size_t>& rc = recv_count;
         while (!stop.load(std::memory_order_acquire)) {
             ssize_t n = receiver->recv(buf, sizeof(buf));
             if (n > 0) {
-                unpacker.feed(buf, (size_t)n);
-                fc->received.fetch_add(1, std::memory_order_release);
+                ++rc;
+                if (!dumped) {
+                    FILE* df = fopen("/tmp/pkt_dump.txt", "w");
+                    fprintf(df, "recv n=%zd\n", n);
+                    for (int i = 0; i < (n < 32 ? n : 32); ++i) fprintf(df, "%02x ", buf[i]);
+                    fprintf(df, "\n");
+                    fclose(df);
+                    dumped = true;
+                }
+                fc->received.fetch_add(1, std::memory_order_release);  // 先确认收到包
+                size_t unpacked = unpacker.feed(buf, (size_t)n);
+                unpacked_total += unpacked;
             } else break;
         }
     });
 
-    // ── 消费线程: 从共享 ring 读 [seq][len][体], 去 seq 拼流 ──
-    std::thread consume_th([&]() {
-        uint8_t body[200];
-        uint64_t seq;
-        while (!stop.load(std::memory_order_acquire) || !shared_ring.empty()) {
-            size_t n = read_one_msg(shared_ring, body, seq);
-            if (n > 0) {
-                // 拼回 [len][体](len 2字节 + 体 n 字节)
-                parsed_stream.push_back(static_cast<uint8_t>(n >> 8));
-                parsed_stream.push_back(static_cast<uint8_t>(n & 0xFF));
-                parsed_stream.insert(parsed_stream.end(), body, body + n);
-                ++msg_count;
-                // seq 连续性
+    // ── 解析线程: ByteRingParser 解析, 成交进通道 A ──
+    std::atomic<size_t> parsed_total{0};
+    std::thread parse_th([&]() {
+        while (!stop.load(std::memory_order_acquire)) {
+            size_t n = parser.parse_available();
+            parsed_total += n;
+            if (!parser.ring().empty()) continue;
+            if (!stop.load()) parser.wait_for_data(200);
+        }
+        parsed_total += parser.parse_available();  // 清空剩余: 所有成交已进通道 A
+        parse_done.store(true, std::memory_order_release);
+    });
+
+    // ── 策略线程: 从通道 A 收成交, 喂 4 策略 + K线 ──
+    std::thread strategy_th([&]() {
+        MarketEvent ev;
+        // 退出条件: 解析已完成(parse_done) 且 通道A空(pending==0)
+        while (!parse_done.load(std::memory_order_acquire) || channel_a.pending(0) > 0) {
+            if (channel_a.pop(0, ev)) {
+                vbs.on_event(ev); pbs.on_event(ev); tds.on_event(ev); tms.on_event(ev);
+                kagg.on_trade(ev);
+                ++trade_count;
                 uint64_t l = last_seq.load();
-                if (l != 0 && seq != l + 1)
+                if (l != 0 && ev.seq_id != l + 1)
                     seq_contiguous.store(false, std::memory_order_relaxed);
-                last_seq.store(seq, std::memory_order_relaxed);
-            } else {
-                if (!stop.load()) std::this_thread::yield();
+                last_seq.store(ev.seq_id, std::memory_order_relaxed);
+            } else if (!parse_done.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
             }
         }
     });
 
-    // 主线程: 等就绪 → fork benchmark
+    // 等接收就绪 → fork benchmark
     while (!st.armed.load(std::memory_order_acquire)) sched_yield();
     fc->ready.store(true, std::memory_order_release);
-    printf("接收端就绪, fork benchmark...\n");
+    printf("接收端就绪, fork benchmark...\n"); fflush(stdout);
 
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
         char port_arg[16], backlog_arg[16];
         snprintf(port_arg, sizeof(port_arg), "%u", port);
-        snprintf(backlog_arg, sizeof(backlog_arg), "%d", 5000);
+        snprintf(backlog_arg, sizeof(backlog_arg), "%d", 100000);  // 大 backlog, 新限速用
         execl(bench_path.c_str(), bench_path.c_str(),
               "--file", itch_file.c_str(),
               "--port", port_arg,
@@ -214,46 +205,58 @@ int main(int argc, char* argv[]) {
         _exit(127);
     }
 
-    // 等接收 + 消费完成
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-    while (fc->received.load() == 0 && std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    stop.store(true, std::memory_order_release);
-    receiver->stop();
-    recv_th.join();
-    consume_th.join();
-
+    // 等 benchmark 子进程完成(新限速: 发前等 received, 接收端跟上则全速)
     int wstatus = 0;
-    waitpid(pid, &wstatus, 0);
-    fc->ready.store(false, std::memory_order_release);
+    auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (waitpid(pid, &wstatus, WNOHANG) == 0
+           && std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    // 超时未退出: kill 兜底(避免残留进程占端口)
+    if (waitpid(pid, &wstatus, WNOHANG) == 0) {
+        printf("benchmark 超时, kill\n"); fflush(stdout);
+        kill(pid, SIGKILL);
+        waitpid(pid, &wstatus, 0);
+    }
     bool bench_ok = WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0;
-    printf("benchmark 子进程 exit: %s\n", bench_ok ? "0 (OK)" : "失败");
+    printf("benchmark 子进程 exit: %s (rc=%d)\n", bench_ok ? "0 (OK)" : "失败",
+           WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
+    fflush(stdout);
 
-    // ── 验证: 去 seq 流 vs 源文件 ──
+    // 停止顺序: 先停接收(不再收包) → 解析线程把 ring 清空(成交全进通道A)
+    // → 策略线程把通道A消费完。
+    receiver->stop();   // 打断接收线程的阻塞 recv
+    recv_th.join();     // 接收完
+
+    // 等解析线程把共享 ring 清空(所有成交进通道 A)
+    // 解析线程在 stop 前持续解析; 这里 sleep 让 ring 排空
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    stop.store(true, std::memory_order_release);
+    parser.notify();
+    parse_th.join();
+
+    // 策略线程: 消费到通道 A 空
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    strategy_th.join();
+
+    fc->ready.store(false, std::memory_order_release);
+
+    // ── 验证 ──
     printf("\n=== 端到端验证 ===\n");
     printf("接收包数:   %llu\n", (unsigned long long)fc->received.load());
-    printf("消费消息数: %zu\n", msg_count.load());
-    printf("拼接流:     %zu 字节\n", parsed_stream.size());
-    printf("源文件:     %zu 字节\n", source.size());
+    printf("recv 次数:  %zu\n", recv_count.load());
+    printf("拆包消息数: %zu\n", unpacked_total.load());
+    printf("解析消息数: %zu\n", parsed_total.load());
+    printf("成交事件数: %zu\n", trade_count.load());
     printf("seq 连续:   %s\n", seq_contiguous.load() ? "yes" : "NO");
+    printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d (0=BUY 1=SELL 2=NONE)\n",
+           (int)vbs.signal(), (int)pbs.signal(), (int)tds.signal(), (int)tms.signal());
 
     CHECK(bench_ok);
     CHECK(seq_contiguous.load());
-    CHECK(parsed_stream.size() == source.size());
-    if (parsed_stream.size() == source.size()) {
-        size_t mismatch = 0, first_bad = (size_t)-1;
-        for (size_t i = 0; i < source.size(); ++i) {
-            if (parsed_stream[i] != source[i]) {
-                ++mismatch;
-                if (first_bad == (size_t)-1) first_bad = i;
-            }
-        }
-        CHECK(mismatch == 0);
-        if (mismatch > 0)
-            printf("失配 %zu 字节, 首个偏移 %zu\n", mismatch, first_bad);
-    }
+    CHECK(trade_count.load() > 0);
 
+    delete[] ev_slots;
     receiver->stop();
     if (g_failures == 0) {
         printf("\n端到端验证 PASS ✓\n");

@@ -77,7 +77,12 @@ add_library(strategy
     strategy/base/strategy.h
     strategy/momentum/momentum_strategy.h
     strategy/trend/trend_strategy.h
-    strategy/book/order_book_imbalance_strategy.h
+    strategy/kline/kline_aggregator.h
+    strategy/kline/kline_consumer.h
+    strategy/tick/volume_breakout_strategy.h
+    strategy/tick/price_breakout_strategy.h
+    strategy/tick/trade_direction_strategy.h
+    strategy/tick/tick_momentum_strategy.h
 )
 
 target_link_libraries(strategy PUBLIC core)
@@ -143,11 +148,18 @@ add_executable(ut_spmc_event_queue
 target_link_libraries(ut_spmc_event_queue PRIVATE core)
 add_test(NAME ut_spmc_event_queue COMMAND ut_spmc_event_queue)
 
-add_executable(ut_obi
-    tests/unit/test_order_book_imbalance.cpp
+add_executable(ut_kline_strategies
+    tests/unit/test_kline_strategies.cpp
 )
-target_link_libraries(ut_obi PRIVATE core strategy)
-add_test(NAME ut_obi COMMAND ut_obi)
+target_link_libraries(ut_kline_strategies PRIVATE core strategy)
+add_test(NAME ut_kline_strategies COMMAND ut_kline_strategies)
+
+# SPMC 多消费者广播: 多个策略从通道 A 消费同一批成交
+add_executable(ut_spmc_strategies
+    tests/integration/test_spmc_strategies.cpp
+)
+target_link_libraries(ut_spmc_strategies PRIVATE core strategy)
+add_test(NAME ut_spmc_strategies COMMAND ut_spmc_strategies)
 
 add_executable(ut_itch_parser
     tests/unit/test_itch_parser.cpp
@@ -181,9 +193,9 @@ add_test(NAME ut_uring COMMAND ut_uring)
 add_executable(ut_benchmark_verify
     tests/integration/test_benchmark_verify.cpp
 )
-target_link_libraries(ut_benchmark_verify PRIVATE core)
+target_link_libraries(ut_benchmark_verify PRIVATE core market strategy)
 add_test(NAME ut_benchmark_verify
     COMMAND ut_benchmark_verify
-        ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_test_small.bin
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_chain_sample.bin
         8080
         $<TARGET_FILE:trader_benchmark>)

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 // ── MoldUDP64 拆包器 ──
 // 接收一个 MoldUDP64 包（20 字节头 + 若干条 ITCH 消息），拆出每条消息，

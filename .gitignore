@@ -21,3 +21,4 @@ docs/benchmark/**/*.png
 
 # Test data (ITCH binaries, etc.)
 test_data/
+trader_parsed.txt

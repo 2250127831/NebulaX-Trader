@@ -23,7 +23,7 @@ class IoUringPoller
 public:
     static constexpr unsigned DEFAULT_ENTRIES = 256;
     static constexpr unsigned MAX_BUFFERS = 64;
-    static constexpr size_t   BUF_SIZE   = 4096;
+    static constexpr size_t   BUF_SIZE   = 8192;   // > 最大 UDP 包(benchmark 最大 4168B)
 
     IoUringPoller() = default;
 

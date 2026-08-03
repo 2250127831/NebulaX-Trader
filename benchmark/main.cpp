@@ -281,10 +281,12 @@ int main(int argc, char* argv[]) {
     double sec = std::chrono::duration<double>(t_end - t_start).count();
 
     printf("\n=== Done ===\n");
-    printf("  Messages sent:   %lu\n", total_sent);
+    printf("  Packets sent:     %lu\n", total_sent);
+    printf("  Messages sent:    %llu\n", (unsigned long long)global_msg_seq);
     printf("  Extra bytes skipped: %lu\n", extra_bytes);
     printf("  Total time:      %.3f s\n", sec);
-    printf("  Send rate:       %.0f msg/s\n", total_sent / sec);
+    printf("  Send rate:       %.0f pkt/s (%.0f msg/s)\n",
+           total_sent / sec, (double)global_msg_seq / sec);
 
     // 通知交易系统行情发完（有共享内存时，trader 据此退出）
     if (fc) fc->done.store(true, std::memory_order_release);

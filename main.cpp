@@ -321,22 +321,49 @@ int main(int argc, char* argv[]) {
     //               而 benchmark 永远等 received 死锁。done 是显式握手。)
     //   no-shm 模式: 运行 idle_timeout_sec 秒(压测脚本: 起 trader → 等 → 发数据 → 汇总)。
     if (fc) {
+        auto t_shm_start = std::chrono::steady_clock::now();
         while (!fc->done.load(std::memory_order_acquire))
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        auto t_shm_end = std::chrono::steady_clock::now();
+        double wall = std::chrono::duration<double>(t_shm_end - t_shm_start).count();
+        uint64_t parsed = parser.message_count();
+        printf("解析 QPS: 均值=%llu msg/s (解析 %llu 条 / %.1f 秒)\n",
+               wall > 0 ? (unsigned long long)(parsed / wall) : 0ull,
+               (unsigned long long)parsed, wall);
     } else {
         // no-shm 压测模式: 收到第一条消息后, idle_timeout_sec(默认10) 无消息
         // (解析数不再增长) → 写解析总数到文件 → 自动关闭。
         // 从"收到第一条消息"才开始计时, 避免 benchmark 还没发(trader 先启动)时误超时。
+        // 同时统计解析 QPS(每秒解析数), 用于确定合理的压测速率。
         uint64_t last_parsed = 0;
         uint64_t idle_sec = 0;
+        uint64_t max_qps = 0;       // 峰值解析 QPS(每秒)
+        uint64_t total_parsed = 0;  // 总解析数
+        uint64_t active_sec = 0;    // 有数据的时间秒数
         bool started = false;
+        auto t_start_mon = std::chrono::steady_clock::now();
         while (!started || idle_sec < cfg.execution.idle_timeout_sec) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             uint64_t p = parser.message_count();
-            if (p != last_parsed) { last_parsed = p; idle_sec = 0; started = true; }
+            if (p != last_parsed) {
+                uint64_t inc = p - last_parsed;
+                last_parsed = p;
+                if (started) {  // 非首条: 算该秒增量
+                    total_parsed += inc;
+                    ++active_sec;
+                    if (inc > max_qps) max_qps = inc;
+                }
+                idle_sec = 0; started = true;
+            }
             else if (started) ++idle_sec;
         }
+        auto t_end_mon = std::chrono::steady_clock::now();
+        double wall = std::chrono::duration<double>(t_end_mon - t_start_mon).count();
         printf("10 秒无消息, 停止。解析总数=%llu\n", (unsigned long long)last_parsed);
+        printf("解析 QPS: 峰值=%llu msg/s, 均值=%llu msg/s (有数据 %llu 秒, 墙钟 %.1f 秒)\n",
+               (unsigned long long)max_qps,
+               active_sec ? (unsigned long long)(total_parsed / active_sec) : 0ull,
+               (unsigned long long)active_sec, wall);
         // 把解析总数写入文件(压测脚本读取评估)
         FILE* pf = fopen("trader_parsed.txt", "w");
         if (pf) {

@@ -39,7 +39,9 @@ int main(int argc, char* argv[]) {
 
     // ── 链路：解析器 → 消费者 ──
     ItchParser parser;
-    OrderBookConsumer consumer;
+    OrderPool pool(1 << 16);
+    OrderMap index(1 << 16);
+    OrderBookConsumer consumer(pool, index);
     parser.set_sink([&](const MarketEvent& ev) { consumer.on_event(ev); });
 
     size_t pos = 0;

@@ -34,17 +34,27 @@ public:
         uint64_t  sequence;
     };
 
-    // 默认：自建内部池（单标的，独立簿用）
+    // 默认：自建内部池 + 自建索引（单标的，独立簿用）
     explicit OrderBook(size_t pool_capacity = 1 << 16)
         : owned_pool_(std::make_unique<OrderPool>(pool_capacity))
+        , owned_index_(std::make_unique<OrderMap>(pool_capacity))
         , pool_(*owned_pool_)
-        , order_index_(pool_capacity)
+        , order_index_(*owned_index_)
     {}
 
-    // 共享外部池（多标的簿共用，避免每标的独立大池爆内存）
-    explicit OrderBook(OrderPool& shared_pool)
+    // 共享外部池（多标的簿共用，避免每标的独立大池爆内存）。
+    // order_map_capacity: 每簿自有 OrderMap 索引容量(默认 256, 按需)。
+    explicit OrderBook(OrderPool& shared_pool, size_t order_map_capacity = 256)
+        : owned_index_(std::make_unique<OrderMap>(order_map_capacity))
+        , pool_(shared_pool)
+        , order_index_(*owned_index_)
+    {}
+
+    // 共享外部池 + 共享索引（多标的簿: OrderPool/OrderMap 由主线程创建为全局，
+    // 所有 OrderBook 引用同一份。挂单数据与索引全局唯一, 每簿只保留盘口。)
+    explicit OrderBook(OrderPool& shared_pool, OrderMap& shared_index)
         : pool_(shared_pool)
-        , order_index_(shared_pool.capacity())
+        , order_index_(shared_index)
     {}
 
     // ── 挂单生命周期 ──
@@ -209,8 +219,9 @@ private:
     }
 
     std::unique_ptr<OrderPool> owned_pool_;               // 自建池（外部池时 nullptr）
-    OrderPool& pool_;                                     // 始终指向可用池（外部或自建）
+    std::unique_ptr<OrderMap>  owned_index_;              // 自建索引（共享索引时 nullptr）
+    OrderPool& pool_;                                     // 指向可用池（自建或共享）
+    OrderMap&  order_index_;                              // 指向索引（自建或共享）
     std::map<int64_t, PriceLevel, std::greater<>> bids_;  // 买档：价降序
     std::map<int64_t, PriceLevel> asks_;                  // 卖档：价升序
-    OrderMap order_index_;                                // order_ref → OrderSlot*
 };

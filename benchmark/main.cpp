@@ -32,7 +32,7 @@ struct Config {
     int order_ret_port = 9091;  // 成交回报发送目标端口(--no-shm 时用)
     uint64_t max_backlog = 10000;
     size_t pack_max  = 100;  // 每包消息条数上限（实际每包 1~pack_max 条随机）
-    uint64_t pace_us = 0;    // 每包间隔(微秒)，--no-shm 限速用(默认 0 = 全速)
+    uint64_t rate_01s = 0;   // 每 0.1 秒发送包数(窗口限速，0 = 全速)
     bool no_shm = false;     // 不挂共享内存(压测脚本模式，与 trader 无握手)
     bool help    = false;
 };
@@ -47,7 +47,7 @@ static Config parse_args(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--order-ret-port") == 0 && i+1 < argc) cfg.order_ret_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--backlog") == 0 && i+1 < argc) cfg.max_backlog = atol(argv[++i]);
         else if (strcmp(argv[i], "--pack-max") == 0 && i+1 < argc) cfg.pack_max = atol(argv[++i]);
-        else if (strcmp(argv[i], "--pace-us") == 0 && i+1 < argc) cfg.pace_us = atol(argv[++i]);
+        else if (strcmp(argv[i], "--rate") == 0 && i+1 < argc) cfg.rate_01s = atol(argv[++i]);
         else if (strcmp(argv[i], "--no-shm") == 0) cfg.no_shm = true;
         else cfg.help = true;
     }
@@ -63,9 +63,9 @@ static void usage() {
            "  --backlog <n>      Max backlog before slowing down (default: 10000)\n"
            "  --pack-max <n>     Max messages per UDP packet (default: 100)\n"
            "                     实际每包 1~pack-max 条随机，模拟真实行情打包\n"
-           "  --pace-us <us>     Per-packet sleep (us). Throttle without shm.\n"
+           "  --rate <n>         Per-0.1s packets sent (window throttle, 0=full speed)\n"
            "  --no-shm           No shared-memory handshake (pressure script mode).\n"
-           "                     Trader started first, wait, then fire at full/pace.\n");
+           "                     Window-throttle by --rate, no recv feedback.\n");
 }
 
 // ── 模拟交易所线程 ──
@@ -191,6 +191,11 @@ int main(int argc, char* argv[]) {
     uint64_t global_msg_seq = 0;   // 全局消息序号：每发一条消息 +1
     auto t_start = std::chrono::steady_clock::now();
 
+    // 窗口限速状态: 每 0.1 秒窗口发 rate_01s 包, 达到后 sleep 到窗口结束。
+    auto window_start = std::chrono::steady_clock::now();
+    uint64_t window_pkts = 0;
+    constexpr auto kWINDOW = std::chrono::milliseconds(100);   // 0.1 秒窗口
+
     // 包缓冲：20 字节头 + 消息们
     std::vector<uint8_t> pkt;
     pkt.reserve(4096);
@@ -238,16 +243,24 @@ int main(int argc, char* argv[]) {
             memcpy(hdr + 18, &be_cnt, 2);
 
             // 发送前限速:
-            //   有共享内存: 忙等上一包被接收(发一个等一个确认)，发送端永不领先>1包，
-            //              内核 UDP 缓冲永不溢出 → 零丢包，吞吐 = 接收确认 RTT。
-            //   无共享内存(--no-shm): 固定每包 sleep(pace_us)，压测脚本模式，
-            //              与 trader 无握手，发完即退。
+            //   有共享内存(测试模式): 忙等上一包被接收(发一个等一个确认)，
+            //              发送端永不领先>1包，内核 UDP 缓冲永不溢出 → 零丢包。
+            //   无共享内存(--no-shm 压测模式): 窗口限速——每 0.1 秒窗口发 rate_01s 包，
+            //              达到后 sleep 到窗口结束(固定速率，无实时反馈)。
             if (fc) {
                 while (fc->received.load(std::memory_order_acquire) < fc->sent.load(std::memory_order_relaxed)) {
                     std::this_thread::yield();
                 }
-            } else if (cfg.pace_us > 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(cfg.pace_us));
+            } else if (cfg.rate_01s > 0) {
+                // 窗口限速: 每 0.1 秒发 rate_01s 包, 超了就等窗口滚到下一格。
+                ++window_pkts;
+                if (window_pkts >= cfg.rate_01s) {
+                    auto el = std::chrono::steady_clock::now() - window_start;
+                    if (el < kWINDOW)
+                        std::this_thread::sleep_for(kWINDOW - el);
+                    window_start = std::chrono::steady_clock::now();
+                    window_pkts = 0;
+                }
             }
 
             ssize_t r = sendto(sock, pkt.data(), pkt.size(), 0,

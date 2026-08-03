@@ -86,7 +86,7 @@ int main(int argc, char* argv[]) {
     // 必须在 fork 之前做, 避免误杀本次 fork 的 benchmark。
     // 用 -x 精确匹配进程名(不含命令行参数), 避免误杀本测试
     // (本测试命令行含 "./build/trader_benchmark" 参数, -f 会误伤自身)。
-    system("pkill -x trader_benchmark");
+    (void)!system("pkill -x trader_benchmark");
     std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 等进程释放端口
 
     // ── 清理环境: 移除残留共享内存(避免复用旧计数器) ──
@@ -146,8 +146,10 @@ int main(int argc, char* argv[]) {
     SignalCombiner combiner;        // 主从分层: 主定方向, 从定强度
     kagg.set_sink([&](const KLine& bar) { trend.on_bar(bar); mom.on_bar(bar); });  // K线 → 低频主策略
 
-    // 通道 B 策略(线程间共享, 提前声明)
-    OrderBookConsumer obc;
+    // 通道 B 策略(线程间共享, 提前声明): 共享池 + 共享索引
+    OrderPool obc_pool(1 << 20);
+    OrderMap  obc_index(1 << 20);
+    OrderBookConsumer obc(obc_pool, obc_index);
     OrderBookImbalanceStrategy obi;
     OrderFlowImbalanceStrategy ofi;
 

@@ -142,8 +142,10 @@ int main(int argc, char* argv[]) {
         return vbs.signal();                      // 默认 volume_breakout
     };
 
-    // 从策略（订单簿侧）
-    OrderBookConsumer obc(cfg.order_book.pool_slots);
+    // 从策略（订单簿侧）: 共享挂单池 + 共享索引(主线程全局, 所有订单簿引用)
+    OrderPool shared_pool(cfg.order_book.pool_slots);
+    OrderMap  shared_index(cfg.order_book.pool_slots);
+    OrderBookConsumer obc(shared_pool, shared_index);
     OrderBookImbalanceStrategy obi;
     OrderFlowImbalanceStrategy ofi;
 
@@ -322,7 +324,25 @@ int main(int argc, char* argv[]) {
         while (!fc->done.load(std::memory_order_acquire))
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
     } else {
-        std::this_thread::sleep_for(std::chrono::seconds(cfg.execution.idle_timeout_sec));
+        // no-shm 压测模式: 收到第一条消息后, idle_timeout_sec(默认10) 无消息
+        // (解析数不再增长) → 写解析总数到文件 → 自动关闭。
+        // 从"收到第一条消息"才开始计时, 避免 benchmark 还没发(trader 先启动)时误超时。
+        uint64_t last_parsed = 0;
+        uint64_t idle_sec = 0;
+        bool started = false;
+        while (!started || idle_sec < cfg.execution.idle_timeout_sec) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            uint64_t p = parser.message_count();
+            if (p != last_parsed) { last_parsed = p; idle_sec = 0; started = true; }
+            else if (started) ++idle_sec;
+        }
+        printf("10 秒无消息, 停止。解析总数=%llu\n", (unsigned long long)last_parsed);
+        // 把解析总数写入文件(压测脚本读取评估)
+        FILE* pf = fopen("trader_parsed.txt", "w");
+        if (pf) {
+            fprintf(pf, "%llu\n", (unsigned long long)last_parsed);
+            fclose(pf);
+        }
     }
 
     // ── 停止 ──

@@ -61,5 +61,5 @@ execution:
   order_ret_port: 9091
 
   # 行情停止增长后退出等待秒数（回放数据发完即停）
-  # 压测脚本用 --no-shm: trader 运行该秒数后退出(需覆盖 等5s + 发送时间)
-  idle_timeout_sec: 30
+  # 压测脚本用 --no-shm: 无消息超过该秒数 → 写解析总数到文件 → 自动关闭
+  idle_timeout_sec: 10

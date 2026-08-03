@@ -1,10 +1,10 @@
 #include "market/book/order_book_consumer.h"
 
-// 取指定 locate 的订单簿（不存在则用共享池新建）
+// 取指定 locate 的订单簿（不存在则用共享池 + 共享索引新建）。
 OrderBook& OrderBookConsumer::book_for(uint64_t locate) {
     auto it = books_.find(locate);
     if (it == books_.end()) {
-        it = books_.try_emplace(locate, shared_pool_).first;
+        it = books_.try_emplace(locate, shared_pool_, shared_index_).first;
     }
     return it->second;
 }

@@ -7,8 +7,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-IoUringSender::IoUringSender(const std::string& host, uint16_t port)
-    : host_(host), port_(port) {}
+IoUringSender::IoUringSender(const std::string& host, uint16_t port,
+                             uint8_t* ring_buf, size_t ring_capacity)
+    : host_(host), port_(port), ring_(ring_buf, ring_capacity) {}
 
 bool IoUringSender::start()
 {

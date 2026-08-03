@@ -5,6 +5,9 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <vector>
+#include <cstdlib>
+#include <ctime>
 
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -12,6 +15,7 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <endian.h>
 #include <cerrno>
 
 // ── ITCH 5.0 消息边界 ──
@@ -23,6 +27,7 @@ struct Config {
     const char* host  = "127.0.0.1";
     int port          = 8080;
     uint64_t max_backlog = 10000;
+    size_t pack_max  = 100;  // 每包消息条数上限（实际每包 1~pack_max 条随机）
     bool help         = false;
 };
 
@@ -33,6 +38,7 @@ static Config parse_args(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--host")    == 0 && i+1 < argc) cfg.host = argv[++i];
         else if (strcmp(argv[i], "--port")    == 0 && i+1 < argc) cfg.port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--backlog") == 0 && i+1 < argc) cfg.max_backlog = atol(argv[++i]);
+        else if (strcmp(argv[i], "--pack-max") == 0 && i+1 < argc) cfg.pack_max = atol(argv[++i]);
         else cfg.help = true;
     }
     return cfg;
@@ -43,7 +49,9 @@ static void usage() {
            "  --file  <path>     ITCH binary file\n"
            "  --host <ip>        Target IP (default: 127.0.0.1)\n"
            "  --port <port>      Target UDP port (default: 8080)\n"
-           "  --backlog <n>      Max backlog before slowing down (default: 10000)\n");
+           "  --backlog <n>      Max backlog before slowing down (default: 10000)\n"
+           "  --pack-max <n>     Max messages per UDP packet (default: 100)\n"
+           "                     实际每包 1~pack-max 条随机，模拟真实行情打包\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -82,46 +90,85 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     printf("NX-Trader ready.  Start replay...\n");
 
-    // ── 全量发送 ──
+    // ── 全量发送（模拟真实交易所 MoldUDP64 封装）──
+    // 每包 = [MoldUDP64头: session(10) + seq(8) + count(2)] + [消息们]
+    // 内部维护全局消息序号 global_msg_seq（每发一条消息 +1）。
+    // 包头 seq = 包内第一条消息的全局序号（真实 MoldUDP64 语义，见 docs）。
+    // 每包 1~pack_max 条消息（随机），包边界在消息之间，不截断。
+    srand(static_cast<unsigned>(time(nullptr)));
     size_t pos = 0;
     uint64_t total_sent = 0;
     uint64_t extra_bytes = 0;
+    uint64_t global_msg_seq = 0;   // 全局消息序号：每发一条消息 +1
     auto t_start = std::chrono::steady_clock::now();
     uint64_t slowdown_ns = 0;
 
+    // 包缓冲：20 字节头 + 消息们
+    std::vector<uint8_t> pkt;
+    pkt.reserve(4096);
+    pkt.resize(20);  // MoldUDP64 头预留
+
     while (pos + 2 <= static_cast<size_t>(file_size)) {
-        // ITCH 5.0: 2 字节 big-endian 长度前缀 = 含 type 的消息体长度
-        uint16_t body_len = ntohs(*(const uint16_t*)(buf + pos));
-        if (body_len < 1 || body_len > 200) {
-            // 损坏的前缀：跳过 1 字节继续尝试对齐
-            ++pos; ++extra_bytes;
-            continue;
-        }
-        size_t msg_len = 2 + static_cast<size_t>(body_len);
-        if (pos + msg_len > static_cast<size_t>(file_size)) break;
+        // 每包随机定条数（1 ~ pack_max）
+        size_t msgs_this_packet = 1 + static_cast<size_t>(rand() % cfg.pack_max);
 
-        ssize_t r = sendto(sock, buf + pos, msg_len, 0,
-                           reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-        if (r > 0) {
-            fc->sent.fetch_add(1, std::memory_order_release);
-            ++total_sent;
+        // 记录包内第一条消息的全局序号（用于包头 seq）
+        uint64_t pkt_first_seq = global_msg_seq;
 
-            if ((total_sent & 0xFF) == 0) {
-                uint64_t sent = fc->sent.load(std::memory_order_relaxed);
-                uint64_t recv = fc->received.load(std::memory_order_acquire);
-                int64_t backlog = static_cast<int64_t>(sent - recv);
-
-                if (backlog > static_cast<int64_t>(cfg.max_backlog))
-                    slowdown_ns += 100;
-                else if (backlog < 100 && slowdown_ns > 0)
-                    slowdown_ns -= slowdown_ns > 100 ? 100 : slowdown_ns;
+        // 攒满 msgs_this_packet 条或文件结束
+        size_t pkt_count = 0;
+        for (size_t i = 0; i < msgs_this_packet && pos + 2 <= static_cast<size_t>(file_size); ++i) {
+            // ITCH 5.0: 2 字节 big-endian 长度前缀 = 含 type 的消息体长度
+            uint16_t body_len = ntohs(*(const uint16_t*)(buf + pos));
+            if (body_len < 1 || body_len > 200) {
+                // 损坏的前缀：跳过 1 字节继续尝试对齐
+                ++pos; ++extra_bytes;
+                --i;  // 本条不算，继续攒
+                continue;
             }
-
-            if (slowdown_ns > 0)
-                std::this_thread::sleep_for(std::chrono::nanoseconds(slowdown_ns));
+            size_t msg_len = 2 + static_cast<size_t>(body_len);
+            if (pos + msg_len > static_cast<size_t>(file_size)) break;
+            pkt.insert(pkt.end(), buf + pos, buf + pos + msg_len);
+            pos += msg_len;
+            ++pkt_count;
+            ++global_msg_seq;
         }
 
-        pos += msg_len;
+        // 填 MoldUDP64 头（20 字节）: session(10) + seq(8) + count(2)
+        if (pkt_count > 0) {
+            uint8_t* hdr = pkt.data();
+            memset(hdr, 0, 10);                          // session: 10 字节（0）
+            uint64_t be_seq = htobe64(pkt_first_seq);    // seq: 8 字节，包内第一条消息序号
+            memcpy(hdr + 10, &be_seq, 8);
+            uint16_t be_cnt = htobe16(pkt_count);        // count: 2 字节
+            memcpy(hdr + 18, &be_cnt, 2);
+
+            ssize_t r = sendto(sock, pkt.data(), pkt.size(), 0,
+                               reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            pkt.clear();
+            pkt.resize(20);  // 复位头预留
+            if (r > 0) {
+                fc->sent.fetch_add(1, std::memory_order_release);
+                ++total_sent;
+
+                if ((total_sent & 0xFF) == 0) {
+                    uint64_t sent = fc->sent.load(std::memory_order_relaxed);
+                    uint64_t recv = fc->received.load(std::memory_order_acquire);
+                    int64_t backlog = static_cast<int64_t>(sent - recv);
+
+                    if (backlog > static_cast<int64_t>(cfg.max_backlog))
+                        slowdown_ns += 100;
+                    else if (backlog < 100 && slowdown_ns > 0)
+                        slowdown_ns -= slowdown_ns > 100 ? 100 : slowdown_ns;
+                }
+
+                if (slowdown_ns > 0)
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(slowdown_ns));
+            }
+        } else {
+            pkt.clear();
+            pkt.resize(20);
+        }
     }
 
     auto t_end = std::chrono::steady_clock::now();

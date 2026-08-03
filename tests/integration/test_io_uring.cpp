@@ -71,8 +71,10 @@ static void test_sender()
     laddr.sin_addr.s_addr = INADDR_ANY;
     CHECK(bind(listen_sock, reinterpret_cast<sockaddr*>(&laddr), sizeof(laddr)) == 0);
 
-    // 堆分配：IoUringSender 内含 8MB SPSC ring（必须堆上）
-    auto sender = std::make_unique<IoUringSender>("127.0.0.1", SEND_PORT);
+    // IoUringSender 的 ring 存储空间由用户分配
+    auto send_ring_buf = std::make_unique<uint8_t[]>(1 << 20);
+    auto sender = std::make_unique<IoUringSender>("127.0.0.1", SEND_PORT,
+                                                  send_ring_buf.get(), 1 << 20);
     CHECK(sender->start());
 
     const char msg[] = "zero-copy send";

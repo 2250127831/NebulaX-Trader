@@ -37,6 +37,9 @@ add_library(core
     core/config_loader.cpp
     core/queue/spsc_byte_ring.h
     core/queue/spmc_ring.h
+    core/queue/spmc_event_queue.h
+    core/queue/queue_manager.h
+    core/market_event.h
     core/memory/memory_pool.h
     core/utils/align.h
     core/net/i_market_data_receiver.h
@@ -57,6 +60,13 @@ target_include_directories(core PUBLIC ${LIBURING_INCLUDE_DIRS})
 add_library(market
     market/gateway/market_data_gateway.h
     market/parser/tick_parser.h
+    market/parser/itch_parser.h
+    market/parser/itch_parser.cpp
+    market/book/order_book.h
+    market/book/order_book_consumer.h
+    market/book/order_book_consumer.cpp
+    market/pipeline/byte_ring_parser.h
+    market/pipeline/mold_udp_unpacker.h
 )
 
 target_link_libraries(market PUBLIC core)
@@ -67,6 +77,7 @@ add_library(strategy
     strategy/base/strategy.h
     strategy/momentum/momentum_strategy.h
     strategy/trend/trend_strategy.h
+    strategy/book/order_book_imbalance_strategy.h
 )
 
 target_link_libraries(strategy PUBLIC core)
@@ -125,6 +136,33 @@ add_executable(ut_spmc
 )
 target_link_libraries(ut_spmc PRIVATE core)
 add_test(NAME ut_spmc COMMAND ut_spmc)
+
+add_executable(ut_spmc_event_queue
+    tests/unit/test_spmc_event_queue.cpp
+)
+target_link_libraries(ut_spmc_event_queue PRIVATE core)
+add_test(NAME ut_spmc_event_queue COMMAND ut_spmc_event_queue)
+
+add_executable(ut_obi
+    tests/unit/test_order_book_imbalance.cpp
+)
+target_link_libraries(ut_obi PRIVATE core strategy)
+add_test(NAME ut_obi COMMAND ut_obi)
+
+add_executable(ut_itch_parser
+    tests/unit/test_itch_parser.cpp
+)
+target_link_libraries(ut_itch_parser PRIVATE core market)
+add_test(NAME ut_itch_parser
+    COMMAND ut_itch_parser ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_parser_sample.bin)
+
+# 字节 ring 管道：连续字节流 → 原地解析 → 事件
+add_executable(ut_byte_ring_pipeline
+    tests/integration/test_byte_ring_pipeline.cpp
+)
+target_link_libraries(ut_byte_ring_pipeline PRIVATE core market)
+add_test(NAME ut_byte_ring_pipeline
+    COMMAND ut_byte_ring_pipeline ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_parser_sample.bin)
 
 # ── 集成测试 ──
 add_executable(it_tick_pipeline

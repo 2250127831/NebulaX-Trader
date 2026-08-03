@@ -5,24 +5,34 @@
 #include <cstring>
 #include <sys/uio.h>
 
-constexpr size_t RING_SIZE = 8388608;  // 8 MB  // 1 MB, 必须是 2 的幂
-
 // ── SPSCByteRing: 单生产者单消费者的字节环形缓冲区 ──
 //
 // push(data, len): 写入尽可能多的字节，返回实际写入数
 // pop(buf, len):   读出尽可能多的字节，返回实际读出数
 // read_acquire / read_release: 零拷贝读（获取内部指针）
-// N 必须是 2 的幂。
-template<size_t N>
+//
+// 存储空间由用户传入（堆分配 / 共享内存 / 内核映射），队列不拥有。
+// capacity 必须是 2 的幂（构造时校验）。
+//
+// 用法：
+//   uint8_t* buf = new uint8_t[1 << 20];
+//   SPSCByteRing ring(buf, 1 << 20);
 class SPSCByteRing
 {
-    static_assert((N & (N - 1)) == 0, "N must be a power of 2");
-
 public:
+    // 用户传入存储空间 + 容量。capacity 必须 2 的幂（不满足返回 false，需检查 valid()）。
+    SPSCByteRing(uint8_t* buf, size_t capacity)
+        : buf_(buf), capacity_(capacity), valid_((capacity & (capacity - 1)) == 0) {}
+
+    // 默认构造：不绑定空间，需先 valid() 检查（或用于测试）
     SPSCByteRing() = default;
 
     SPSCByteRing(const SPSCByteRing&) = delete;
     SPSCByteRing& operator=(const SPSCByteRing&) = delete;
+
+    // 空间是否合法（2 的幂 + 已绑定）
+    bool valid() const { return valid_ && buf_ != nullptr; }
+    size_t capacity() const { return capacity_; }
 
     // ── producer ──
 
@@ -30,14 +40,14 @@ public:
     {
         size_t head = head_.load(std::memory_order_acquire);
         size_t tail = tail_.load(std::memory_order_relaxed);
-        size_t free = N - (tail - head);
+        size_t free = capacity_ - (tail - head);
         if (free == 0 || len == 0) return 0;
 
         size_t actual = (len < free) ? len : free;
-        size_t mask   = N - 1;
+        size_t mask   = capacity_ - 1;
         size_t pos    = tail & mask;
 
-        size_t n1 = N - pos;
+        size_t n1 = capacity_ - pos;
         if (n1 > actual) n1 = actual;
         if (n1 > 0) memcpy(buf_ + pos, data, n1);
 
@@ -60,9 +70,9 @@ public:
         if (used == 0 || request == 0) { ptr = nullptr; return 0; }
 
         size_t actual = (request < used) ? request : used;
-        size_t mask   = N - 1;
+        size_t mask   = capacity_ - 1;
         size_t pos    = head & mask;
-        size_t contig = N - pos;
+        size_t contig = capacity_ - pos;
         if (actual > contig) actual = contig;
         ptr = buf_ + pos;
         return actual;
@@ -75,6 +85,9 @@ public:
     }
 
     // ── consumer: 带拷贝读取 ──
+    //
+    // 原子读：只有拿到完整 len 字节才释放，不足时什么都不释放（返回实际可读，
+    // 但字节保留在 ring，调用方应等更多数据再试）。这避免了"部分消费导致丢字节"。
 
     size_t pop(void* buf, size_t len)
     {
@@ -82,18 +95,20 @@ public:
         size_t n1 = read_acquire(ptr, len);
         if (n1 == 0) return 0;
         memcpy(buf, ptr, n1);
-        read_release(n1);
+        if (n1 == len) {            // 一次读全（不跨回绕）
+            read_release(n1);
+            return n1;
+        }
 
         size_t remaining = len - n1;
-        if (remaining > 0) {
-            size_t n2 = read_acquire(ptr, remaining);
-            if (n2 > 0) {
-                memcpy(static_cast<uint8_t*>(buf) + n1, ptr, n2);
-                read_release(n2);
-                return n1 + n2;
-            }
+        size_t n2 = read_acquire(ptr, remaining);
+        if (n2 < remaining) {
+            // 第二段不足：不释放任何字节（n1 也不释放），等更多数据
+            return 0;
         }
-        return n1;
+        memcpy(static_cast<uint8_t*>(buf) + n1, ptr, n2);
+        read_release(len);          // 完整拿到，一次释放全部
+        return len;
     }
 
     // ── queries & buffer 暴露 ──
@@ -102,18 +117,21 @@ public:
     {
         size_t h = head_.load(std::memory_order_acquire);
         size_t t = tail_.load(std::memory_order_relaxed);
-        return N - (t - h);
+        return capacity_ - (t - h);
     }
 
     uint8_t* raw_buffer() { return buf_; }
-    size_t   raw_size() const { return N; }
-    struct iovec raw_iovec() { return { buf_, N }; }
+    size_t   raw_size() const { return capacity_; }
+    struct iovec raw_iovec() { return { buf_, capacity_ }; }
     // 外部只读：暴露读写位置（供监控端 mmap 后直接读）
     size_t tail() const { return tail_.load(std::memory_order_relaxed); }
     size_t head() const { return head_.load(std::memory_order_relaxed); }
+    bool empty() const { return head() == tail(); }
 
 private:
     alignas(64) std::atomic<size_t> tail_{0};
     alignas(64) std::atomic<size_t> head_{0};
-    uint8_t buf_[N]{};
+    uint8_t* buf_ = nullptr;        // 用户传入的存储空间（队列不拥有）
+    size_t   capacity_ = 0;         // 容量（运行时）
+    bool     valid_ = false;        // 空间是否合法（2 的幂 + 已绑定）
 };

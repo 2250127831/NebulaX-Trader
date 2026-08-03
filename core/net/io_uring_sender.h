@@ -15,7 +15,10 @@
 // 再从 ring 零拷贝发送到网卡，免去用户态→内核的数据拷贝。
 class IoUringSender : public IMarketDataSender {
 public:
-    IoUringSender(const std::string& host, uint16_t port);
+    // 构造传入发送中转 ring 的存储空间 + 容量（用户分配，见 SPSCByteRing）。
+    // ring 的原始 buffer 会被注册为 io_uring 固定缓冲区（SEND_ZC）。
+    IoUringSender(const std::string& host, uint16_t port,
+                  uint8_t* ring_buf, size_t ring_capacity);
 
     bool start() override;
     void stop() override;
@@ -35,7 +38,7 @@ private:
     bool uring_ok_ = false;
 
     // 发送中转 ring，其原始 buffer 注册为固定缓冲区
-    SPSCByteRing<RING_SIZE> ring_;
+    SPSCByteRing ring_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> blocking_{true};

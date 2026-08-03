@@ -67,7 +67,10 @@ Virtual Exchange
 IMarketDataReceiver ← IoUringReceiver（V1 默认实现）
         │
         ▼
-Parser → Market State → Dispatcher → Strategy → OMS → Execution
+Parser ──► Market State ──► Dispatcher → Strategy → OMS → Execution
+             │
+             ├─ 订单簿：逐笔委托 A/D/X/U → 每档挂单量（按 symbol 分簿）
+             └─ Tick：成交 P/E/C → last_price / volume / timestamp
 ```
 
 ## 主要内容
@@ -80,11 +83,16 @@ Parser → Market State → Dispatcher → Strategy → OMS → Execution
 - Cache Line 优化。
 
 实现：
-- 行情接收；
-- Tick 解析；
+- 行情接收（io_uring）；
+- 逐笔委托解析（A/D/X/U）；
+- 订单簿重建（按 symbol 分簿，维护每档挂单量，成交更新剩余量）；
+- 成交解析（P/E/C）→ 生成 Tick（last_price / volume / timestamp）；
 - 策略计算；
 - 订单生成；
 - 模拟执行。
+
+> 订单簿是行情层的市场快照（对手挂单），不是撮合簿；撮合簿见 NebulaX。
+> 重建依赖完整逐笔委托流：只有成交流无法判断全部/部分成交（见 MARKET_DATA_DECISION.md §2.5）。
 
 形成完整但高性能的单策略交易链路，作为全链路的 Benchmark 基线。
 
@@ -138,13 +146,14 @@ Parser → Market State → Dispatcher → Strategy → OMS → Execution
 - Strategy Manager（策略注册与生命周期管理）；
 - Tick Broadcast Ring（多策略广播）；
 - Consumer Sequence 管理；
-- Market State 维护；
+- Market State 维护（V1 的订单簿 → 盘口快照，供盘口类策略消费）；
 - 风控模块集成。
 
 策略（仅用于验证系统）：
 - 趋势策略；
 - 动量策略；
-- 均值回归策略。
+- 均值回归策略；
+- 盘口策略（消费订单簿：买一/卖一价量、盘口失衡等信号）。
 
 ## 相比 V2 的提升
 

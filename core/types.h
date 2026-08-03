@@ -3,22 +3,33 @@
 #include <cstddef>
 #include <cstdint>
 
+// ── 价格表示约定 ──
+// 价格一律用定点整数，不用浮点：
+//   - 线上行情（ITCH 等）价格本来就是整数，交易所撮合全程整数
+//   - 浮点在展示层才有意义，内部计算/比较/撮合永不碰 double
+// 精度：
+//   - Tick 用「分」（×100）：12345 = 123.45 元（A 股最小报价单位）
+//   - Order 同样用定点整数，精度由接入的市场决定（A 股 ×100 / 美股 ×10000）
+// 换算只发生在协议边界和展示层，见 price_to_double()。
+
 // ── Tick 数据结构 ──
 // 定长设计，避免变长消息带来的内存管理开销
 struct Tick {
+    static constexpr int64_t kTickSize = 100;  // 价格精度：1 元 = 100（分）
+
     uint64_t timestamp;       // 时间戳（纳秒）
     uint64_t seq_id;          // 行情序列号
     uint64_t symbol_id;       // 合约/股票 ID
-    double    last_price;     // 最新成交价
+    int64_t   last_price;     // 最新成交价（分，定点整数）
     uint64_t volume;          // 成交量
-    double    bid_price;      // 买一价
-    double    ask_price;      // 卖一价
+    int64_t   bid_price;      // 买一价（分，定点整数）
+    int64_t   ask_price;      // 卖一价（分，定点整数）
     uint64_t bid_volume;      // 买一量
     uint64_t ask_volume;      // 卖一量
 };
 
 // ── Order 数据结构 ──
-enum class OrderSide : uint8_t { BUY = 0, SELL = 1 };
+enum class OrderSide : uint8_t { BUY = 0, SELL = 1, NONE = 2 };  // NONE = 观望（无方向信号）
 enum class OrderType : uint8_t { MARKET = 0, LIMIT = 1, ICEBERG = 2 };
 
 struct Order {
@@ -27,7 +38,12 @@ struct Order {
     uint64_t symbol_id;       // 合约 ID
     OrderSide  side;          // 买卖方向
     OrderType  type;          // 订单类型
-    double     price;         // 价格（市价单填 0）
+    int64_t    price;         // 价格（定点整数，市价单填 0）
     uint64_t   quantity;      // 数量
     uint64_t   timestamp;     // 下单时间戳
 };
+
+// 定点价格 → double（仅展示层用，业务计算不要用浮点）
+inline double price_to_double(int64_t price) {
+    return static_cast<double>(price) / static_cast<double>(Tick::kTickSize);
+}

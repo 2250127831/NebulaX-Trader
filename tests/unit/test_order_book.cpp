@@ -17,7 +17,9 @@ static int g_failures = 0;
     } while (0)
 
 int main() {
-    OrderBook book(1024);
+    OrderPool pool(1024);
+    OrderMap  index(1024);
+    OrderBook book(pool, index);
 
     // ── ADD: 买 100@1000, 买 200@990, 卖 300@1010, 卖 400@1020 ──
     CHECK(book.add(1, OrderSide::BUY,  1000, 100, 1) != UINT32_MAX);
@@ -82,7 +84,9 @@ int main() {
     CHECK(!book.execute(999, 10));
 
     // ── 空簿 ──
-    OrderBook empty_book(16);
+    OrderPool epool(16);
+    OrderMap  eindex(16);
+    OrderBook empty_book(epool, eindex);
     CHECK(empty_book.best_bid() == -1);
     CHECK(empty_book.best_ask() == -1);
     CHECK(empty_book.empty());

@@ -2,7 +2,7 @@
 
 market:
   # 行情数据源类型
-  # itch      : NASDAQ ITCH 协议接入
+  # itch : NASDAQ ITCH 协议接入（回放）
   type: itch
 
   # UDP 行情源连接参数
@@ -12,37 +12,53 @@ market:
   # io_uring 异步 IO 配置
   uring_entries: 256
 
+  # 字节 ring 容量（接收 → 解析）
+  ring_bytes: 4194304
+
+  # 通道 A/B 槽位数
+  chan_slots: 1048576
+
+order_book:
+  # 是否启用订单簿重建（通道B）+ OBI/OFI 策略
+  enabled: true
+
+  # 共享挂单池槽位
+  pool_slots: 1048576
+
 strategy:
-  # 策略名称
-  # trend     : 趋势跟踪
-  # momentum  : 动量策略
-  name: trend
+  # 主策略（定方向）
+  # volume_breakout : 成交量突破
+  # trend           : 趋势跟踪（需多根K线）
+  # momentum        : 动量（需多根K线）
+  primary: volume_breakout
 
-  # 并行 Worker 数（对应 SPMC 消费者数）
-  workers: 4
+  # 成交量突破参数
+  vol_window: 100
+  vol_threshold: 5000
 
-  # 策略参数
-  fast_period: 10
-  slow_period: 30
+  # 从策略（定强度）
+  use_obi: true
+  use_ofi: true
+
+  # 低频主策略的 K线聚合（每 N 笔成交一根，与时间无关）
+  kline_ticks: 10
 
 risk:
   # 单品种最大持仓
   max_position: 10000
 
-  # 单日最大亏损
-  max_daily_loss: 100000.0
+  # 单日最大亏损（分，默认 100 万元）
+  max_daily_loss: 100000000
 
 execution:
-  # 执行算法
-  algo: straight
+  # 满强度基准下单量（股）
+  base_qty: 100
 
-  # 下单超时（毫秒）
-  timeout_ms: 1000
+  # 模拟交易所收单端口
+  order_port: 9090
 
-  # 重试次数
-  max_retries: 3
+  # 成交回报接收端口
+  order_ret_port: 9091
 
-worker:
-  # 线程绑定 CPU（避免线程切换抖动）
-  # 留空表示不绑核
-  cpu_affinity: []
+  # 行情停止增长后退出等待秒数（回放数据发完即停）
+  idle_timeout_sec: 3

@@ -14,34 +14,38 @@ Config ConfigLoader::load(const std::string& path) {
         if (n["host"])           cfg.market.host          = n["host"].as<std::string>();
         if (n["port"])           cfg.market.port          = n["port"].as<uint16_t>();
         if (n["uring_entries"])  cfg.market.uring_entries = n["uring_entries"].as<uint32_t>();
+        if (n["ring_bytes"])     cfg.market.ring_bytes    = n["ring_bytes"].as<size_t>();
+        if (n["chan_slots"])     cfg.market.chan_slots    = n["chan_slots"].as<size_t>();
+    }
+
+    // order_book
+    if (auto n = root["order_book"]) {
+        if (n["enabled"])     cfg.order_book.enabled    = n["enabled"].as<bool>();
+        if (n["pool_slots"])  cfg.order_book.pool_slots = n["pool_slots"].as<size_t>();
     }
 
     // strategy
     if (auto n = root["strategy"]) {
-        if (n["name"])        cfg.strategy.name        = n["name"].as<std::string>();
-        if (n["workers"])     cfg.strategy.workers     = n["workers"].as<uint32_t>();
-        if (n["fast_period"]) cfg.strategy.fast_period = n["fast_period"].as<uint32_t>();
-        if (n["slow_period"]) cfg.strategy.slow_period = n["slow_period"].as<uint32_t>();
+        if (n["primary"])         cfg.strategy.primary         = n["primary"].as<std::string>();
+        if (n["vol_window"])      cfg.strategy.vol_window      = n["vol_window"].as<size_t>();
+        if (n["vol_threshold"])   cfg.strategy.vol_threshold   = n["vol_threshold"].as<uint64_t>();
+        if (n["use_obi"])         cfg.strategy.use_obi         = n["use_obi"].as<bool>();
+        if (n["use_ofi"])         cfg.strategy.use_ofi         = n["use_ofi"].as<bool>();
+        if (n["kline_ticks"])     cfg.strategy.kline_ticks     = n["kline_ticks"].as<size_t>();
     }
 
     // risk
     if (auto n = root["risk"]) {
         if (n["max_position"])   cfg.risk.max_position   = n["max_position"].as<uint64_t>();
-        if (n["max_daily_loss"]) cfg.risk.max_daily_loss = n["max_daily_loss"].as<double>();
+        if (n["max_daily_loss"]) cfg.risk.max_daily_loss = n["max_daily_loss"].as<int64_t>();
     }
 
     // execution
     if (auto n = root["execution"]) {
-        if (n["algo"])        cfg.execution.algo        = n["algo"].as<std::string>();
-        if (n["timeout_ms"])  cfg.execution.timeout_ms  = n["timeout_ms"].as<uint32_t>();
-        if (n["max_retries"]) cfg.execution.max_retries = n["max_retries"].as<uint32_t>();
-    }
-
-    // worker
-    if (auto n = root["worker"]) {
-        if (n["cpu_affinity"]) {
-            cfg.worker.cpu_affinity = n["cpu_affinity"].as<std::vector<uint32_t>>();
-        }
+        if (n["base_qty"])         cfg.execution.base_qty         = n["base_qty"].as<uint64_t>();
+        if (n["order_port"])       cfg.execution.order_port       = n["order_port"].as<uint16_t>();
+        if (n["order_ret_port"])   cfg.execution.order_ret_port  = n["order_ret_port"].as<uint16_t>();
+        if (n["idle_timeout_sec"]) cfg.execution.idle_timeout_sec = n["idle_timeout_sec"].as<uint32_t>();
     }
 
     return cfg;

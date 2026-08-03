@@ -125,7 +125,7 @@ add_executable(trader
     main.cpp
 )
 
-target_link_libraries(trader PRIVATE core)
+target_link_libraries(trader PRIVATE core market strategy oms risk execution)
 
 # ── 基准测试 ──
 add_executable(trader_benchmark

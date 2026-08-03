@@ -1,8 +1,10 @@
 #pragma once
 
 #include "strategy/kline/kline_aggregator.h"
+#include "strategy/base/signal.h"
 #include "core/types.h"
 
+#include <cmath>
 #include <deque>
 
 // ── 动量策略 ──
@@ -20,6 +22,9 @@ public:
 
     // 每根完成的 K线
     void on_bar(const KLine& bar) {
+        symbol_id_ = bar.symbol_id;
+        last_ts_ = bar.timestamp;
+        last_close_ = bar.close;
         closes_.push_back(bar.close);
         if (closes_.size() > lookback_ + 1) closes_.pop_front();
 
@@ -35,13 +40,32 @@ public:
         if      (ret >  threshold_) current_ = OrderSide::BUY;
         else if (ret < -threshold_) current_ = OrderSide::SELL;
         else                        current_ = OrderSide::NONE;
+
+        // 强度：收益率 / 阈值，万分比，收益率=阈值即满强度
+        if (current_ != OrderSide::NONE) {
+            if (threshold_ <= 0) strength_ = Signal::kStrengthScale;
+            else {
+                double s = std::abs(ret) / threshold_ * (double)Signal::kStrengthScale;
+                strength_ = (int64_t)(s > Signal::kStrengthScale ? Signal::kStrengthScale : s);
+            }
+        } else {
+            strength_ = 0;
+        }
     }
 
-    OrderSide signal() const { return current_; }
+    Signal signal() const {
+        return Signal{.side = current_, .locate = symbol_id_,
+                      .price = last_close_, .timestamp = last_ts_,
+                      .strength = strength_};
+    }
 
 private:
     size_t lookback_;
     double threshold_;
     std::deque<int64_t> closes_;   // 最近 close 序列
     OrderSide current_ = OrderSide::NONE;
+    uint64_t  symbol_id_ = 0;
+    int64_t   last_close_ = 0;
+    uint64_t  last_ts_ = 0;
+    int64_t   strength_ = 0;
 };

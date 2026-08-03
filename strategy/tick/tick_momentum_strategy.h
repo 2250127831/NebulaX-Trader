@@ -20,6 +20,9 @@ public:
             ev.type != MarketEvent::Type::EXECUTE) return;
         int64_t price = ev.trade.price;
         if (price < 0) return;
+        locate_ = ev.locate;
+        last_ts_ = ev.timestamp;
+        last_price_ = price;
 
         prices_.push_back(price);
         vols_.push_back(ev.trade.volume);
@@ -41,9 +44,31 @@ public:
         if (vwap2 - vwap1 > threshold_)      current_ = OrderSide::BUY;
         else if (vwap1 - vwap2 > threshold_) current_ = OrderSide::SELL;
         else                                 current_ = OrderSide::NONE;
+
+        // 强度：VWAP 差 / 阈值，万分比，差=阈值即满强度
+        int64_t diff = vwap2 - vwap1;
+        if (current_ == OrderSide::BUY) {
+            if (threshold_ <= 0) strength_ = Signal::kStrengthScale;
+            else {
+                int64_t s = diff * Signal::kStrengthScale / threshold_;
+                strength_ = s > Signal::kStrengthScale ? Signal::kStrengthScale : s;
+            }
+        } else if (current_ == OrderSide::SELL) {
+            if (threshold_ <= 0) strength_ = Signal::kStrengthScale;
+            else {
+                int64_t s = -diff * Signal::kStrengthScale / threshold_;
+                strength_ = s > Signal::kStrengthScale ? Signal::kStrengthScale : s;
+            }
+        } else {
+            strength_ = 0;
+        }
     }
 
-    OrderSide signal() const override { return current_; }
+    Signal signal() const override {
+        return Signal{.side = current_, .locate = locate_,
+                      .price = last_price_, .timestamp = last_ts_,
+                      .strength = strength_};
+    }
 
 private:
     size_t window_;
@@ -51,4 +76,8 @@ private:
     std::deque<int64_t> prices_;
     std::deque<uint64_t> vols_;
     OrderSide current_ = OrderSide::NONE;
+    uint64_t  locate_ = 0;
+    int64_t   last_price_ = 0;
+    uint64_t  last_ts_ = 0;
+    int64_t   strength_ = 0;
 };

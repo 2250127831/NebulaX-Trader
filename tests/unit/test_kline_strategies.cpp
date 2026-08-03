@@ -66,8 +66,8 @@ int main() {
         KLine b{}; b.close = p;
         trend.on_bar(b);
     }
-    printf("趋势信号: %d\n", (int)trend.signal());
-    CHECK(trend.signal() == OrderSide::BUY);
+    printf("趋势信号: %d\n", (int)trend.signal().side);
+    CHECK(trend.signal().side == OrderSide::BUY);
 
     // 下降序列 → SELL
     TrendStrategy trend2(3, 5);
@@ -75,8 +75,8 @@ int main() {
         KLine b{}; b.close = p;
         trend2.on_bar(b);
     }
-    printf("趋势2信号: %d\n", (int)trend2.signal());
-    CHECK(trend2.signal() == OrderSide::SELL);
+    printf("趋势2信号: %d\n", (int)trend2.signal().side);
+    CHECK(trend2.signal().side == OrderSide::SELL);
 
     // ── 动量策略: 大涨 → BUY, 大跌 → SELL ──
     MomentumStrategy mom(5, 0.01);  // 5根 阈值1%
@@ -85,8 +85,8 @@ int main() {
         KLine b{}; b.close = p;
         mom.on_bar(b);
     }
-    printf("动量信号: %d\n", (int)mom.signal());
-    CHECK(mom.signal() == OrderSide::BUY);
+    printf("动量信号: %d\n", (int)mom.signal().side);
+    CHECK(mom.signal().side == OrderSide::BUY);
 
     if (g_failures == 0) {
         printf("\nK线聚合 + 趋势/动量策略单测 PASS ✓\n");

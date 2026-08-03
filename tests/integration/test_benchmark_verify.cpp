@@ -13,6 +13,7 @@
 #include "core/queue/spsc_byte_ring.h"
 #include "core/net/i_market_data_receiver.h"
 #include "core/net/io_uring_receiver.h"
+#include "core/net/io_uring_sender.h"
 #include "market/pipeline/byte_ring_parser.h"
 #include "market/pipeline/mold_udp_unpacker.h"
 #include "strategy/kline/kline_aggregator.h"
@@ -20,6 +21,14 @@
 #include "strategy/tick/tick_momentum_strategy.h"
 #include "strategy/tick/trade_direction_strategy.h"
 #include "strategy/tick/volume_breakout_strategy.h"
+#include "execution/execution_engine.h"
+#include "oms/order_manager.h"
+#include "oms/order_protocol.h"
+#include "risk/risk_manager.h"
+
+// 模拟交易所端口：订单发到 benchmark(order-port)，成交回报回到本端(order_ret_port)
+static constexpr uint16_t ORDER_PORT     = 9090;
+static constexpr uint16_t ORDER_RET_PORT = 9091;
 
 #include <atomic>
 #include <cstdio>
@@ -91,6 +100,8 @@ int main(int argc, char* argv[]) {
     fc->heartbeat.store(0, std::memory_order_release);
     fc->sent.store(0, std::memory_order_release);
     fc->received.store(0, std::memory_order_release);
+    // 告诉 benchmark 模拟交易所：成交回报发到 ORDER_RET_PORT
+    fc->order_ret_port.store(ORDER_RET_PORT, std::memory_order_release);
 
     // ── 管道: 共享 ring + 通道A + 拆包器 + 解析器 + 策略 ──
     // ring/通道容量加大, 减少背压(接收端跟上 benchmark)
@@ -112,6 +123,25 @@ int main(int argc, char* argv[]) {
     TradeDirectionStrategy tds;
     TickMomentumStrategy tms;
     KLineAggregator kagg(60000000000ull);
+
+    // ── 交易侧: 信号 → 执行引擎(风控 + OMS) → 真发送到模拟交易所 ──
+    OrderManager om;
+    RiskManager rm;
+    ExecutionEngine ex(om, rm);
+    ex.set_base_qty(100);
+
+    // 订单发送端(io_uring 零拷贝) → benchmark 模拟交易所
+    auto order_send_ring = std::make_unique<uint8_t[]>(1 << 20);
+    auto order_sender = std::make_unique<IoUringSender>(
+        "127.0.0.1", ORDER_PORT, order_send_ring.get(), 1 << 20);
+    CHECK(order_sender->start());
+    if (!order_sender->start()) return 1;
+    ex.set_sender(order_sender.get());
+
+    // 成交回报接收端(io_uring) ← benchmark 模拟交易所
+    auto fill_rcv = std::make_unique<IoUringReceiver>(ORDER_RET_PORT);
+    CHECK(fill_rcv->start());
+    if (!fill_rcv->start()) return 1;
 
     std::atomic<bool> seq_contiguous{true};
     std::atomic<uint64_t> last_seq{0};
@@ -168,8 +198,12 @@ int main(int argc, char* argv[]) {
     });
 
     // ── 策略线程: 从通道 A 收成交, 喂 4 策略 + K线 ──
+    // 交易侧: 信号翻转时经执行引擎真发送(风控→OMS→模拟交易所→回报)
     std::thread strategy_th([&]() {
         MarketEvent ev;
+        OrderSide last_side[4] = {OrderSide::NONE, OrderSide::NONE,
+                                  OrderSide::NONE, OrderSide::NONE};
+        Strategy* strats[4] = {&vbs, &pbs, &tds, &tms};
         // 退出条件: 解析已完成(parse_done) 且 通道A空(pending==0)
         while (!parse_done.load(std::memory_order_acquire) || channel_a.pending(0) > 0) {
             if (channel_a.pop(0, ev)) {
@@ -180,9 +214,41 @@ int main(int argc, char* argv[]) {
                 if (l != 0 && ev.seq_id != l + 1)
                     seq_contiguous.store(false, std::memory_order_relaxed);
                 last_seq.store(ev.seq_id, std::memory_order_relaxed);
+
+                // 交易侧: 信号从 NONE 翻转/变化时下单(避免每 tick 重复下单)
+                for (int i = 0; i < 4; ++i) {
+                    Signal s = strats[i]->signal();
+                    if (s.side != last_side[i]) {
+                        last_side[i] = s.side;
+                        if (s.side != OrderSide::NONE)
+                            ex.submit_signal(s, (uint64_t)i + 1);
+                    }
+                }
             } else if (!parse_done.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
+        }
+    });
+
+    // ── 成交回报线程: 收模拟交易所 FILL → 驱动 OMS/Risk ──
+    std::atomic<bool> fill_stop{false};
+    std::atomic<size_t> fill_count{0};
+    std::thread fill_th([&]() {
+        uint8_t pre[2048];
+        fill_rcv->set_blocking(false);
+        fill_rcv->recv(pre, sizeof(pre));
+        fill_rcv->set_blocking(true);
+        uint8_t buf[2048];
+        while (!fill_stop.load(std::memory_order_acquire)) {
+            ssize_t n = fill_rcv->recv(buf, sizeof(buf));
+            if (n > 0) {
+                uint64_t oid = 0, qty = 0;
+                int64_t price = 0;
+                if (decode_fill(buf, (size_t)n, oid, qty, price)) {
+                    ex.on_order_fill(oid, qty, price);
+                    ++fill_count;
+                }
+            } else break;
         }
     });
 
@@ -194,12 +260,15 @@ int main(int argc, char* argv[]) {
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
-        char port_arg[16], backlog_arg[16];
+        char port_arg[16], order_port_arg[16], backlog_arg[16];
         snprintf(port_arg, sizeof(port_arg), "%u", port);
-        snprintf(backlog_arg, sizeof(backlog_arg), "%d", 100000);  // 大 backlog, 新限速用
+        snprintf(order_port_arg, sizeof(order_port_arg), "%u", ORDER_PORT);
+        snprintf(backlog_arg, sizeof(backlog_arg), "%d", 32);  // 限速: 发送端最多领先 32 包
+                                                               // (匹配内核 UDP 缓冲 ~208KB, 防突发溢出)
         execl(bench_path.c_str(), bench_path.c_str(),
               "--file", itch_file.c_str(),
               "--port", port_arg,
+              "--order-port", order_port_arg,
               "--backlog", backlog_arg,
               (char*)nullptr);
         _exit(127);
@@ -239,6 +308,13 @@ int main(int argc, char* argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     strategy_th.join();
 
+    // 成交回报: 等最后一批 FILL 到达 → 停回报线程 → 停发送端
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    fill_stop.store(true, std::memory_order_release);
+    fill_rcv->stop();
+    fill_th.join();
+    order_sender->stop();
+
     fc->ready.store(false, std::memory_order_release);
 
     // ── 验证 ──
@@ -250,11 +326,29 @@ int main(int argc, char* argv[]) {
     printf("成交事件数: %zu\n", trade_count.load());
     printf("seq 连续:   %s\n", seq_contiguous.load() ? "yes" : "NO");
     printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d (0=BUY 1=SELL 2=NONE)\n",
-           (int)vbs.signal(), (int)pbs.signal(), (int)tds.signal(), (int)tms.signal());
+           (int)vbs.signal().side, (int)pbs.signal().side,
+           (int)tds.signal().side, (int)tms.signal().side);
+
+    // ── 交易侧: 订单经模拟交易所真实往返(发送→回报→OMS/Risk) ──
+    size_t n_orders   = om.order_count();
+    size_t n_filled   = om.count_by_status(OrderStatus::FILLED);
+    size_t n_rejected = om.count_by_status(OrderStatus::REJECTED);
+    size_t n_pending  = om.count_by_status(OrderStatus::PENDING);
+    printf("交易侧:   订单=%zu 成交=%zu 风控拒=%zu 未决=%zu 回报=%zu 持仓=%llu 已实现盈亏=%lld 分\n",
+           n_orders, n_filled, n_rejected, n_pending, fill_count.load(),
+           (unsigned long long)rm.position(vbs.signal().locate),
+           (long long)rm.realized_pnl());
 
     CHECK(bench_ok);
     CHECK(seq_contiguous.load());
     CHECK(trade_count.load() > 0);
+    // 真实往返: 至少一个订单发出并经模拟交易所成交回报落地
+    CHECK(n_orders > 0);
+    CHECK(n_filled > 0);
+    CHECK(fill_count.load() > 0);
+    // 全部落定: 已发订单要么成交要么被风控拒，无 PENDING 残留
+    CHECK(n_filled + n_rejected == n_orders);
+    CHECK(n_pending == 0);
 
     delete[] ev_slots;
     receiver->stop();

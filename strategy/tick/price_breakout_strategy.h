@@ -18,6 +18,9 @@ public:
             ev.type != MarketEvent::Type::EXECUTE) return;
         int64_t price = ev.trade.price;
         if (price < 0) return;  // E 无价格
+        locate_ = ev.locate;
+        last_ts_ = ev.timestamp;
+        last_price_ = price;
 
         if (prices_.size() >= window_) {
             int64_t hi = *std::max_element(prices_.begin(), prices_.end());
@@ -25,15 +28,41 @@ public:
             if (price > hi)      current_ = OrderSide::BUY;
             else if (price < lo) current_ = OrderSide::SELL;
             else                 current_ = OrderSide::NONE;
+
+            // 强度：突破幅度 / 窗口内波动幅度(hi-lo)，万分比，满 1 倍波动即满强度。
+            int64_t range = hi - lo;
+            if (current_ == OrderSide::BUY) {
+                if (range <= 0) strength_ = Signal::kStrengthScale;
+                else {
+                    int64_t s = (price - hi) * Signal::kStrengthScale / range;
+                    strength_ = s > Signal::kStrengthScale ? Signal::kStrengthScale : s;
+                }
+            } else if (current_ == OrderSide::SELL) {
+                if (range <= 0) strength_ = Signal::kStrengthScale;
+                else {
+                    int64_t s = (lo - price) * Signal::kStrengthScale / range;
+                    strength_ = s > Signal::kStrengthScale ? Signal::kStrengthScale : s;
+                }
+            } else {
+                strength_ = 0;
+            }
         }
         prices_.push_back(price);
         if (prices_.size() > window_) prices_.pop_front();
     }
 
-    OrderSide signal() const override { return current_; }
+    Signal signal() const override {
+        return Signal{.side = current_, .locate = locate_,
+                      .price = last_price_, .timestamp = last_ts_,
+                      .strength = strength_};
+    }
 
 private:
     size_t window_;
     std::deque<int64_t> prices_;
     OrderSide current_ = OrderSide::NONE;
+    uint64_t  locate_ = 0;
+    int64_t   last_price_ = 0;
+    uint64_t  last_ts_ = 0;
+    int64_t   strength_ = 0;
 };

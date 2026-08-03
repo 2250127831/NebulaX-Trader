@@ -75,6 +75,7 @@ target_include_directories(market PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # ── 策略模块 ──
 add_library(strategy
     strategy/base/strategy.h
+    strategy/base/signal.h
     strategy/momentum/momentum_strategy.h
     strategy/trend/trend_strategy.h
     strategy/kline/kline_aggregator.h
@@ -92,6 +93,7 @@ target_include_directories(strategy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(oms
     oms/order.h
     oms/order_manager.h
+    oms/order_protocol.h
 )
 
 target_link_libraries(oms PUBLIC core)
@@ -153,6 +155,18 @@ add_executable(ut_kline_strategies
 )
 target_link_libraries(ut_kline_strategies PRIVATE core strategy)
 add_test(NAME ut_kline_strategies COMMAND ut_kline_strategies)
+
+add_executable(ut_signal_strength
+    tests/unit/test_signal_strength.cpp
+)
+target_link_libraries(ut_signal_strength PRIVATE core strategy)
+add_test(NAME ut_signal_strength COMMAND ut_signal_strength)
+
+add_executable(ut_execution
+    tests/unit/test_execution.cpp
+)
+target_link_libraries(ut_execution PRIVATE core oms risk execution strategy)
+add_test(NAME ut_execution COMMAND ut_execution)
 
 # SPMC 多消费者广播: 多个策略从通道 A 消费同一批成交
 add_executable(ut_spmc_strategies

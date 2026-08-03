@@ -1,8 +1,11 @@
 #pragma once
 
 #include "strategy/kline/kline_aggregator.h"
+#include "strategy/base/signal.h"
 #include "core/types.h"
 
+#include <algorithm>
+#include <cmath>
 #include <deque>
 
 // ── 趋势跟踪策略 ──
@@ -20,6 +23,9 @@ public:
 
     // 每根完成的 K线
     void on_bar(const KLine& bar) {
+        symbol_id_ = bar.symbol_id;
+        last_ts_ = bar.timestamp;
+        last_close_ = bar.close;
         closes_.push_back(bar.close);
         if (closes_.size() > long_period_) closes_.pop_front();
 
@@ -31,9 +37,22 @@ public:
         if (short_ma > long_ma)      current_ = OrderSide::BUY;
         else if (short_ma < long_ma) current_ = OrderSide::SELL;
         else                         current_ = OrderSide::NONE;
+
+        // 强度：均线距离 / 长均线，万分比，1% 距离即满强度
+        if (current_ != OrderSide::NONE) {
+            double ratio = std::abs(short_ma - long_ma) / std::max(1.0, long_ma);
+            double s = ratio * 100.0 * (double)Signal::kStrengthScale;  // 0.01 → 10000
+            strength_ = (int64_t)(s > Signal::kStrengthScale ? Signal::kStrengthScale : s);
+        } else {
+            strength_ = 0;
+        }
     }
 
-    OrderSide signal() const { return current_; }
+    Signal signal() const {
+        return Signal{.side = current_, .locate = symbol_id_,
+                      .price = last_close_, .timestamp = last_ts_,
+                      .strength = strength_};
+    }
 
 private:
     double ma(size_t period) const {
@@ -46,4 +65,8 @@ private:
     size_t short_period_, long_period_;
     std::deque<int64_t> closes_;   // 最近 close 序列
     OrderSide current_ = OrderSide::NONE;
+    uint64_t  symbol_id_ = 0;
+    int64_t   last_close_ = 0;
+    uint64_t  last_ts_ = 0;
+    int64_t   strength_ = 0;
 };

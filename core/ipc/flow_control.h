@@ -21,6 +21,7 @@ struct FlowControl {
     CACHE_ALIGN std::atomic<uint64_t> heartbeat{0};
     CACHE_ALIGN std::atomic<uint64_t> sent{0};
     CACHE_ALIGN std::atomic<uint64_t> received{0};
+    CACHE_ALIGN std::atomic<uint64_t> order_ret_port{0};  // 成交回报监听端口(交易系统→模拟交易所)
 };
 
 static constexpr const char* FLOW_SHM_PATH = "/nx_trader_flow";

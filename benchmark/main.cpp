@@ -1,5 +1,7 @@
 #include "core/ipc/flow_control.h"
+#include "oms/order_protocol.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +28,7 @@ struct Config {
     const char* file  = "test_data/itch_sample.bin";
     const char* host  = "127.0.0.1";
     int port          = 8080;
+    int order_port    = 9090;   // 模拟交易所端口：收订单、回成交回报
     uint64_t max_backlog = 10000;
     size_t pack_max  = 100;  // 每包消息条数上限（实际每包 1~pack_max 条随机）
     bool help         = false;
@@ -37,6 +40,7 @@ static Config parse_args(int argc, char* argv[]) {
         if      (strcmp(argv[i], "--file")    == 0 && i+1 < argc) cfg.file = argv[++i];
         else if (strcmp(argv[i], "--host")    == 0 && i+1 < argc) cfg.host = argv[++i];
         else if (strcmp(argv[i], "--port")    == 0 && i+1 < argc) cfg.port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--order-port") == 0 && i+1 < argc) cfg.order_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--backlog") == 0 && i+1 < argc) cfg.max_backlog = atol(argv[++i]);
         else if (strcmp(argv[i], "--pack-max") == 0 && i+1 < argc) cfg.pack_max = atol(argv[++i]);
         else cfg.help = true;
@@ -49,9 +53,59 @@ static void usage() {
            "  --file  <path>     ITCH binary file\n"
            "  --host <ip>        Target IP (default: 127.0.0.1)\n"
            "  --port <port>      Target UDP port (default: 8080)\n"
+           "  --order-port <port> Simulated exchange port (default: 9090)\n"
            "  --backlog <n>      Max backlog before slowing down (default: 10000)\n"
            "  --pack-max <n>     Max messages per UDP packet (default: 100)\n"
            "                     实际每包 1~pack-max 条随机，模拟真实行情打包\n");
+}
+
+// ── 模拟交易所线程 ──
+// 理想状态：收到订单立即全额成交，回报发回交易系统的成交回报端口(共享内存指定)。
+// 定长协议见 oms/order_protocol.h。
+static void run_sim_exchange(int order_port, FlowControl* fc,
+                             std::atomic<bool>& stop,
+                             std::atomic<uint64_t>& orders_received) {
+    int osock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (osock < 0) return;
+    sockaddr_in oaddr{};
+    oaddr.sin_family = AF_INET;
+    oaddr.sin_port   = htons(static_cast<uint16_t>(order_port));
+    oaddr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(osock, reinterpret_cast<sockaddr*>(&oaddr), sizeof(oaddr)) < 0) {
+        close(osock);
+        return;
+    }
+    // 200ms recv 超时，让 stop 能及时退出
+    struct timeval tv{0, 200000};
+    setsockopt(osock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint8_t buf[256];
+    while (!stop.load(std::memory_order_acquire)) {
+        sockaddr_in from{};
+        socklen_t flen = sizeof(from);
+        ssize_t n = recvfrom(osock, buf, sizeof(buf), 0,
+                             reinterpret_cast<sockaddr*>(&from), &flen);
+        if (n < 0) continue;   // 超时(无订单)
+        if (n < (ssize_t)kOrderMsgLen || buf[0] != kMsgOrder) continue;
+
+        Order o{};
+        if (!decode_order(buf, static_cast<size_t>(n), o)) continue;
+        ++orders_received;
+
+        // 理想状态：全额成交，按订单价回报
+        uint8_t fill[kFillMsgLen];
+        encode_fill(o.order_id, o.quantity, o.price, fill);
+
+        uint64_t ret_port = fc->order_ret_port.load(std::memory_order_acquire);
+        if (ret_port == 0) continue;
+        sockaddr_in ret{};
+        ret.sin_family = AF_INET;
+        ret.sin_port   = htons(static_cast<uint16_t>(ret_port));
+        inet_pton(AF_INET, "127.0.0.1", &ret.sin_addr);
+        sendto(osock, fill, kFillMsgLen, 0,
+               reinterpret_cast<sockaddr*>(&ret), sizeof(ret));
+    }
+    close(osock);
 }
 
 int main(int argc, char* argv[]) {
@@ -83,6 +137,12 @@ int main(int argc, char* argv[]) {
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(cfg.port);
     inet_pton(AF_INET, cfg.host, &addr.sin_addr);
+
+    // ── 模拟交易所线程：收订单、立即回全额成交 ──
+    std::atomic<bool> order_stop{false};
+    std::atomic<uint64_t> orders_received{0};
+    std::thread sim_exchange(run_sim_exchange, cfg.order_port, fc,
+                             std::ref(order_stop), std::ref(orders_received));
 
     // ── 等待 NX-Trader 就绪 ──
     printf("Waiting for NX-Trader ...\n");
@@ -148,13 +208,11 @@ int main(int argc, char* argv[]) {
             uint16_t be_cnt = htobe16(pkt_count);        // count: 2 字节
             memcpy(hdr + 18, &be_cnt, 2);
 
-            // 发送前: 轮询计数器, 等对面收完到 backlog 允许范围。
-            // backlog = sent - received; 超过 max_backlog 就等 received 追上来。
-            uint64_t sent = fc->sent.load(std::memory_order_relaxed);
-            uint64_t recv = fc->received.load(std::memory_order_acquire);
-            while (static_cast<int64_t>(sent - recv) >= static_cast<int64_t>(cfg.max_backlog)) {
+            // 发送前: 忙等上一包被接收(发一个等一个确认)。
+            // 发送端永不领先超过 1 包 → 内核 UDP 缓冲永不溢出 → 任何数据量都不丢。
+            // 吞吐 = 接收确认 RTT(本地微秒级)，即最佳速度回放。
+            while (fc->received.load(std::memory_order_acquire) < fc->sent.load(std::memory_order_relaxed)) {
                 std::this_thread::yield();
-                recv = fc->received.load(std::memory_order_acquire);
             }
 
             ssize_t r = sendto(sock, pkt.data(), pkt.size(), 0,
@@ -179,6 +237,15 @@ int main(int argc, char* argv[]) {
     printf("  Extra bytes skipped: %lu\n", extra_bytes);
     printf("  Total time:      %.3f s\n", sec);
     printf("  Send rate:       %.0f msg/s\n", total_sent / sec);
+
+    // 行情发完，给交易系统留时间把订单发过来并回执。
+    // 理想状态：模拟交易所全额成交，回报在交易系统侧落地。
+    printf("  Waiting for order fills (2s)...\n");
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    order_stop.store(true, std::memory_order_release);
+    sim_exchange.join();
+    printf("  Sim exchange received orders: %llu\n",
+           (unsigned long long)orders_received.load());
 
     munmap(buf, file_size);
     munmap(fc, sizeof(FlowControl));

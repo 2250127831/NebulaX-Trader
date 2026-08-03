@@ -23,6 +23,7 @@
 #include "strategy/tick/trade_direction_strategy.h"
 #include "strategy/tick/volume_breakout_strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
+#include "strategy/tick/order_flow_imbalance_strategy.h"
 #include "execution/execution_engine.h"
 #include "oms/order_manager.h"
 #include "oms/order_protocol.h"
@@ -239,19 +240,42 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // ── 通道 B 消费线程: 委托事件 → 订单簿重建(高性能簿) → OBI 策略 ──
+    // ── 通道 B 消费线程: 委托事件 → 订单簿重建 → OBI + OFI 策略 ──
     OrderBookConsumer obc;
     OrderBookImbalanceStrategy obi;
+    OrderFlowImbalanceStrategy ofi;
     std::atomic<bool> book_ready{false};
     std::atomic<size_t> book_events{0};
     std::thread book_th([&]() {
         MarketEvent ev;
         while (!parse_done.load(std::memory_order_acquire) || channel_b.pending(0) > 0) {
             if (channel_b.pop(0, ev)) {
-                obc.on_event(ev);   // 委托 → 订单簿重建
+                obc.on_event(ev);   // 委托 → 订单簿重建(先重建, 才能查方向)
                 ++book_events;
-                // 盘口变化 → OBI 策略
                 const OrderBook* book = obc.book(ev.locate);
+
+                // 方向：A/U 事件自带 side；D/X/E 查簿(order_ref 对应挂单侧)
+                OrderSide side = OrderSide::NONE;
+                if (ev.type == MarketEvent::Type::ADD ||
+                    ev.type == MarketEvent::Type::REPLACE) {
+                    side = ev.order.side;
+                } else if (book) {
+                    if (ev.type == MarketEvent::Type::TRADE ||
+                        ev.type == MarketEvent::Type::EXECUTE)
+                        side = book->side_of(ev.trade.order_ref);
+                    else
+                        side = book->side_of(ev.order.order_ref);
+                }
+
+                // OFI：逐笔委托方向累加(高频)
+                if (side != OrderSide::NONE) {
+                    ofi.on_event(ev, side);
+                    // 参考价：盘口可用时取中间价，否则保持
+                    if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
+                        ofi.set_last_price((book->best_bid() + book->best_ask()) / 2);
+                }
+
+                // OBI：盘口失衡(低频盘口参考)
                 if (book) {
                     obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
                                 book->best_ask(), book->best_ask_volume(), ev.timestamp);
@@ -366,10 +390,12 @@ int main(int argc, char* argv[]) {
     printf("解析消息数: %zu\n", parsed_total.load());
     printf("成交事件数: %zu\n", trade_count.load());
     printf("seq 连续:   %s\n", seq_contiguous.load() ? "yes" : "NO");
-    printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d OBI盘口=%d (0=BUY 1=SELL 2=NONE)\n",
+    printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d OBI盘口=%d OFI订单流=%d (0=BUY 1=SELL 2=NONE)\n",
            (int)vbs.signal().side, (int)pbs.signal().side,
-           (int)tds.signal().side, (int)tms.signal().side, (int)obi.signal().side);
-    printf("通道B:      委托事件=%zu\n", book_events.load());
+           (int)tds.signal().side, (int)tms.signal().side,
+           (int)obi.signal().side, (int)ofi.signal().side);
+    printf("通道B:      委托事件=%zu OFI累计=%lld\n",
+           book_events.load(), (long long)ofi.ofi());
 
     // ── 交易侧: 订单经模拟交易所真实往返(发送→回报→OMS/Risk) ──
     size_t n_orders   = om.order_count();

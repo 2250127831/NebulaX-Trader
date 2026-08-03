@@ -87,6 +87,7 @@ add_library(strategy
     strategy/tick/trade_direction_strategy.h
     strategy/tick/tick_momentum_strategy.h
     strategy/tick/order_book_imbalance_strategy.h
+    strategy/tick/order_flow_imbalance_strategy.h
 )
 
 target_link_libraries(strategy PUBLIC core)
@@ -170,6 +171,12 @@ add_executable(ut_order_book
 )
 target_link_libraries(ut_order_book PRIVATE core market)
 add_test(NAME ut_order_book COMMAND ut_order_book)
+
+add_executable(ut_ofi
+    tests/unit/test_ofi.cpp
+)
+target_link_libraries(ut_ofi PRIVATE core strategy)
+add_test(NAME ut_ofi COMMAND ut_ofi)
 
 add_executable(ut_execution
     tests/unit/test_execution.cpp

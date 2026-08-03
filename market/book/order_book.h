@@ -139,6 +139,12 @@ public:
         return true;
     }
 
+    // 某挂单的方向(不存在返回 NONE)——OFI 查 D/X/E 方向用
+    OrderSide side_of(uint64_t order_ref) const {
+        OrderSlot* s = order_index_.find(order_ref);
+        return s ? s->side : OrderSide::NONE;
+    }
+
     // TopOfBook：best bid / best ask
     int64_t best_bid() const { return bids_.empty() ? -1 : bids_.begin()->first; }
     int64_t best_ask() const { return asks_.empty() ? -1 : asks_.begin()->first; }

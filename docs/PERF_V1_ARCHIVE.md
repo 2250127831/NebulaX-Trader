@@ -164,8 +164,8 @@ execution:
 | 类别 | 占比 | 说明 |
 |---|---|---|
 | **book_th 线程循环**（lambda#3） | **29.68%** | 订单簿重建 + 信号 + 仲裁 |
-| └ `OrderBook::add` | 4.99% | 哈希 + 链式指针追逐 |
-| └ `handle_delete` / `unlink_and_free` | 3.97% / 2.79% | 红黑树 erase |
+| └ `OrderBook::add` | 4.99% | 价格档插入 std::map + 指针追逐 |
+| └ `handle_delete` / `unlink_and_free` | 3.97% / 2.79% | std::map 红黑树 erase |
 | **parse_th 线程循环**（lambda#2） | ~16% | ByteRingParser::parse_available |
 | └ `ItchParser::feed` | 10.91% | ITCH 解析 |
 | └ `parse_A` / `parse_D` | 4.45% / 4.12% | Add / Delete 消息 |
@@ -185,9 +185,10 @@ execution:
 
 **结论**：
 1. **三个消费者线程（parse_th/book_th/strategy_th）是主要 CPU 消耗**，证明 SPMC 多消费者并行。
-2. **book_th 线程是第一热点（29.68%）**：`OrderBook::add`/`unlink_and_free`（红黑树 + 指针追逐）是核心。
-3. **IPC 0.62 + L1 miss 134M → 内存带宽受限，非 CPU 算力**：订单簿的哈希/红黑树访问跨 cache line，这是硬件级证据——**V2 订单簿缓存友好化（开地址哈希/扁平数组）是正确方向**。
-4. **io_uring 生效证据**：recvfrom/sendto = 0，UDP 收发全走 io_uring SQE，不经系统调用。
+2. **book_th 线程是第一热点（29.68%）**：`OrderBook::add`/`unlink_and_free`（std::map 红黑树 + 指针追逐）是核心。
+3. **IPC 0.55 + L1 miss 134M → 内存带宽受限，非 CPU 算力**：订单簿访问跨 cache line，这是硬件级证据——**V2 订单簿缓存友好化是正确方向**。
+4. **红黑树归属（关键精确化）**：perf 里的红黑树开销来自 **`std::map<int64_t, PriceLevel>`（bids_/asks_ 价格档组织，`_Rb_tree::erase`）**，**不是** `OrderMap`。`OrderMap`（order_ref→OrderSlot 哈希）已经是零堆分配 O(1) 查单，不是瓶颈。**V2 应替换 std::map 价格档（开地址哈希/扁平数组），勿动 OrderMap**。
+5. **io_uring 生效证据**：recvfrom/sendto = 0，UDP 收发全走 io_uring SQE，不经系统调用。
 
 ### 4.1 临界吞吐（当前版本：方案A单通道）
 
@@ -245,8 +246,8 @@ execution:
 按影响排序：
 
 ### 6.1 吞吐：订单簿缓存友好化
-- **现状**：book_th ~5.5M msg/s 是吞吐天花板（方案A单通道）。瓶颈是 `OrderBook::add` 的哈希+指针追逐（内存延迟），perf 中订单簿占 ~23% 第一热点。
-- **方向**：开地址哈希替代链式（更缓存友好）、价格档用扁平数组/缓存行对齐、批量加载。
+- **现状**：book_th ~5.5M msg/s 是吞吐天花板（方案A单通道）。瓶颈是 `OrderBook::add` 往 **`std::map`（bids_/asks_ 价格档，红黑树）** 插入/删除（内存延迟），perf 中 book_th 占 ~29% 第一热点。
+- **方向**：**替换 `std::map` 价格档为开地址哈希/扁平数组**（更缓存友好）、价格档用缓存行对齐、批量加载。`OrderMap`（查单哈希）已是 O(1) 非瓶颈，勿动。
 - **验证**：扫档后临界应显著 >5.5M msg/s。
 
 ### 6.2 延迟：进一步压低端到端（次要，吞吐优先）

@@ -39,7 +39,9 @@ for i in $(seq 1 40); do
   sleep 1
 done
 sleep 3   # 排空 lensx ring buffer
-S pkill -x lensx 2>/dev/null || true
+# SIGINT 触发 lensx 输出 Results(默认 SIGTERM 不输出)
+S pkill -INT -x lensx 2>/dev/null || true
+sleep 2
 wait $TRADER_PID 2>/dev/null || true
 echo ""
 echo "=== trader 汇总 ==="
@@ -50,3 +52,31 @@ grep "Messages sent" /tmp/bench.log
 echo ""
 echo "=== lensx 输出 ==="
 cat /tmp/lensx.log
+echo ""
+echo "=== CSV 离线分析(P50/P99/P999, 剔除异常) ==="
+# CSV 是完整原始数据, 比终端 Results 可靠(Results 可能被 SIGINT 截断样本)。
+# 先 chown 让当前用户能读(CSV 是 root 写的)
+echo "$SUDO_PASS" | sudo -S chown "$(whoami)" /tmp/trader_lensx.csv 2>/dev/null || true
+python3 - <<'PYEOF'
+import csv
+SEG = {
+    (0,1):'recv->unpack', (2,3):'alloc->push_ring', (3,4):'push_ring->parse',
+    (4,5):'parse->push_spmc', (5,6):'push_spmc->pop', (2,6):'alloc->pop(total)',
+    (7,8):'arb', (9,10):'order',
+}
+groups = {}
+for r in csv.DictReader(open('/tmp/trader_lensx.csv')):
+    k = (int(r['from_stage']), int(r['to_stage']))
+    if k in SEG:
+        try: v = int(r['delta_ns'])
+        except: continue
+        if v > 10**12: continue  # 剔除异常值(211106s)
+        groups.setdefault(k, []).append(v)
+def pct(d, p):
+    d = sorted(d)
+    return d[min(len(d)-1, int(len(d)*p))]
+for k, name in SEG.items():
+    d = groups.get(k, [])
+    if not d: continue
+    print(f"{name:16s} n={len(d):8d}  P50={pct(d,0.5)/1e3:8.1f}us  P99={pct(d,0.99)/1e3:9.1f}us  P999={pct(d,0.999)/1e3:9.1f}us")
+PYEOF

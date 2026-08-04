@@ -155,21 +155,39 @@ execution:
 
 ## 4. 吞吐瓶颈分析（perf）
 
-### 4.0 perf 热点（当前版本）
+### 4.0 perf 热点 + 硬件事件（2026-08-04 最终测量）
 
-压测窗口（`--rate 10000` 零丢档，满解析 8,737,176，单通道零丢；`-F 4000 -e cpu-clock --call-graph dwarf`）：
+压测窗口（`--rate 10000` 零丢档，满解析 8,737,176，单通道零丢；`-F 999 -e cpu-clock --call-graph dwarf`，`scripts/perf_measure.sh` 按样本时间戳裁剪 2.5%~97.5% 纯负载段）。
+
+**CPU 热点（裁剪窗口内）**：
 
 | 类别 | 占比 | 说明 |
 |---|---|---|
-| **book_th 线程循环**（lambda#3） | ~23% | book_th 主循环（等待+轮询+调度+订单簿） |
-| **parse_th 线程循环**（lambda#2） | ~16% | parse_th 主循环（等待+轮询+调度） |
-| **strategy_th 线程循环**（lambda#4） | ~13% | 独立高频策略(consumer 1) |
-| **订单簿计算**（add 5.4% + unlink 2.8% + book_for 1.9% + delete/cancel 2%） | ~12% | book_th 订单簿热点 |
-| **解析路径**（parse_available 4.6% + sink 6.8% + push 4.1% + memmove 2.6%） | ~18% | parse_th 计算 |
+| **book_th 线程循环**（lambda#3） | **29.68%** | 订单簿重建 + 信号 + 仲裁 |
+| └ `OrderBook::add` | 4.99% | 哈希 + 链式指针追逐 |
+| └ `handle_delete` / `unlink_and_free` | 3.97% / 2.79% | 红黑树 erase |
+| **parse_th 线程循环**（lambda#2） | ~16% | ByteRingParser::parse_available |
+| └ `ItchParser::feed` | 10.91% | ITCH 解析 |
+| └ `parse_A` / `parse_D` | 4.45% / 4.12% | Add / Delete 消息 |
+
+**硬件事件（perf stat，裁剪窗口内）**：
+
+| 事件 | 值 | 解读 |
+|---|---|---|
+| **IPC** | **0.62** | 每周期 0.62 指令，**内存受限**（理想 ≥1） |
+| **cache-misses** | 18.6M / 229M refs = **8.1%** | 订单簿指针追逐 |
+| **L1-dcache-load-misses** | 134M | 数据访问跨 cache line |
+| **L2-load-misses** | 2.4M | L2 命中良好 |
+| **branch-misses** | 66M（0.49%） | 分支预测良好 |
+| **ctx/s** | 3558 | 5 线程调度平稳 |
+| **syscalls:sys_enter_sendto / recvfrom** | **0** | **UDP 走 io_uring SQE，不经 syscall** |
+| syscalls:sys_enter_read | 429 | io_uring 接管 |
 
 **结论**：
-1. **三个消费者线程（parse_th/book_th/strategy_th）是主要 CPU 消耗**，证明 SPMC 多消费者并行（strategy_th 独立消费成交）。
-2. **订单簿计算是 book_th 的第一热点**：`OrderBook::add`（哈希+指针追逐）+ unlink + book_for + delete/cancel。这是 V2 订单簿缓存友好化的直接依据。
+1. **三个消费者线程（parse_th/book_th/strategy_th）是主要 CPU 消耗**，证明 SPMC 多消费者并行。
+2. **book_th 线程是第一热点（29.68%）**：`OrderBook::add`/`unlink_and_free`（红黑树 + 指针追逐）是核心。
+3. **IPC 0.62 + L1 miss 134M → 内存带宽受限，非 CPU 算力**：订单簿的哈希/红黑树访问跨 cache line，这是硬件级证据——**V2 订单簿缓存友好化（开地址哈希/扁平数组）是正确方向**。
+4. **io_uring 生效证据**：recvfrom/sendto = 0，UDP 收发全走 io_uring SQE，不经系统调用。
 
 ### 4.1 临界吞吐（当前版本：方案A单通道）
 
@@ -253,10 +271,9 @@ execution:
 # 权限
 sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0 kernel.unprivileged_bpf_disabled=0
 
-# perf 热点（压测窗口）
-./scripts/pressure_test.sh --rate 10000 &   # 后台跑
-perf record -F 4000 -e cpu-clock --call-graph dwarf -p <trader_pid> &
-# 等压测完，停 perf，perf report
+# perf 热点 + 硬件事件（压测窗口, 自动裁剪 2.5%~97.5% 纯负载段）
+# 学 NebulaX: perf record 全程采, 按样本时间戳裁剪空闲期; 同时 perf stat 采硬件事件
+SUDO_PASS=<密码> ./scripts/perf_measure.sh 10000
 
 # LensX 延迟(四级链路: 包级 + alloc→pop 四段 + 仲裁 + 下单)
 # 需 sudo(密码用 SUDO_PASS 环境变量传入), LensX 在 ~/LensX/build/lensx

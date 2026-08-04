@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdio>
 #include "core/market_event.h"
 #include "core/queue/spmc_event_queue.h"
 #include "core/queue/spsc_byte_ring.h"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <immintrin.h>   // _mm_pause (背压重试)
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -41,20 +43,16 @@ public:
 
     // ── eventfd 唤醒（学撮合引擎 poll + eventfd 方案）──
     // 解析线程 poll(wake_fd) 阻塞等数据；生产者 push 完 write(wake_fd) 唤醒。
-    // V2 多消费者：所有消费者 poll 同一个 wake_fd，写一次全醒（广播）。
-    // 构造传入共享 ring（unpacker 写、bp 读）+ 通道 A（成交）+ 通道 B（委托）。
-    //   成交事件(TRADE/EXECUTE) → 通道 A（低频策略消费）
-    //   委托事件(ADD/DELETE/CANCEL/REPLACE) → 通道 B（订单簿/逐笔委托策略消费）
-    ByteRingParser(SPSCByteRing& ring, EventQueue& channel_a, EventQueue& channel_b)
-        : ring_(ring), channel_a_(channel_a), channel_b_(channel_b) {
+    // 单通道广播(方案A): 所有事件(成交+委托)进同一队列, 多消费者各自消费关心的类型。
+    //   - 策略消费者: 只处理成交(TRADE/EXECUTE), 委托 skip
+    //   - 订单簿消费者: 处理全部(成交更新挂单量 + 委托重建盘口)
+    // 同一序列 → 订单簿时序正确(成交不会先于对应委托处理)。
+    ByteRingParser(SPSCByteRing& ring, EventQueue& channel)
+        : ring_(ring), channel_(channel) {
         wake_fd_ = eventfd(0, EFD_NONBLOCK);
         parser_.set_sink([this](const MarketEvent& ev) {
-            if (ev.type == MarketEvent::Type::TRADE ||
-                ev.type == MarketEvent::Type::EXECUTE) {
-                channel_a_.push(ev);   // 成交事件 → 通道 A（低频策略消费）
-            } else {
-                channel_b_.push(ev);   // 委托事件 → 通道 B（订单簿/逐笔策略消费）
-            }
+            // 背压: push 满(尝试清理后仍满)返回 false, 使用者重试直到成功(不丢消息)。
+            while (!channel_.push(ev)) _mm_pause();
         });
     }
     ~ByteRingParser() {
@@ -64,6 +62,8 @@ public:
     ByteRingParser& operator=(const ByteRingParser&) = delete;
 
     int wake_fd() const { return wake_fd_; }
+    uint64_t drops_a() const { return drops_a_.load(std::memory_order_relaxed); }
+    uint64_t drops_b() const { return drops_b_.load(std::memory_order_relaxed); }
 
     // 生产者：唤醒可能睡眠的解析线程（写完 ring 后调用）
     void notify() {
@@ -96,19 +96,22 @@ public:
     size_t parse_available() {
         size_t parsed = 0;
         for (;;) {
-            // 1. 读头（4 字节: [seq 2][len 2]）。n 是连续部分；used 是 ring 实际占用。
+            // 1. 读头（10 字节: [seq 8][len 2]）。n 是连续部分；used 是 ring 实际占用。
+            //    实验A(头帧不跨回绕)由 SPSCByteRing 保证 kHeaderBytes=8 字节头完整。
             const uint8_t* p;
-            size_t n = ring_.read_acquire(reinterpret_cast<const void*&>(p), 4);
+            constexpr size_t kHeadBytes = 10;   // [seq 8][len 2]
+            constexpr size_t kSeqBytes  = 8;
+            size_t n = ring_.read_acquire(reinterpret_cast<const void*&>(p), kHeadBytes);
             size_t used = ring_.tail() - ring_.head();
 
-            uint16_t seq, body_len;
-            if (n == 4) {
-                // 头完整：直接读(实验A: 头帧不跨回绕)
-                seq      = (static_cast<uint16_t>(p[0]) << 8) | p[1];
-                body_len = (static_cast<uint16_t>(p[2]) << 8) | p[3];
-            } else if (used >= 4) {
-                // 实验A: 头帧不跨回绕。n<4 且 used>=4 = 尾部空洞(尾部剩余<4,
-                // 生产者跳过尾部, 头+体到物理开头)。跳到物理开头。
+            uint64_t seq = 0;
+            uint16_t body_len = 0;
+            if (n == kHeadBytes) {
+                // 头完整：直接读
+                for (int i = 0; i < 8; ++i) seq = (seq << 8) | p[i];
+                body_len = (static_cast<uint16_t>(p[8]) << 8) | p[9];
+            } else if (used >= kHeadBytes) {
+                // 尾部空洞(尾部剩余<kHeadBytes, 生产者跳物理开头)。跳到物理开头。
                 size_t aligned = (ring_.head() / ring_.capacity() + 1) * ring_.capacity();
                 if (aligned > ring_.tail()) break;   // 生产者还没跨越, 等
                 ring_.read_release(aligned - ring_.head());
@@ -121,7 +124,7 @@ public:
                 ring_.read_release(n);  // 损坏前缀：释放已读的连续部分
                 continue;
             }
-            size_t msg_len = 4 + body_len;  // [seq 2][len 2][消息体]
+            size_t msg_len = kHeadBytes + body_len;  // [seq 8][len 2][消息体]
 
             // 2. 整条消息必须完整在 ring 里才消费。
             if (used < msg_len) break;
@@ -129,11 +132,10 @@ public:
             // 3. 读整条消息。实验A: 头帧完整, 消息体可能跨回绕。
             n = ring_.read_acquire(reinterpret_cast<const void*&>(p), msg_len);
             if (n == msg_len) {
-                parser_.feed(p + 4, body_len, seq);  // 零拷贝：整条连续
-                ring_.read_release(msg_len);         // 处理完才释放整条
+                parser_.feed(p + kHeadBytes, body_len, seq);  // 零拷贝：整条连续
+                ring_.read_release(msg_len);                  // 处理完才释放整条
             } else {
                 // 消息体跨回绕: 拼段(尾部体部分 + 物理开头体部分)。
-                // 头帧在 p[0..3], 体在 p[4..] 尾部 + raw_buffer 开头。
                 size_t n1 = n;              // 头帧+部分体(尾部连续)
                 size_t n2 = msg_len - n1;   // 物理开头的体部分
                 // 验证: 头部+体都在已发布区(生产者已写物理开头)
@@ -141,7 +143,7 @@ public:
                 uint8_t tmp[512];
                 memcpy(tmp, p, n1);
                 memcpy(tmp + n1, ring_.raw_buffer(), n2);
-                parser_.feed(tmp + 4, body_len, seq);
+                parser_.feed(tmp + kHeadBytes, body_len, seq);
                 ring_.read_release(msg_len);
             }
             ++parsed;
@@ -154,8 +156,9 @@ public:
 
 private:
     Ring& ring_;
-    EventQueue& channel_a_;       // 成交事件广播通道（低频策略消费）
-    EventQueue& channel_b_;       // 委托事件广播通道（订单簿/逐笔策略消费）
+    EventQueue& channel_;         // 单通道广播(方案A): 全部事件(成交+委托)
     ItchParser parser_;
     int wake_fd_ = -1;
+    std::atomic<uint64_t> drops_a_{0};   // 成交通道满被丢弃的事件数
+    std::atomic<uint64_t> drops_b_{0};   // 委托通道满被丢弃的事件数
 };

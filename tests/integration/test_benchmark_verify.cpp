@@ -124,17 +124,12 @@ int main(int argc, char* argv[]) {
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
     auto* ev_slots = new MarketEvent[1 << 20];   // 1M 槽
-    size_t chan_a_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                            ev_slots, 1 << 20, 1);
-    auto& channel_a = QueueManager::get<SPMCEventQueue<16>>(chan_a_id);
-
-    auto* ord_slots = new MarketEvent[1 << 20];  // 1M 槽
-    size_t chan_b_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                            ord_slots, 1 << 20, 1);
-    auto& channel_b = QueueManager::get<SPMCEventQueue<16>>(chan_b_id);
+    size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
+                                          ev_slots, 1 << 20, 2);
+    auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
     MoldUdpUnpacker unpacker(shared_ring);
-    ByteRingParser parser(shared_ring, channel_a, channel_b);
+    ByteRingParser parser(shared_ring, channel);
 
     VolumeBreakoutStrategy vbs;
     PriceBreakoutStrategy pbs;
@@ -231,14 +226,17 @@ int main(int argc, char* argv[]) {
     std::thread strategy_th([&]() {
         MarketEvent ev;
         OrderSide last_order_side = OrderSide::NONE;   // 已下单方向(同向不重下)
-        // 退出条件: 解析已完成(parse_done) 且 通道A空(pending==0)
-        while (!parse_done.load(std::memory_order_acquire) || channel_a.pending(0) > 0) {
-            if (channel_a.pop(0, ev)) {
+        // 退出条件: 解析已完成(parse_done) 且 通道空(pending==0)
+        while (!parse_done.load(std::memory_order_acquire) || channel.pending(0) > 0) {
+            if (channel.pop(0, ev)) {
+                if (ev.type != MarketEvent::Type::TRADE &&
+                    ev.type != MarketEvent::Type::EXECUTE) continue;   // skip 委托
                 vbs.on_event(ev); pbs.on_event(ev); tds.on_event(ev); tms.on_event(ev);
                 kagg.on_trade(ev);      // 成交 → K线聚合
                 ++trade_count;
                 uint64_t l = last_seq.load();
-                if (l != 0 && ev.seq_id != l + 1)
+                // seq_id 是全局消息序号, 成交之间隔了委托, 只要求递增不要求连续
+                if (l != 0 && ev.seq_id <= l)
                     seq_contiguous.store(false, std::memory_order_relaxed);
                 last_seq.store(ev.seq_id, std::memory_order_relaxed);
 
@@ -272,9 +270,9 @@ int main(int argc, char* argv[]) {
     std::atomic<size_t> book_events{0};
     std::thread book_th([&]() {
         MarketEvent ev;
-        while (!parse_done.load(std::memory_order_acquire) || channel_b.pending(0) > 0) {
-            if (channel_b.pop(0, ev)) {
-                obc.on_event(ev);   // 委托 → 订单簿重建(先重建, 才能查方向)
+        while (!parse_done.load(std::memory_order_acquire) || channel.pending(1) > 0) {
+            if (channel.pop(1, ev)) {
+                obc.on_event(ev);   // 事件 → 订单簿(成交更新挂单 + 委托重建盘口)
                 ++book_events;
                 const OrderBook* book = obc.book(ev.locate);
 

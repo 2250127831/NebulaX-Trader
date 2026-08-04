@@ -19,6 +19,9 @@
 #include "core/ipc/flow_control.h"
 #include "core/net/io_uring_receiver.h"
 #include "core/net/io_uring_sender.h"
+#include "core/prof/lensx_probe.h"
+
+#include <immintrin.h>   // _mm_pause（高频消费者忙轮询暂停）
 #include "core/queue/queue_manager.h"
 #include "core/queue/spmc_event_queue.h"
 #include "core/queue/spsc_byte_ring.h"
@@ -30,16 +33,8 @@
 #include "oms/order_protocol.h"
 #include "risk/risk_manager.h"
 #include "strategy/base/strategy.h"
-#include "strategy/combo/signal_combiner.h"
-#include "strategy/kline/kline_aggregator.h"
-#include "strategy/momentum/momentum_strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
 #include "strategy/tick/order_flow_imbalance_strategy.h"
-#include "strategy/tick/price_breakout_strategy.h"
-#include "strategy/tick/tick_momentum_strategy.h"
-#include "strategy/tick/trade_direction_strategy.h"
-#include "strategy/tick/volume_breakout_strategy.h"
-#include "strategy/trend/trend_strategy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -110,39 +105,18 @@ int main(int argc, char* argv[]) {
                                           ring_buf.get(), cfg.market.ring_bytes);
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
-    auto* chan_a_slots = new MarketEvent[cfg.market.chan_slots];
-    size_t chan_a_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                            chan_a_slots, cfg.market.chan_slots, 1);
-    auto& channel_a = QueueManager::get<SPMCEventQueue<16>>(chan_a_id);
-
-    auto* chan_b_slots = new MarketEvent[cfg.market.chan_slots];
-    size_t chan_b_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                            chan_b_slots, cfg.market.chan_slots, 1);
-    auto& channel_b = QueueManager::get<SPMCEventQueue<16>>(chan_b_id);
+    // 单通道: 全部事件(成交+委托)进同一队列, 单一消费者 book_th 处理全部。
+    // 同一序列 → 订单簿时序正确(成交不会先于对应委托处理)。
+    auto* chan_slots = new MarketEvent[cfg.market.chan_slots];
+    size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
+                                          chan_slots, cfg.market.chan_slots, 1);
+    auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
     MoldUdpUnpacker unpacker(shared_ring);
-    ByteRingParser parser(shared_ring, channel_a, channel_b);
+    ByteRingParser parser(shared_ring, channel);
 
-    // ── 策略 ──
-    // 主策略：成交量突破（默认），也可配置趋势/动量
-    VolumeBreakoutStrategy vbs(cfg.strategy.vol_window, cfg.strategy.vol_threshold);
-    PriceBreakoutStrategy pbs;
-    TradeDirectionStrategy tds;
-    TickMomentumStrategy tms;
-    TrendStrategy trend;
-    MomentumStrategy mom;
-    KLineAggregator kagg(0, cfg.strategy.kline_ticks);   // 按数量分窗
-    kagg.set_sink([&](const KLine& bar) { trend.on_bar(bar); mom.on_bar(bar); });
-    SignalCombiner combiner;
-
-    // 主策略信号选择
-    auto primary_signal = [&]() -> Signal {
-        if (cfg.strategy.primary == "trend")     return trend.signal();
-        if (cfg.strategy.primary == "momentum")  return mom.signal();
-        return vbs.signal();                      // 默认 volume_breakout
-    };
-
-    // 从策略（订单簿侧）: 共享挂单池 + 共享索引(主线程全局, 所有订单簿引用)
+    // ── 高频策略(订单簿侧): 共享挂单池 + 共享索引(主线程全局, 所有订单簿引用) ──
+    // 独立信号 + 仲裁下单: OFI(逐笔委托) + OBI(盘口) 各产信号, 同向才下单。
     OrderPool shared_pool(cfg.order_book.pool_slots);
     OrderMap  shared_index(cfg.order_book.pool_slots);
     OrderBookConsumer obc(shared_pool, shared_index);
@@ -186,78 +160,54 @@ int main(int argc, char* argv[]) {
             if (n > 0) {
                 if (fc) fc->received.fetch_add(1, std::memory_order_release);
                 unpacker.feed(buf, (size_t)n);
+                parser.notify();   // 新数据已写入 ring → 立即唤醒可能阻塞在 poll 的解析线程
             } else break;
         }
     });
 
-    // ── 解析线程：通道A(成交) / 通道B(委托) ──
+    // 消费者混合退避参数: 短暂空自旋顶住唤醒延迟, 持续空才 eventfd 阻塞。
+    // parse_th/strategy_th/book_th 共用(kSpinMax ~ 几十µs)。
+    constexpr int kSpinMax = 2000;
+
+    // ── 解析线程：解析 ITCH → 单通道广播(方案A, 全部事件) ──
     // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。排空 ring 后置 parse_done。
     std::thread parse_th([&]() {
+        int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
         while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
             parser.parse_available();
-            if (!parser.ring().empty()) continue;
-            parser.wait_for_data(200);
+            if (!parser.ring().empty()) { spin_left = kSpinMax; continue; }
+            if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
+            spin_left = kSpinMax;
+            parser.wait_for_data(200);   // 持续空: 阻塞等 recv_th notify
         }
         parser.parse_available();   // 排空剩余
         parse_done.store(true, std::memory_order_release);
     });
 
-    // ── 策略线程：通道A → 成交策略 + K线 → 主从组合评估 → 下单 ──
+    // ── 订单簿线程(单消费者): 单通道全部事件 → 订单簿重建 → OFI/OBI 信号 → 仲裁下单 ──
+    // 独立信号 + 仲裁: OFI(逐笔委托) + OBI(盘口) 各产信号, 同向才下单。
     std::atomic<OrderSide> last_order_side{OrderSide::NONE};
     std::atomic<int64_t> last_order_str{-1};
-    std::thread strategy_th([&]() {
-        MarketEvent ev;
-        while (!parse_done.load(std::memory_order_acquire) || channel_a.pending(0) > 0) {
-            if (channel_a.pop(0, ev)) {
-                vbs.on_event(ev); pbs.on_event(ev); tds.on_event(ev); tms.on_event(ev);
-                kagg.on_trade(ev);
-                ++trade_count;
-
-                // 组合评估：主策略(通道A)信号更新时，合成从策略(通道B)当前信号
-                // 仅成交 tick 时评估，避免独立线程高频空轮询导致的重复下单
-                combiner.set_primary(primary_signal());
-                if (cfg.strategy.use_ofi) combiner.add_slave(ofi.signal());
-                if (cfg.strategy.use_obi) combiner.add_slave(obi.signal());
-                Signal decision = combiner.combine();
-                combiner.clear_slaves();
-
-                if (decision.side != OrderSide::NONE && decision.strength > 0) {
-                    // 持仓封顶检查
-                    uint64_t pos = rm.position(decision.locate);
-                    if (decision.side == OrderSide::BUY && pos >= cfg.risk.max_position)
-                        { last_order_side.store(decision.side); continue; }
-                    if (decision.side == OrderSide::SELL && pos == 0)
-                        { last_order_side.store(decision.side); continue; }
-                    // 方向或强度显著变化才下
-                    int64_t str_delta = decision.strength - last_order_str.load();
-                    if (str_delta < 0) str_delta = -str_delta;
-                    bool fresh = (decision.side != last_order_side.load()) ||
-                                 (str_delta >= Signal::kStrengthScale / 20);
-                    if (fresh) {
-                        uint64_t oid = ex.submit_signal(decision, 1);
-                        if (oid != 0) {
-                            last_order_side.store(decision.side);
-                            last_order_str.store(decision.strength);
-                        }
-                    }
-                } else {
-                    last_order_side.store(OrderSide::NONE);
-                    last_order_str.store(-1);
-                }
-            } else if (!parse_done.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            } else {
-                break;
-            }
-        }
-        kagg.flush();
-    });
-
-    // ── 订单簿线程：通道B → 订单簿重建 → OBI/OFI ──
     std::thread book_th([&]() {
         MarketEvent ev;
-        while (!parse_done.load(std::memory_order_acquire) || channel_b.pending(0) > 0) {
-            if (channel_b.pop(0, ev)) {
+        // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
+        // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
+        // 平衡高频吞吐(不牺牲)与空闲省CPU(不空转)。
+        int spin_left = 0;   // 剩余自旋次数(每空一轮减一, 耗完才阻塞)
+        while (!parse_done.load(std::memory_order_acquire) || channel.pending(0) > 0) {
+            if (channel.pending(0) == 0) {
+                if (!parse_done.load(std::memory_order_acquire)) {
+                    if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
+                    spin_left = kSpinMax;
+                    channel.wait_for_data(200);   // 持续空: 阻塞等 push 唤醒
+                    continue;
+                }
+                break;
+            }
+            spin_left = kSpinMax;   // 有数据: 重置自旋预算
+            while (channel.pop(0, ev)) {
+                if (ev.type == MarketEvent::Type::TRADE ||
+                    ev.type == MarketEvent::Type::EXECUTE) ++trade_count;   // 成交统计
                 obc.on_event(ev);
                 ++book_events;
                 const OrderBook* book = obc.book(ev.locate);
@@ -274,23 +224,54 @@ int main(int argc, char* argv[]) {
                         side = book->side_of(ev.order.order_ref);
                 }
                 if (side != OrderSide::NONE && cfg.strategy.use_ofi) {
+                    lensx::mark_book(ev.seq_id);   // [LensX 四类起点] 会更新OFI的委托
                     ofi.on_event(ev, side);
+                    lensx::mark_ofi(ev.seq_id);   // [LensX 四类终点] OFI 信号更新完成
                     if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
                         ofi.set_last_price((book->best_bid() + book->best_ask()) / 2);
                 }
                 if (book && cfg.strategy.use_obi) {
+                    lensx::mark_book(ev.seq_id);   // [LensX 三类起点] 会更新OBI的委托
                     obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
                                 book->best_ask(), book->best_ask_volume(), ev.timestamp);
+                    lensx::mark_obi(ev.seq_id);   // [LensX 三类终点] OBI 信号更新完成
                 }
-            } else if (!parse_done.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            } else {
-                break;
+
+                // 仲裁下单: OFI 和 OBI 同向才下(独立信号, 不一致不动)。
+                if (cfg.strategy.use_ofi && cfg.strategy.use_obi) {
+                    Signal sof = ofi.signal(), sob = obi.signal();
+                    if (sof.side != OrderSide::NONE && sof.side == sob.side) {
+                        Signal decision = sof;   // 同向: 用 OFI 方向
+                        uint64_t pos = rm.position(decision.locate);
+                        if (decision.side == OrderSide::BUY && pos >= cfg.risk.max_position) {
+                            last_order_side.store(decision.side);   // 持仓满: 记录信号, 避免重复下单
+                            last_order_str.store(decision.strength);
+                            continue;
+                        }
+                        if (decision.side == OrderSide::SELL && pos == 0) {
+                            last_order_side.store(decision.side);
+                            last_order_str.store(decision.strength);
+                            continue;
+                        }
+                        // 收紧: 只在方向翻转时下单(高频策略强度连续波动, 强度变化不触发)。
+                        // 方向不变 → 持仓已反映, 不重复下单。
+                        bool fresh = (decision.side != last_order_side.load());
+                        if (fresh) {
+                            lensx::mark_s5(ev.seq_id);   // [LensX s5] 下单决策
+                            uint64_t oid = ex.submit_signal(decision, 1);
+                            lensx::mark_s6(ev.seq_id);   // [LensX s6] 订单发出
+                            if (oid != 0) {
+                                last_order_side.store(decision.side);
+                                last_order_str.store(decision.strength);
+                            }
+                        }
+                    }
+                    // else: 不同向/NONE 不重置 last_order_side——信号抖动(OFI 在 BUY/NONE 间)
+                    // 不应清状态, 否则每次抖动都触发"方向变化"下单。
+                }
             }
         }
     });
-
-    // 组合评估已并入 strategy_th（成交 tick 时评估，避免独立线程高频空轮询）
 
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
@@ -359,7 +340,8 @@ int main(int argc, char* argv[]) {
         }
         auto t_end_mon = std::chrono::steady_clock::now();
         double wall = std::chrono::duration<double>(t_end_mon - t_start_mon).count();
-        printf("10 秒无消息, 停止。解析总数=%llu\n", (unsigned long long)last_parsed);
+        printf("%d 秒无消息, 停止。解析总数=%llu\n",
+               cfg.execution.idle_timeout_sec, (unsigned long long)last_parsed);
         printf("解析 QPS: 峰值=%llu msg/s, 均值=%llu msg/s (有数据 %llu 秒, 墙钟 %.1f 秒)\n",
                (unsigned long long)max_qps,
                active_sec ? (unsigned long long)(total_parsed / active_sec) : 0ull,
@@ -379,7 +361,7 @@ int main(int argc, char* argv[]) {
     recv_th.join();
     parser.notify();
     parse_th.join();
-    strategy_th.join();
+    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的消费者(book_th)
     book_th.join();
     fill_stop.store(true, std::memory_order_release);
     fill_rcv->stop();
@@ -390,9 +372,8 @@ int main(int argc, char* argv[]) {
 
     // ── 汇总 ──
     printf("\n=== 运行汇总 ===\n");
-    printf("成交事件:   %zu\n", trade_count.load());
-    printf("委托事件:   %zu\n", book_events.load());
-    printf("主策略信号: %d  (0=BUY 1=SELL 2=NONE)\n", (int)primary_signal().side);
+    printf("成交事件:   %zu  单通道丢=%llu\n", trade_count.load(), (unsigned long long)parser.drops_a());
+    printf("事件处理:   %zu  单通道丢=%llu\n", book_events.load(), (unsigned long long)parser.drops_b());
     if (cfg.strategy.use_ofi)
         printf("OFI 累计:   %lld  信号=%d\n",
                (long long)ofi.ofi(), (int)ofi.signal().side);
@@ -403,11 +384,10 @@ int main(int argc, char* argv[]) {
            om.count_by_status(OrderStatus::FILLED),
            om.count_by_status(OrderStatus::REJECTED));
     printf("持仓:       %llu  已实现盈亏=%lld 分\n",
-           (unsigned long long)rm.position(vbs.signal().locate),
+           (unsigned long long)rm.position(ofi.signal().locate),
            (long long)rm.realized_pnl());
 
-    delete[] chan_a_slots;
-    delete[] chan_b_slots;
+    delete[] chan_slots;
     if (fc) munmap(fc, sizeof(FlowControl));
     return 0;
 }

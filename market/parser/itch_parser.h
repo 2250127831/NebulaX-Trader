@@ -40,7 +40,8 @@ public:
     // 喂一条消息（不含长度前缀，len = 消息体长度）。返回是否成功处理。
     bool feed(const uint8_t* msg, size_t len);
     // 带 seq 版本：seq 是 recv 从 MoldUDP64 包头 + 包内偏移推算的消息序号。
-    bool feed(const uint8_t* msg, size_t len, uint16_t seq);
+    // uint64_t: 完整消息序号不回绕(之前 uint16_t 在 873 万条下回绕 133 次)。
+    bool feed(const uint8_t* msg, size_t len, uint64_t seq);
 
     uint64_t message_count() const { return msg_count_; }
 
@@ -66,5 +67,5 @@ private:
 
     Sink sink_;
     uint64_t msg_count_ = 0;
-    uint16_t cur_seq_ = 0;   // 当前消息序号（feed 带 seq 时设置）
+    uint64_t cur_seq_ = 0;   // 当前消息序号（feed 带 seq 时设置, 64 位不回绕）
 };

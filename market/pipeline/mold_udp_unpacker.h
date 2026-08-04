@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/queue/spsc_byte_ring.h"
+#include "core/prof/lensx_probe.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -43,7 +44,7 @@ public:
     size_t feed(const uint8_t* pkt, size_t pkt_len) {
         size_t pos = 0;
         size_t unpacked = 0;
-        uint8_t msg_buf[4 + 200];  // [seq][len][消息体]
+        uint8_t msg_buf[10 + 200];  // [seq 8][len 2][消息体]
 
         while (pos + kHeaderLen <= pkt_len) {
             uint64_t seq  = be64(pkt + pos + 10);    // 包头 seq = 包内第一条消息序号
@@ -57,16 +58,25 @@ public:
                 size_t msg_len = 2 + body_len;
                 if (pos + msg_len > pkt_len) break;
 
-                // 每条消息前加 2 字节 seq（包 seq + 包内偏移）
+                // 每条消息前加 8 字节完整 seq（包 seq + 包内偏移, 64 位不回绕）。
+                // 之前 16 位在 873 万条消息下回绕 133 次, 导致 seq_id 撞车/探针 key 错配。
                 uint64_t msg_seq = seq + i;
-                be16_store(msg_buf, static_cast<uint16_t>(msg_seq));  // [seq 2]
-                msg_buf[2] = pkt[pos];        // [len 2 高字节]
-                msg_buf[3] = pkt[pos + 1];    // [len 2 低字节]
-                memcpy(msg_buf + 4, pkt + pos + 2, body_len);  // 消息体
+                be64_store(msg_buf, msg_seq);        // [seq 8]
+                msg_buf[8] = pkt[pos];               // [len 2 高字节]
+                msg_buf[9] = pkt[pos + 1];           // [len 2 低字节]
+                memcpy(msg_buf + 10, pkt + pos + 2, body_len);  // 消息体
 
                 // 推入 ring: 一次 push 整条消息(消息级, 让 push 处理跨回绕空洞)。
                 // push 返回 0 = 空间不足(含空洞跨越后仍不足), 忙等消费者释放。
-                while (ring_.push(msg_buf, msg_len + 2) == 0)
+                // [LensX 第一类] 只对成交消息('P' Trade / 'E' Executed)打点:
+                //   mark_recv = 包到达(收包到拆出本条成交), mark_s0 = 入ring。
+                //   两者都在本条消息处, 频率一致(每成交一对), 可配对。
+                uint8_t mtype = msg_buf[10];
+                if (mtype == 'P' || mtype == 'E') {
+                    lensx::mark_recv(msg_seq);   // 包到达(完整 64 位 seq, 不回绕)
+                    lensx::mark_s0(msg_seq);     // 消息入ring
+                }
+                while (ring_.push(msg_buf, msg_len + 8) == 0)   // [seq 8][len 2][体]
                     __builtin_ia32_pause();
 
                 pos += msg_len;
@@ -91,6 +101,10 @@ private:
     static void be16_store(uint8_t* p, uint16_t v) {
         p[0] = static_cast<uint8_t>(v >> 8);
         p[1] = static_cast<uint8_t>(v & 0xFF);
+    }
+    static void be64_store(uint8_t* p, uint64_t v) {
+        for (int i = 0; i < 8; ++i)
+            p[i] = static_cast<uint8_t>(v >> (56 - 8 * i));
     }
 
     Ring& ring_;

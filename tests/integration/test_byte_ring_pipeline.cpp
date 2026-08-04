@@ -113,19 +113,13 @@ int main(int argc, char* argv[]) {
                                           ring_buf, 1 << 20);
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
-    // 通道 A: 成交事件广播（低频策略消费）
+    // 单通道广播(方案A): 全部事件, 多消费者各自处理关心的类型
     auto* ev_slots = new MarketEvent[1 << 16];
-    size_t chan_a_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                            ev_slots, 1 << 16, 1);
-    auto& channel_a = QueueManager::get<SPMCEventQueue<16>>(chan_a_id);
+    size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
+                                          ev_slots, 1 << 16, 2);
+    auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
-    // 通道 B: 委托事件广播（订单簿/逐笔策略消费）
-    auto* ord_slots = new MarketEvent[1 << 16];
-    size_t chan_b_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                            ord_slots, 1 << 16, 1);
-    auto& channel_b = QueueManager::get<SPMCEventQueue<16>>(chan_b_id);
-
-    ByteRingParser bp(shared_ring, channel_a, channel_b);
+    ByteRingParser bp(shared_ring, channel);
     MoldUdpUnpacker unpacker(shared_ring);  // 共享同一个 ring
     std::atomic<size_t> parsed_count{0};
     std::atomic<bool> stop{false};
@@ -144,11 +138,13 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // ── 策略消费线程: 从通道 A 收成交事件, 验证 seq 连续 ──
+    // ── 策略消费线程: 从单通道收成交事件(委托 skip), 验证 seq 连续 ──
     std::thread strategy_th([&] {
         MarketEvent ev;
-        while (!stop.load(std::memory_order_acquire) || channel_a.pending(0) > 0) {
-            if (channel_a.pop(0, ev)) {
+        while (!stop.load(std::memory_order_acquire) || channel.pending(0) > 0) {
+            if (channel.pop(0, ev)) {
+                if (ev.type != MarketEvent::Type::TRADE &&
+                    ev.type != MarketEvent::Type::EXECUTE) continue;   // skip 委托
                 if (last_seq.load() != 0 && ev.seq_id != last_seq.load() + 1)
                     seq_contiguous.store(false, std::memory_order_relaxed);
                 last_seq.store(ev.seq_id, std::memory_order_relaxed);

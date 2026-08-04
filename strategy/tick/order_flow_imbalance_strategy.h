@@ -3,11 +3,12 @@
 #include "strategy/base/strategy.h"
 #include "market/book/order_book_consumer.h"
 
+#include <array>
 #include <cstdint>
 
 // ── OFI 订单流失衡策略(逐笔委托，高频) ──
-// 消费通道 B 的逐笔委托事件(ADD/DELETE/CANCEL/REPLACE/EXECUTE)，
-// 累加订单流方向强度(Order Flow Imbalance, OFI)，判断买卖主导。
+// 消费单通道的逐笔委托事件(ADD/DELETE/CANCEL/REPLACE/EXECUTE)，
+// 滑动窗口累计订单流方向强度(Order Flow Imbalance, OFI)，判断买卖主导。
 //
 // OFI(经典 Cont et al.，适配 ITCH 事件类型)：
 //   事件              方向来源        对 OFI 贡献
@@ -22,15 +23,18 @@
 //
 // 方向信息：D/X/E 事件只带 order_ref 不带 side，方向要靠订单簿查。
 //   因此 OFI 策略与订单簿协同：回调里先用 OrderBookConsumer 查方向再累加。
-//   这就是为什么 OFI 需要订单簿(盘口)支撑——它是逐笔委托的高频消费者。
 //
-// 强度：累计 OFI 超出阈值的部分，万分比，封顶满强度。
+// 窗口化: ofi_ = 最近 kWindow 笔委托的净流(环形缓冲, 满则减最旧)。
+//   之前无限累计导致信号一旦超阈值就恒为 BUY/SELL 永不回摆, 高频下单锁死。
+//   窗口化后信号随行情回摆, 方向能翻转, 高频下单才有意义。
+//
+// 强度：窗口 OFI 超出阈值的部分，万分比，封顶满强度。
 class OrderFlowImbalanceStrategy : public Strategy {
 public:
     explicit OrderFlowImbalanceStrategy(int64_t threshold = 500)
         : threshold_(threshold) {}
 
-    // 消费一个通道B事件。direction 由调用方从订单簿查得(仅 D/X/E 需要)。
+    // 消费一个通道事件。direction 由调用方从订单簿查得(仅 D/X/E 需要)。
     // A/U 事件自带 side，direction 传 side 即可。
     void on_event(const MarketEvent& ev, OrderSide side) {
         locate_ = ev.locate;
@@ -58,9 +62,13 @@ public:
             default:
                 return;
         }
+        // 滑动窗口: 加入新 delta, 满则减去最旧
+        if (widx_ < kWindow) win_[widx_] = delta;
+        else { ofi_ -= win_[widx_ % kWindow]; win_[widx_ % kWindow] = delta; }
         ofi_ += delta;
+        ++widx_;
 
-        // 信号：|OFI| 超阈值 → 方向；强度 = |OFI|/阈值 封顶
+        // 信号：|窗口 OFI| 超阈值 → 方向；强度 = |OFI|/阈值 封顶
         if (ofi_ > threshold_)      current_ = OrderSide::BUY;
         else if (ofi_ < -threshold_) current_ = OrderSide::SELL;
         else                         current_ = OrderSide::NONE;
@@ -85,13 +93,18 @@ public:
 
     // 查询/重置
     int64_t ofi() const { return ofi_; }
-    void reset() { ofi_ = 0; current_ = OrderSide::NONE; strength_ = 0; }
+    void reset() { ofi_ = 0; current_ = OrderSide::NONE; strength_ = 0;
+                   for (auto& v : win_) v = 0; widx_ = 0; }
 
     void set_last_price(int64_t p) { last_price_ = p; }
 
 private:
+    // 滑动窗口大小(最近 N 笔委托的净流)。按行情尺度调, 默认 1024 笔。
+    static constexpr size_t kWindow = 1024;
     int64_t threshold_;
-    int64_t  ofi_ = 0;                 // 累计订单流失衡
+    int64_t  ofi_ = 0;                 // 窗口内净订单流失衡
+    std::array<int64_t, kWindow> win_{};   // 窗口内每笔 delta(环形)
+    size_t   widx_ = 0;                // 窗口写入位置
     OrderSide current_ = OrderSide::NONE;
     uint64_t  locate_ = 0;
     int64_t   last_price_ = 0;

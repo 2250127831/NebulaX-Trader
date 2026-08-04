@@ -20,6 +20,10 @@
 class SPSCByteRing
 {
 public:
+    // 消息头长度(跨回绕时保证头不跨回绕)。调用方(unpacker)写入消息 = [kHeaderBytes 头][body]。
+    // 之前是 4 字节 [seq 2][len 2], 现扩为 8 字节 [seq 8](64 位完整 seq 不回绕)。
+    static constexpr size_t kHeaderBytes = 8;
+
     // 用户传入存储空间 + 容量。capacity 必须 2 的幂（不满足返回 false，需检查 valid()）。
     SPSCByteRing(uint8_t* buf, size_t capacity)
         : buf_(buf), capacity_(capacity), valid_((capacity & (capacity - 1)) == 0) {}
@@ -55,32 +59,32 @@ public:
         }
 
         // 跨回绕: 实验A方案(头帧不跨回绕, 消息体可跨回绕)。
-        // 假设: 调用方(feed)约定消息 = [4字节头][body]。
-        //   - 尾部剩余 >= 4: 头帧写尾部(不跨回绕), 消息体跨回绕(尾部剩余+物理开头)。
-        //   - 尾部剩余 <  4: 跳过尾部, 头+体都到物理开头。
+        // 假设: 调用方(unpacker)约定消息 = [kHeaderBytes 字节头][body]。
+        //   - 尾部剩余 >= kHeaderBytes: 头帧写尾部(不跨回绕), 消息体跨回绕(尾部剩余+物理开头)。
+        //   - 尾部剩余 <  kHeaderBytes: 跳过尾部, 头+体都到物理开头。
         // 对照实验证明: 头帧不跨回绕 → 稳定(150/150); 头帧跨回绕 → flaky。
         // 因此只保证头帧不跨回绕即可, 消息体跨回绕无害(复用尾部空间)。
         size_t aligned = (tail / capacity_ + 1) * capacity_;   // 下一圈开头
         if (aligned + len > head + capacity_) return 0;         // 物理开头空间不足
         size_t tail_room = capacity_ - pos;
-        if (tail_room >= 4) {
-            // 头帧写尾部(前4字节, 不跨回绕), 消息体跨回绕
+        if (tail_room >= kHeaderBytes) {
+            // 头帧写尾部(kHeaderBytes 字节, 不跨回绕), 消息体跨回绕
             const auto* db = static_cast<const uint8_t*>(data);
-            memcpy(buf_ + pos, db, 4);                         // 头帧
-            size_t body_room = tail_room - 4;                  // 尾部给体的空间
-            size_t body_len = len - 4;
+            memcpy(buf_ + pos, db, kHeaderBytes);                          // 头帧
+            size_t body_room = tail_room - kHeaderBytes;                   // 尾部给体的空间
+            size_t body_len = len - kHeaderBytes;
             if (body_len > body_room) {
                 // 体跨回绕: 尾部写 body_room, 物理开头写剩余
-                memcpy(buf_ + pos + 4, db + 4, body_room);
-                memcpy(buf_, db + 4 + body_room, body_len - body_room);
+                memcpy(buf_ + pos + kHeaderBytes, db + kHeaderBytes, body_room);
+                memcpy(buf_, db + kHeaderBytes + body_room, body_len - body_room);
             } else {
                 // 体不跨回绕(尾部够): 全写尾部
-                memcpy(buf_ + pos + 4, db + 4, body_len);
+                memcpy(buf_ + pos + kHeaderBytes, db + kHeaderBytes, body_len);
             }
             tail_.store(tail + len, std::memory_order_release);
             return len;
         }
-        // tail_room < 4: 跳过尾部, 头+体都到物理开头
+        // tail_room < kHeaderBytes: 跳过尾部, 头+体都到物理开头
         memcpy(buf_, data, len);
         tail_.store(aligned + len, std::memory_order_release);
         return len;

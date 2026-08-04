@@ -35,6 +35,7 @@
 #include "strategy/base/strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
 #include "strategy/tick/order_flow_imbalance_strategy.h"
+#include "strategy/tick/trade_direction_strategy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -105,23 +106,34 @@ int main(int argc, char* argv[]) {
                                           ring_buf.get(), cfg.market.ring_bytes);
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
-    // 单通道: 全部事件(成交+委托)进同一队列, 单一消费者 book_th 处理全部。
+    // 单通道: 全部事件(成交+委托)进同一队列, 多消费者(SPMC 广播)。
+    // 消费者0 = book_th(订单簿+OFI/OBI+仲裁), 消费者1 = strategy_th(独立高频策略)。
     // 同一序列 → 订单簿时序正确(成交不会先于对应委托处理)。
     auto* chan_slots = new MarketEvent[cfg.market.chan_slots];
     size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                          chan_slots, cfg.market.chan_slots, 1);
+                                          chan_slots, cfg.market.chan_slots, 2);
     auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
     MoldUdpUnpacker unpacker(shared_ring);
     ByteRingParser parser(shared_ring, channel);
 
     // ── 高频策略(订单簿侧): 共享挂单池 + 共享索引(主线程全局, 所有订单簿引用) ──
-    // 独立信号 + 仲裁下单: OFI(逐笔委托) + OBI(盘口) 各产信号, 同向才下单。
+    // 独立信号 + 统一仲裁: OFI(逐笔委托) + OBI(盘口) + TradeDirection(成交) 各产信号,
+    // arbitrate() 读三信号槽, 同向才下单。
     OrderPool shared_pool(cfg.order_book.pool_slots);
     OrderMap  shared_index(cfg.order_book.pool_slots);
     OrderBookConsumer obc(shared_pool, shared_index);
     OrderBookImbalanceStrategy obi;
     OrderFlowImbalanceStrategy ofi;
+    TradeDirectionStrategy tds;   // 独立高频策略(消费成交, 不依赖订单簿)
+
+    // ── 信号槽: 各策略线程写, arbitrate() 读(跨线程原子) ──
+    // 每个信号拆成 side/locate/strength 原子, 避免整 Signal 非原子的竞争。
+    struct SignalSlot {
+        alignas(64) std::atomic<OrderSide> side{OrderSide::NONE};
+        alignas(64) std::atomic<uint64_t> locate{0};
+        alignas(64) std::atomic<int64_t> strength{0};
+    } sig_ofi, sig_obi, sig_td;   // OFI/OBI(book_th 写) + TD(strategy_th 写)
 
     // ── 交易侧：风控 + OMS + 执行引擎 ──
     OrderManager om;
@@ -137,6 +149,40 @@ int main(int argc, char* argv[]) {
         "127.0.0.1", cfg.execution.order_port, order_send_ring.get(), 1 << 20);
     if (!order_sender->start()) { printf("订单发送端启动失败\n"); return 1; }
     ex.set_sender(order_sender.get());
+
+    // ── 统一仲裁(共享函数): 读三信号槽, 同向才下 ──
+    // 谁写信号谁调用(写完检查信号是否齐全, 齐则仲裁下单)。
+    // 无定时器无独立线程——信号一更新同步仲裁, TD 后写也能触发。
+    std::atomic<OrderSide> last_order_side{OrderSide::NONE};
+    std::atomic<int64_t> last_order_str{-1};
+    auto arbitrate = [&]() {
+        OrderSide so = sig_ofi.side.load(std::memory_order_acquire);
+        OrderSide sb = sig_obi.side.load(std::memory_order_acquire);
+        OrderSide st = sig_td.side.load(std::memory_order_acquire);
+        // 仲裁: TD 有方向时要求三同向; TD 无方向(NONE, E 多无主动方)退化为 OFI/OBI 两信号。
+        bool ok;
+        if (st != OrderSide::NONE) ok = (so != OrderSide::NONE && so == sb && so == st);
+        else                      ok = (so != OrderSide::NONE && so == sb);
+        if (!ok) return;
+        // 用 OFI 方向(方向一致时任一方向都成立, 取 OFI)
+        uint64_t locate = sig_ofi.locate.load(std::memory_order_acquire);
+        int64_t strength = sig_ofi.strength.load(std::memory_order_acquire);
+        uint64_t pos = rm.position(locate);
+        if (so == OrderSide::BUY && pos >= cfg.risk.max_position) return;
+        if (so == OrderSide::SELL && pos == 0) return;
+        bool fresh = (so != last_order_side.load());
+        if (fresh) {
+            Signal decision{.side = so, .locate = locate,
+                            .price = 0, .timestamp = 0, .strength = strength};
+            lensx::mark_s5(0);   // [LensX s5] 下单决策
+            uint64_t oid = ex.submit_signal(decision, 1);
+            lensx::mark_s6(0);   // [LensX s6] 订单发出
+            if (oid != 0) {
+                last_order_side.store(so);
+                last_order_str.store(strength);
+            }
+        }
+    };
 
     // 成交回报接收端（← 模拟交易所）
     auto fill_rcv = std::make_unique<IoUringReceiver>(cfg.execution.order_ret_port);
@@ -184,10 +230,37 @@ int main(int argc, char* argv[]) {
         parse_done.store(true, std::memory_order_release);
     });
 
-    // ── 订单簿线程(单消费者): 单通道全部事件 → 订单簿重建 → OFI/OBI 信号 → 仲裁下单 ──
-    // 独立信号 + 仲裁: OFI(逐笔委托) + OBI(盘口) 各产信号, 同向才下单。
-    std::atomic<OrderSide> last_order_side{OrderSide::NONE};
-    std::atomic<int64_t> last_order_str{-1};
+    // ── 独立高频策略线程(consumer 1): 消费成交跑 TradeDirection, 产信号(不下单) ──
+    // 验证 SPMC 多消费者广播: 独立于 book_th 并行消费单通道成交, 不依赖订单簿。
+    std::thread strategy_th([&]() {
+        MarketEvent ev;
+        int spin_left = 0;
+        while (!parse_done.load(std::memory_order_acquire) || channel.pending(1) > 0) {
+            if (channel.pending(1) == 0) {
+                if (!parse_done.load(std::memory_order_acquire)) {
+                    if (spin_left > 0) { --spin_left; _mm_pause(); continue; }
+                    spin_left = kSpinMax;
+                    channel.wait_for_data(200);
+                    continue;
+                }
+                break;
+            }
+            spin_left = kSpinMax;
+            while (channel.pop(1, ev)) {
+                if (ev.type != MarketEvent::Type::TRADE &&
+                    ev.type != MarketEvent::Type::EXECUTE) continue;   // 只处理成交
+                tds.on_event(ev);   // TradeDirection: 独立信号(不依赖订单簿)
+                // 写信号槽, 检查是否齐 → 仲裁下单(TD 后写也能触发)
+                Signal s = tds.signal();
+                sig_td.side.store(s.side, std::memory_order_release);
+                sig_td.locate.store(s.locate, std::memory_order_release);
+                sig_td.strength.store(s.strength, std::memory_order_release);
+                arbitrate();
+            }
+        }
+    });
+
+    // ── 订单簿线程(consumer 0): 单通道全部事件 → 订单簿重建 → OFI/OBI 信号 → 写信号槽 ──
     std::thread book_th([&]() {
         MarketEvent ev;
         // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
@@ -206,8 +279,13 @@ int main(int argc, char* argv[]) {
             }
             spin_left = kSpinMax;   // 有数据: 重置自旋预算
             while (channel.pop(0, ev)) {
-                if (ev.type == MarketEvent::Type::TRADE ||
-                    ev.type == MarketEvent::Type::EXECUTE) ++trade_count;   // 成交统计
+                // [LensX s2] 只对成交打点(端到端: 成交→仲裁→下单→send 同 seq 配对)。
+                bool is_trade = (ev.type == MarketEvent::Type::TRADE ||
+                                 ev.type == MarketEvent::Type::EXECUTE);
+                if (is_trade) {
+                    lensx::mark_s2(ev.seq_id);
+                    ++trade_count;
+                }
                 obc.on_event(ev);
                 ++book_events;
                 const OrderBook* book = obc.book(ev.locate);
@@ -237,38 +315,20 @@ int main(int argc, char* argv[]) {
                     lensx::mark_obi(ev.seq_id);   // [LensX 三类终点] OBI 信号更新完成
                 }
 
-                // 仲裁下单: OFI 和 OBI 同向才下(独立信号, 不一致不动)。
-                if (cfg.strategy.use_ofi && cfg.strategy.use_obi) {
-                    Signal sof = ofi.signal(), sob = obi.signal();
-                    if (sof.side != OrderSide::NONE && sof.side == sob.side) {
-                        Signal decision = sof;   // 同向: 用 OFI 方向
-                        uint64_t pos = rm.position(decision.locate);
-                        if (decision.side == OrderSide::BUY && pos >= cfg.risk.max_position) {
-                            last_order_side.store(decision.side);   // 持仓满: 记录信号, 避免重复下单
-                            last_order_str.store(decision.strength);
-                            continue;
-                        }
-                        if (decision.side == OrderSide::SELL && pos == 0) {
-                            last_order_side.store(decision.side);
-                            last_order_str.store(decision.strength);
-                            continue;
-                        }
-                        // 收紧: 只在方向翻转时下单(高频策略强度连续波动, 强度变化不触发)。
-                        // 方向不变 → 持仓已反映, 不重复下单。
-                        bool fresh = (decision.side != last_order_side.load());
-                        if (fresh) {
-                            lensx::mark_s5(ev.seq_id);   // [LensX s5] 下单决策
-                            uint64_t oid = ex.submit_signal(decision, 1);
-                            lensx::mark_s6(ev.seq_id);   // [LensX s6] 订单发出
-                            if (oid != 0) {
-                                last_order_side.store(decision.side);
-                                last_order_str.store(decision.strength);
-                            }
-                        }
-                    }
-                    // else: 不同向/NONE 不重置 last_order_side——信号抖动(OFI 在 BUY/NONE 间)
-                    // 不应清状态, 否则每次抖动都触发"方向变化"下单。
+                // 更新信号槽(arbitrate 读): OFI/OBI 信号 → 原子槽
+                if (cfg.strategy.use_ofi) {
+                    Signal s = ofi.signal();
+                    sig_ofi.side.store(s.side, std::memory_order_release);
+                    sig_ofi.locate.store(s.locate, std::memory_order_release);
+                    sig_ofi.strength.store(s.strength, std::memory_order_release);
                 }
+                if (cfg.strategy.use_obi) {
+                    Signal s = obi.signal();
+                    sig_obi.side.store(s.side, std::memory_order_release);
+                    sig_obi.locate.store(s.locate, std::memory_order_release);
+                    sig_obi.strength.store(s.strength, std::memory_order_release);
+                }
+                arbitrate();   // 写完 OFI/OBI 信号, 检查是否齐 → 仲裁下单
             }
         }
     });
@@ -361,7 +421,8 @@ int main(int argc, char* argv[]) {
     recv_th.join();
     parser.notify();
     parse_th.join();
-    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的消费者(book_th)
+    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的消费者(strategy_th/book_th)
+    strategy_th.join();
     book_th.join();
     fill_stop.store(true, std::memory_order_release);
     fill_rcv->stop();

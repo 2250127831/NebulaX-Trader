@@ -81,30 +81,33 @@ public:
     // 生产者：写入一个事件。满时**批量回收一次**, 仍满才返回 false。
     // 元素槽队列: "清理已消费" = tail 覆盖 seq < min_head 的槽位(顺序写, 隐式回收)。
     //   满 = 无已消费区可覆盖 → 批量回收(重读 min_head) → 仍满返回 false(调用方决定)。
-    // 平时快速检查 free(不遍历); 仅 free==0(满)才批量回收(找已消费区可覆盖)。
+    //
+    // Lazy Reclaim(cached min_head): 生产者私有缓存缓存最慢消费者进度。
+    //   平时 push 用缓存判断空间(零遍历); 仅缓存判断空间不足才扫描 min_consumed() 更新。
+    //   正确性: 缓存只可能滞后(消费者进度单调增, 缓存是上次扫描值), 滞后 → 假满 → 多扫一次,
+    //   不丢数据。消除每次 push 的 O(consumers) 原子遍历(5M/s 吞吐下是每秒千万次原子读)。
+    //
     // 唤醒: 每次成功 push 后查 blocked 掩码——有消费者阻塞(在 poll)才写其 fd(广播),
     //   无阻塞零 syscall。**不按"空→非空"门控**: 一个消费者阻塞(pending==0)时,
     //   其它消费者可能还落后, 队列未必全局空; 空转换门控会漏唤醒 → 无限阻塞的消费者饿死。
     bool push(const MarketEvent& ev) {
         const size_t tail = tail_.load(std::memory_order_relaxed);
-        // 快路径: 检查 free(最慢消费者进度)。
-        size_t min_head = min_consumed();   // 最慢消费者已消费到哪
-        if (tail - min_head < capacity_) {   // 有空间(fast path)
+        // 快路径: 用缓存的最慢消费者进度判断空间, 不遍历。
+        if (tail - cached_min_head_ < capacity_) {   // 有空间(fast path)
             slots_[tail & (capacity_ - 1)] = ev;
             tail_.store(tail + 1, std::memory_order_release);
             notify_all();   // 有阻塞消费者才写其 fd(广播), 无则零 syscall
             return true;
         }
-        // 满(free==0): 批量回收——重读 min_head(消费者可能刚推进)。
-        // 批量 = 一次重读所有消费者进度(非逐条), 已消费区一次性标记可覆盖。
-        min_head = min_consumed();
-        if (tail - min_head < capacity_) {
+        // 缓存判断空间不足: 扫描一次 min_consumed() 更新缓存(消费者可能已推进)。
+        cached_min_head_ = min_consumed();
+        if (tail - cached_min_head_ < capacity_) {
             slots_[tail & (capacity_ - 1)] = ev;
             tail_.store(tail + 1, std::memory_order_release);
             notify_all();
             return true;
         }
-        return false;   // 批量回收后仍满, 调用方决定重试/失败策略
+        return false;   // 扫描后仍满, 调用方决定重试/失败策略
     }
 
     // 消费者：读取一个事件。读到即推进该消费者进度（可跳过不处理）。
@@ -226,6 +229,8 @@ private:
     alignas(64) std::atomic<size_t> tail_{0};
     alignas(64) std::atomic<size_t> heads_[MAX_CONSUMERS]{};  // 全局发布进度(消费者 flush)
     LocalState locals_[MAX_CONSUMERS];      // 本地攒批(每消费者独立 cache line)
+    size_t cached_min_head_ = 0;            // 生产者私有缓存: 最近一次扫描的 min_consumed()
+                                            // (仅 push 读写, 无并发, 不需原子)。滞后→假满→多扫一次。
     size_t num_consumers_ = 1;
     MarketEvent* slots_ = nullptr;   // 用户传入的槽位数组（队列不拥有）
     size_t capacity_ = 0;            // 容量（运行时）

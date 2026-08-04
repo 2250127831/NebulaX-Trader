@@ -24,7 +24,8 @@ S perf record -F 999 --call-graph dwarf -e cpu-clock -p $TPID -o "$PERF_DATA" 2>
 REC_PID=$!
 # perf stat 硬件事件 + syscall 计数。用 timeout 限时 8s, 到时自动结束写文件(不被 pkill 杀断)。
 # 必须 -s INT: timeout 默认 SIGTERM 会让 perf stat 不 flush 文件, SIGINT 才优雅收尾。
-S timeout -s INT 8 perf stat -e context-switches,cycles,instructions,cache-misses,cache-references,branch-misses,L1-dcache-load-misses,L2-load-misses,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_read -p $TPID -o "$PERF_STAT" 2>/dev/null &
+# 事件集: 上下文切换/迁移 + IPC(cycles/instructions) + 各级缓存 miss + syscall 频率。
+S timeout -s INT 8 perf stat -e context-switches,cpu-migrations,cycles,instructions,cache-misses,cache-references,branch-misses,L1-dcache-load-misses,L1-dcache-loads,L2-load-misses,LLC-load-misses,LLC-loads,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_read -p $TPID -o "$PERF_STAT" 2>/dev/null &
 sleep 0.5
 
 ./build/trader_benchmark --file test_data/itch_100mb.bin --no-shm --rate $RATE > /tmp/bench.log 2>&1
@@ -48,13 +49,23 @@ echo "=== 硬件事件(perf stat) ==="
 cat "$PERF_STAT" > /tmp/trader_perf_stat_read.txt 2>/dev/null
 grep -vE "<not counted>|cpu_atom/|^#|^$|Performance counter" /tmp/trader_perf_stat_read.txt 2>/dev/null | sed 's/  #.*$//'
 echo ""
-echo "=== IPC / ctx/s ==="
-INST=$(awk '/instructions/{gsub(/,/,"",$1); print $1; exit}' /tmp/trader_perf_stat_read.txt)
-CYCLES=$(awk '/cycles/{gsub(/,/,"",$1); print $1; exit}' /tmp/trader_perf_stat_read.txt)
-CTX=$(awk '/context-switches/{gsub(/,/,"",$1); print $1; exit}' /tmp/trader_perf_stat_read.txt)
+echo "=== 派生指标 ==="
+# 硬件计数器: 优先 cpu_core/<event>(主导核); ctx/migration 是进程级无前缀, 回退裸匹配。
+getv(){ awk -v pat="$1" '$0 ~ "cpu_core/" pat && $1 ~ /^[0-9]/ {gsub(/,/,"",$1); print $1; exit}' /tmp/trader_perf_stat_read.txt; }
+getp(){ awk -v pat="$1" '$0 ~ pat && $1 ~ /^[0-9]/ {gsub(/,/,"",$1); print $1; exit}' /tmp/trader_perf_stat_read.txt; }
+INST=$(getv 'instructions'); CYCLES=$(getv 'cycles')
+CMISS=$(getv 'cache-misses'); CREF=$(getv 'cache-references')
+L1M=$(getv 'L1-dcache-load-misses'); L1L=$(getv 'L1-dcache-loads')
+L2M=$(getv 'L2-load-misses'); LLCM=$(getv 'LLC-load-misses'); LLCL=$(getv 'LLC-loads')
+CTX=$(getp 'context-switches'); MIG=$(getp 'cpu-migrations')
 SEC=$(awk '/seconds time elapsed/{print $1; exit}' /tmp/trader_perf_stat_read.txt)
-[ -n "$INST" ] && [ -n "$CYCLES" ] && [ "$CYCLES" != "0" ] && echo "IPC = $(awk "BEGIN{printf \"%.2f\", $INST/$CYCLES}")"
-[ -n "$CTX" ] && [ -n "$SEC" ] && [ "$SEC" != "0" ] && echo "ctx/s = $(awk "BEGIN{printf \"%.0f\", $CTX/$SEC}")"
+[ -n "$INST" ] && [ -n "$CYCLES" ] && [ "$CYCLES" != "0" ] && echo "IPC            = $(awk "BEGIN{printf \"%.2f\", $INST/$CYCLES}")"
+[ -n "$CMISS" ] && [ -n "$CREF" ] && [ "$CREF" != "0" ] && echo "cache miss率   = $(awk "BEGIN{printf \"%.1f%%\", $CMISS*100/$CREF}")"
+[ -n "$L1M" ] && [ -n "$L1L" ] && [ "$L1L" != "0" ] && echo "L1 miss率      = $(awk "BEGIN{printf \"%.1f%%\", $L1M*100/$L1L}")"
+[ -n "$L2M" ] && [ -n "$LLCL" ] && [ "$LLCL" != "0" ] && echo "L2 miss率       = $(awk "BEGIN{printf \"%.1f%%\", $L2M*100/$LLCL}")"
+[ -n "$LLCM" ] && [ -n "$LLCL" ] && [ "$LLCL" != "0" ] && echo "LLC miss率     = $(awk "BEGIN{printf \"%.1f%%\", $LLCM*100/$LLCL}")"
+[ -n "$CTX" ] && [ -n "$SEC" ] && [ "$SEC" != "0" ] && echo "ctx/s          = $(awk "BEGIN{printf \"%.0f\", $CTX/$SEC}")"
+[ -n "$MIG" ] && [ -n "$SEC" ] && [ "$SEC" != "0" ] && echo "cpu迁移/s      = $(awk "BEGIN{printf \"%.0f\", $MIG/$SEC}")"
 echo ""
 echo "=== CPU 热点 Top 15(裁剪窗口内) ==="
 perf report -i "$PERF_DATA" --time "$TIME_RANGE" --stdio --no-header > /tmp/trader_perf_report.txt 2>/dev/null

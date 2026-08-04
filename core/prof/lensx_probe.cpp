@@ -20,6 +20,16 @@ LENSX_NOINLINE void mark_alloc(uint64_t key) {
 LENSX_NOINLINE void mark_pop(uint64_t key) {
     if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
 }
+// 级别2 细化: alloc→pop 拆 4 段(key = 消息 seq, 抽样, 与 alloc/pop 相同 kSample)
+LENSX_NOINLINE void mark_push_ring(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
+LENSX_NOINLINE void mark_parse_done(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
+LENSX_NOINLINE void mark_push_spmc(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
 
 // 级别3 仲裁函数完整执行耗时(seq 模式, 无 key)
 // 抽样判断在调用点(main.cpp arbitrate 内, 抽中才调本函数), 函数体只需 noinline 防优化。

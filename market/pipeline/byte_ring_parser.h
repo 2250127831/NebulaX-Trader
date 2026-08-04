@@ -53,6 +53,9 @@ public:
         parser_.set_sink([this](const MarketEvent& ev) {
             // 背压: push 满(尝试清理后仍满)返回 false, 使用者重试直到成功(不丢消息)。
             while (!channel_.push(ev)) _mm_pause();
+            // [LensX 级别2细化] SPMC push 成功(parse_th, parse_done→push_spmc 段终点)。
+            // key=消息 seq(ev.seq_id), 与 alloc/pop 侧抽样一致配对。
+            if (ev.seq_id % lensx::kSample == 0) lensx::mark_push_spmc(ev.seq_id);
         });
     }
     ~ByteRingParser() {

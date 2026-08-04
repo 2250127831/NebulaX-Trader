@@ -74,6 +74,8 @@ public:
                 // push 返回 0 = 空间不足(含空洞跨越后仍不足), 忙等消费者释放。
                 while (ring_.push(msg_buf, msg_len + 8) == 0)   // [seq 8][len 2][体]
                     __builtin_ia32_pause();
+                // [LensX 级别2细化] 字节 ring push 成功(recv_th 内, alloc→push_ring 段终点)。
+                if (msg_seq % lensx::kSample == 0) lensx::mark_push_ring(msg_seq);
 
                 pos += msg_len;
                 ++unpacked;

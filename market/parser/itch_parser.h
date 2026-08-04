@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/market_event.h"
+#include "core/prof/lensx_probe.h"
 #include "core/types.h"
 
 #include <cstdint>
@@ -62,6 +63,9 @@ private:
     void emit(const MarketEvent& ev) {
         MarketEvent e = ev;
         e.seq_id = cur_seq_;  // 填入当前消息的序号
+        // [LensX 级别2细化] 解析完成(parse_th, push_ring→parse_done 段终点)。
+        // key=消息 seq(ev.seq_id 即 cur_seq_), 与 alloc/pop 侧抽样一致配对。
+        if (e.seq_id % lensx::kSample == 0) lensx::mark_parse_done(e.seq_id);
         if (sink_) sink_(e);
     }
 

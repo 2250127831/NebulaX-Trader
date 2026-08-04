@@ -2,7 +2,7 @@
 
 > 日期：2026-08-04 · 分支：V1 · 工具：perf（CPU 热点）+ LensX（eBPF 延迟）+ 压测（吞吐/丢包）
 >
-> 一句话结论：**V1 吞吐受订单簿消费能力限制（~5.5M msg/s，方案A单通道），延迟热点在订单簿计算与解析路径，V2 主攻订单簿缓存友好化与延迟优化。**
+> 一句话结论：**V1 吞吐受订单簿消费能力限制（~5.5M msg/s，方案A单通道）；延迟大头是 book_th 跨线程排队（成交等前面委托处理完，P50 96µs / P90 12ms），各段计算路径（拆包/解析/OFI/OBI/下单）全部 ≤6µs。V2 主攻订单簿缓存友好化（吞吐+排队同源）。**
 
 ---
 
@@ -44,7 +44,8 @@ parse_th   ByteRingParser 解析 ITCH → MarketEvent → 单通道 SPMC 广播
 
 **统一仲裁（arbitrate 函数）**：非独立线程——各策略写信号后调用。读三信号槽,同向才下单:TD 有方向要求三同向,TD 无方向(NONE)退化为 OFI/OBI 两信号。无定时器、无轮询,信号一更新同步仲裁。方向翻转才下单(信号稳定不重复加仓)。
 
-**消费者阻塞机制（当前实现）**：`SPMCEventQueue` 内建 eventfd 唤醒（`notify_all()` + `wait_for_data()`），push 空→非空才 notify。消费者**混合退避**——有数据连续排空保吞吐，短暂空 `_mm_pause` 自旋顶住唤醒延迟，持续空才 `wait_for_data` 阻塞省 CPU。parse_th/book_th/strategy_th 都用此机制：高负载零丢、idle 0% CPU。
+**消费者阻塞机制（当前实现）**：`SPMCEventQueue` **每消费者独立 eventfd**——`notify_all()` 广播写所有消费者的 fd,每个都醒(无竞争);`wait_for_data(consumer_id)` poll 自己的 fd,无限阻塞(无超时)。push 空→非空才广播。消费者**混合退避**——有数据连续排空保吞吐,短暂空 `_mm_pause` 自旋,持续空才阻塞。parse_th/book_th/strategy_th 都用此机制。
+> **教训(广播唤醒)**:多消费者曾共享单 eventfd,notify 计数被一个消费者消费后其他漏唤醒 → 靠 200ms 超时兜底 → **push→sig 延迟 101ms**。改每消费者独立 fd + 广播后 → **2.5µs**。唤醒必须广播,不能有毫秒级超时计时器。
 
 **通道满背压（当前实现）**：`SPMCEventQueue` 满时**先尝试清理一次**（重读 `min_consumed()`，看消费者是否已推进腾出已消费区），仍满返回 false；调用方（sink）收到 false 自旋重试直到成功。队列满绝不静默丢——满 → 尝试清理 → 重试，消息可靠，压力传导回上游（parse_th→recv_th→UDP）。
 
@@ -185,33 +186,41 @@ execution:
 
 ## 5. 延迟分析（LensX）
 
-探针（`core/prof/lensx_probe.h`，noinline 空函数作 uprobe 挂载点）。当前架构路径（去低频策略后），用 **key 配对**（`key: arg1` = 消息 seq，跨线程按 seq 归组），配置在 `docs/bench/trader_lensx.yaml`。
+探针（`core/prof/lensx_probe.h`，noinline 空函数作 uprobe 挂载点）。**key 配对**（`key: arg1` = 消息 seq，跨线程靠 `MarketEvent.seq_id` 贯穿：unpacker 分配 64 位 seq → 字节 ring → parser → 各线程探针统一取 `ev.seq_id`）。2026-08-04 探针重建为四级链路测量（配置 `docs/bench/trader_lensx.yaml`）。
 
-**每段路径的意义**：
-| 路径 | 起点→终点 | 线程 | 语义 |
-|---|---|---|---|
-| 收包→入ring | mark_recv → mark_s0 | recv_th | 网络→拆包进队列（成交） |
-| 成交→仲裁评估 | mark_s2 → mark_sig | book_th | 成交→OFI/OBI 信号评估 |
-| 仲裁→send | mark_s5 → mark_s6 | book_th | 仲裁下单→订单发出 |
-| 端到端 | mark_recv→s2→s5→s6 | 跨线程 | 收包→成交→仲裁→下单→send |
+**四级探针（从收包到下单的完整链路）**：
 
-**测量说明**：LensX uprobe 单次采样开销小（几十 ns，均匀偏移），每段延迟可靠。但探针多会拖慢高频线程（book_th）→ 排队污染尾部。故分批测：book_th 上探针受控，避免拖垮。
+| 级别 | 路径 | 线程 | 模式 | 语义 |
+|---|---|---|---|---|
+| 1 包级 | recv_pkt → unpack | recv_th | seq | 包到达→拆包（内核→用户态 + SQE） |
+| 2 消息级 | alloc → push_ring → parse_done → push_spmc → pop | 跨线程 | key(抽样) | **一条消息从分配到被消费，拆 4 段** |
+| 3 仲裁 | arb_start → arb_end | book_th | seq(抽样) | 仲裁函数完整执行 |
+| 4 下单 | order_start → order_end | book_th | key(抽样) | 下单决策→执行完毕(send/被拒) |
 
-延迟分布（`--rate 10000` 零丢档）：
+**抽样 1/128**（`msg_seq % 128 == 0`）：全采样实测拖垮吞吐（5M→543K，9x）。**抽样判断必须在调用点**（uprobe 挂函数入口，只要函数被调用就命中，函数内抽样无效）。抽中同一批消息（seq 一致），key 配对完整。
 
-| 路径 | n | p50 | p90 | p99 | max |
+延迟分布（`--rate 10000` 零丢档，最终测量）：
+
+| 段 | n | P50 | P90 | P99 | 语义 |
 |---|---|---|---|---|---|
-| **收包→入ring** | 44,971 | 1.9µs | 2.4µs | 7.9µs | 16.9µs |
-| **成交→仲裁评估** | 44,987 | 2.1µs | 2.6µs | 3.4µs | 13.4µs |
-| **仲裁→send** | 5,828 | 5.1µs | 7.1µs | 11.0µs | 151µs |
-| **端到端** | 25 | 17.1µs | 27.6µs | 289µs | 289µs |
+| 包级 recv→unpack | 346K | 1µs | 3µs | 3µs | recv_th 内部 |
+| alloc→push_ring | 134K | 1µs | 1µs | 3µs | 构造+入字节 ring(recv_th) |
+| **push_ring→parse** | 132K | **192ns** | 3µs | 12µs | **SPSC 跨线程(recv→parse), 近零** |
+| parse→push_spmc | 132K | 1µs | 3µs | 3µs | 解析→入 SPMC(parse_th) |
+| **push_spmc→pop** | 132K | **24µs** | **6ms** | 12ms | **SPMC 排队(parse→book), 长尾全在这** |
+| **alloc→pop(总)** | 66K | 24µs | 196µs | 786µs | 一条消息从分配到被消费 |
+| 仲裁 arb→end | 133K | 1µs | 3µs | 3µs | 仲裁完整执行, 非瓶颈 |
+| 下单 order→end | 11 | 6µs | 6µs | 6µs | 下单决策→send, 快 |
 
-**端到端**（key 配对实测）：mark_recv→mark_s2→mark_s5→mark_s6（收包→入ring→成交→仲裁→下单→send），样本 = 走通全链路的成交（~25，与下单触发数一致）。
+> 注：`push_ring_to_parse`/`push_spmc_to_pop` 有 ~0.9% 的 `211106s` 异常值（key 模式跨线程 ts 序差导致，98%+ 样本分布可信）。测量中曾有一次 trader 段错误（偶发，未复现，待查）。
 
 ### 延迟瓶颈结论
-1. **各段计算路径 1.9-5.1µs 级，无单段瓶颈**：收包→入ring 和 成交→仲裁 都极快（~2µs），仲裁→send 5.1µs（含下单编码）。
-2. **端到端 p50 17.1µs / p99 289µs**：主要来自**跨线程 handoff**（recv_th→parse_th→单通道→book_th 的唤醒/调度）累积。p99 289µs 重尾是高频调度抖动。
-3. **仲裁→send 5.1µs**：OFI/OBI 仲裁 + 下单编码 + send，同步执行。
+1. **各段计算路径全部 ≤6µs，无单段计算瓶颈**：拆包 1µs、解析 1µs、仲裁 1µs、下单 6µs——计算全程极快。
+2. **端到端延迟大头 = push_spmc→pop（P50 24µs / P90 6ms）= SPMC 排队**：alloc→pop 拆 4 段后，前 3 段（含 SPSC 跨线程）全部干净（≤1µs），**唯一热点是 SPMC→book_th 排队**。book_th 处理全部事件（委托占 ~97%），消费慢 → SPMC 积压。
+3. **SPSC vs SPMC 跨线程对比**：SPSC 字节 ring 跨线程 P50 192ns（近零）vs SPMC 排队 P50 24µs / P90 6ms——**相差两个数量级**。SPSC 单消费者（parse_th 快），永不积压；SPMC 多消费者共享，**被最慢消费者（book_th）拖累**。这是 SPMC 多消费者广播的固有代价，非队列实现问题。
+4. **长尾根源 = book_th 消费速度（吞吐瓶颈）**：队列满 → 等最慢消费者 → 长尾。与吞吐瓶颈同源（book_th 临界 ~5.5M，压测 5M 接近临界）。
+5. **SPMC 优化（2026-08-04）已生效**：lazy progress + cache padding + batch reclaim + **cached min_head**（满时才扫描）。实测 alloc→pop 长尾下降：P90 1ms→393µs→196µs，P99 3ms→786µs。cached min_head 消除每次 push 的 O(consumers) 原子遍历，减少"假满"。
+6. **根治 = V2 book_th 加速**：订单簿缓存友好化 → book_th 消费速率远超生产 → SPMC 不积压 → 长尾消失。这是吞吐与延迟的同源解。
 
 ## 6. V2 优化方向
 
@@ -223,10 +232,11 @@ execution:
 - **验证**：扫档后临界应显著 >5.5M msg/s。
 
 ### 6.2 延迟：进一步压低端到端（次要，吞吐优先）
-- **现状**：端到端 p50 17.1µs / p99 289µs，主要来自跨线程 handoff（recv→parse→单通道→book 唤醒/调度）累积。
-- **决策（2026-08-04）**：**吞吐优先，多解析器为主**（见 6.3）。合并 recv_th+parse_th 会牺牲多解析器扩展，仅作为单策略/极致延迟的**远期参考**，不作为 V2 主方向。
+- **现状（2026-08-04 最终测量）**：alloc→pop 拆 4 段后，**唯一热点 = push_spmc→pop（P50 24µs / P90 6ms）= SPMC 排队**，与吞吐瓶颈（book_th 消费能力）同源——**吞吐与延迟的瓶颈同根**。SPMC 优化（cached min_head 等）已把长尾从 P90 1ms 压到 196µs，但排队本质仍在。
+- **决策（2026-08-04）**：**吞吐优先，订单簿缓存友好化（6.1）+ 多解析器（6.3）为主**。book_th 加速 → SPMC 不积压 → 排队消失，延迟与信号同步同时受益。
+- **信号不同步（见 5 节结论）**：book_th 积压期间 strategy_th 基于过时 OFI/OBI 快照下单。V1 单通道固有代价；V2 若保持单通道需 book_th 追平消费，若改分簿/双通道需保证订单簿时序。
 - **可做**：更快唤醒（shared futex / 直接 spin 检查 ring），不牺牲并行度。
-- **验证**：LensX 重测端到端，目标 p50 <10µs（若走远期合并方案）。
+- **验证**：LensX 重测，目标 push_spmc→pop p50 <10µs、alloc→pop p50 <10µs。
 
 ### 6.3 吞吐：多解析器并行（主方向）
 - **现状**：单 parse_th，解析路径占 ~19% CPU；recv_th 与 parse_th 分离。
@@ -248,8 +258,9 @@ sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0 kernel.unpriv
 perf record -F 4000 -e cpu-clock --call-graph dwarf -p <trader_pid> &
 # 等压测完，停 perf，perf report
 
-# LensX 延迟
-/tmp/lensx_measure.sh 2000   # 起 trader + LensX + 压测 + 报告
+# LensX 延迟(四级链路: 包级 + alloc→pop 四段 + 仲裁 + 下单)
+# 需 sudo(密码用 SUDO_PASS 环境变量传入), LensX 在 ~/LensX/build/lensx
+SUDO_PASS=<密码> ./scripts/measure_lensx.sh 10000
 
 # 压测 + 事后丢包检测
 ./scripts/pressure_test.sh --rate 10000   # 标准零丢档(~5M msg/s, 方案A)

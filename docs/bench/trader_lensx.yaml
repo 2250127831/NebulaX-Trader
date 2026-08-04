@@ -32,36 +32,51 @@ probes:
     type: uprobe
     symbol: lensx::mark_unpack
     stage: 1
-  # 级别2 消息级(key = 消息 seq)
+  # 级别2 消息级(key = 消息 seq, 抽样): alloc→pop 拆 4 段
   - name: alloc
     type: uprobe
     symbol: lensx::mark_alloc
     stage: 2
     key: arg1
+  - name: push_ring
+    type: uprobe
+    symbol: lensx::mark_push_ring
+    stage: 3
+    key: arg1
+  - name: parse_done
+    type: uprobe
+    symbol: lensx::mark_parse_done
+    stage: 4
+    key: arg1
+  - name: push_spmc
+    type: uprobe
+    symbol: lensx::mark_push_spmc
+    stage: 5
+    key: arg1
   - name: pop
     type: uprobe
     symbol: lensx::mark_pop
-    stage: 3
+    stage: 6
     key: arg1
   # 级别3 仲裁(seq 模式, 无 key)
   - name: arb_start
     type: uprobe
     symbol: lensx::mark_arb_start
-    stage: 4
+    stage: 7
   - name: arb_end
     type: uprobe
     symbol: lensx::mark_arb_end
-    stage: 5
+    stage: 8
   # 级别4 下单决策→执行完毕(key 模式, key = sig_ofi.seq)
   - name: order_start
     type: uprobe
     symbol: lensx::mark_order_start
-    stage: 6
+    stage: 9
     key: arg1
   - name: order_end
     type: uprobe
     symbol: lensx::mark_order_end
-    stage: 7
+    stage: 10
     key: arg1
 
 matchers:
@@ -69,29 +84,53 @@ matchers:
   - id: recv_to_unpack
     stages: [0, 1]
     mode: seq
-  # 级别2: 消息级完整链路 分配→pop(跨线程 key 配对)
-  - id: alloc_to_pop
+  # 级别2 细化: alloc→pop 拆 4 段(跨线程 key 配对, 每段成对无残留)
+  - id: alloc_to_push_ring
     stages: [2, 3]
+    mode: key
+  - id: push_ring_to_parse
+    stages: [3, 4]
+    mode: key
+  - id: parse_to_push_spmc
+    stages: [4, 5]
+    mode: key
+  - id: push_spmc_to_pop
+    stages: [5, 6]
+    mode: key
+  - id: alloc_to_pop
+    stages: [2, 3, 4, 5, 6]
     mode: key
   # 级别3: 仲裁函数完整执行(同线程 seq 配对)
   - id: arb_to_end
-    stages: [4, 5]
+    stages: [7, 8]
     mode: seq
   # 级别4: 下单决策→执行完毕(同线程 key 配对, send/被拒都是终点)
   - id: order_to_end
-    stages: [6, 7]
+    stages: [9, 10]
     mode: key
 
 reports:
   - name: recv_to_unpack
     from: 0
     to: 1
-  - name: alloc_to_pop
+  - name: alloc_to_push_ring
     from: 2
     to: 3
-  - name: arb_to_end
+  - name: push_ring_to_parse
+    from: 3
+    to: 4
+  - name: parse_to_push_spmc
     from: 4
     to: 5
+  - name: push_spmc_to_pop
+    from: 5
+    to: 6
+  - name: alloc_to_pop
+    from: 2
+    to: 6
+  - name: arb_to_end
+    from: 7
+    to: 8
   - name: order_to_end
-    from: 6
-    to: 7
+    from: 9
+    to: 10

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <ctime>
 
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -33,6 +34,7 @@ struct Config {
     uint64_t max_backlog = 10000;
     size_t pack_max  = 100;  // 每包消息条数上限（实际每包 1~pack_max 条随机）
     uint64_t rate_01s = 0;   // 每 0.1 秒发送包数(窗口限速，0 = 全速)
+    int core          = 3;   // 发送线程绑核(选低中断 P 核, 避开 P0/偶数核噪声)
     bool no_shm = false;     // 不挂共享内存(压测脚本模式，与 trader 无握手)
     bool help    = false;
 };
@@ -48,6 +50,7 @@ static Config parse_args(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--backlog") == 0 && i+1 < argc) cfg.max_backlog = atol(argv[++i]);
         else if (strcmp(argv[i], "--pack-max") == 0 && i+1 < argc) cfg.pack_max = atol(argv[++i]);
         else if (strcmp(argv[i], "--rate") == 0 && i+1 < argc) cfg.rate_01s = atol(argv[++i]);
+        else if (strcmp(argv[i], "--core") == 0 && i+1 < argc) cfg.core = atoi(argv[++i]);
         else if (strcmp(argv[i], "--no-shm") == 0) cfg.no_shm = true;
         else cfg.help = true;
     }
@@ -63,9 +66,10 @@ static void usage() {
            "  --backlog <n>      Max backlog before slowing down (default: 10000)\n"
            "  --pack-max <n>     Max messages per UDP packet (default: 100)\n"
            "                     实际每包 1~pack-max 条随机，模拟真实行情打包\n"
-           "  --rate <n>         Per-0.1s packets sent (window throttle, 0=full speed)\n"
+           "  --rate <n>         Per-0.1s packets sent (smooth throttle, 0=full speed)\n"
+           "  --core <n>         Pin main thread to CPU n (default: 3, 低中断 P 核)\n"
            "  --no-shm           No shared-memory handshake (pressure script mode).\n"
-           "                     Window-throttle by --rate, no recv feedback.\n");
+           "                     Throttle by --rate, no recv feedback.\n");
 }
 
 // ── 模拟交易所线程 ──
@@ -122,6 +126,14 @@ static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
 int main(int argc, char* argv[]) {
     auto cfg = parse_args(argc, argv);
     if (cfg.help) { usage(); return 0; }
+
+    // ── 绑核：压测客户端绑定低中断独立核(默认 CPU3), 避免与 trader 抢核(学撮合引擎) ──
+    // 选核依据: 该机奇数核中断低(0.3-1M), 偶数核高(3-4M), CPU0(P0)高达4.3M噪声大。
+    // 压测客户端独占一核, 发送计时稳定, 不干扰 trader 各线程。
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cfg.core, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
     // ── mmap 文件（小样本 / 完整日数据通吃）──
     int fd = open(cfg.file, O_RDONLY);
@@ -191,10 +203,8 @@ int main(int argc, char* argv[]) {
     uint64_t global_msg_seq = 0;   // 全局消息序号：每发一条消息 +1
     auto t_start = std::chrono::steady_clock::now();
 
-    // 窗口限速状态: 每 0.1 秒窗口发 rate_01s 包, 达到后 sleep 到窗口结束。
-    auto window_start = std::chrono::steady_clock::now();
-    uint64_t window_pkts = 0;
-    constexpr auto kWINDOW = std::chrono::milliseconds(100);   // 0.1 秒窗口
+    // 平滑限速: 每包 sleep 到目标节奏(匀速发, 瞬时≈平均)。
+    auto next_pkt_time = std::chrono::steady_clock::now();
 
     // 包缓冲：20 字节头 + 消息们
     std::vector<uint8_t> pkt;
@@ -252,15 +262,15 @@ int main(int argc, char* argv[]) {
                     std::this_thread::yield();
                 }
             } else if (cfg.rate_01s > 0) {
-                // 窗口限速: 每 0.1 秒发 rate_01s 包, 超了就等窗口滚到下一格。
-                ++window_pkts;
-                if (window_pkts >= cfg.rate_01s) {
-                    auto el = std::chrono::steady_clock::now() - window_start;
-                    if (el < kWINDOW)
-                        std::this_thread::sleep_for(kWINDOW - el);
-                    window_start = std::chrono::steady_clock::now();
-                    window_pkts = 0;
-                }
+                // 平滑限速: 按平均速率匀速发(而非窗口 burst)。
+                // 每 0.1s 目标 rate_01s 包 → 每包间隔 = 0.1s/rate_01s。
+                // 用 steady_clock 跟踪下一包应发时刻, 未到就 sleep 到点。
+                // 与旧窗口限速(攒满 rate_01s 包瞬间发)不同: 平滑限速的瞬时
+                // 速率≈平均速率, 不会瞬间灌满内核缓冲而溢出丢包, 能测真实临界。
+                auto now = std::chrono::steady_clock::now();
+                if (next_pkt_time > now)
+                    std::this_thread::sleep_for(next_pkt_time - now);
+                next_pkt_time += std::chrono::microseconds(100000 / cfg.rate_01s);
             }
 
             ssize_t r = sendto(sock, pkt.data(), pkt.size(), 0,

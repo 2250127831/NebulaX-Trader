@@ -18,6 +18,11 @@ bool IoUringReceiver::start()
     fd_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd_ < 0) return false;
 
+    // 增大内核 UDP 接收缓冲, 吞下突发(默认 ~208KB, 全速/限速窗口突发易溢出丢包)。
+    // 内核实际会翻倍到 rmem_max, 这里设 4MB 目标。
+    int rcvbuf = 4 * 1024 * 1024;
+    setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;

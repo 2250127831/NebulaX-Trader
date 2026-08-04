@@ -43,6 +43,8 @@ add_library(core
     core/memory/memory_pool.h
     core/memory/order_pool.h
     core/memory/order_map.h
+    core/prof/lensx_probe.h
+    core/prof/lensx_probe.cpp
     core/utils/align.h
     core/net/i_market_data_receiver.h
     core/net/i_market_data_sender.h
@@ -54,7 +56,7 @@ add_library(core
     core/ipc/flow_control.h
 )
 
-target_include_directories(core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(core PUBLIC yaml-cpp ${URING_LIBS})
 target_include_directories(core PUBLIC ${LIBURING_INCLUDE_DIRS})
 

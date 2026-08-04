@@ -25,6 +25,17 @@
 // 为什么不关心就跳过：消费者读到事件但不处理（推进进度即弃），
 //   生产者仍能覆盖该槽位，因为该消费者的进度已推进。
 //
+// ── 高性能优化（对齐 SPMC Ring 设计文档）──
+// 1. Lazy Progress Update：消费者 pop 本地攒 kLazyBatch 个才 publish 一次
+//    heads_[consumer_id]，降低高频 atomic 写 + cache line bouncing。
+//    正确性：flush 在 pending==0 时由消费者补发（无数据时补齐进度，生产者
+//    看到真实进度）；batch 边界最多滞后 kLazyBatch 条，容量大时可接受。
+//    新增 progress_flush(id)：消费者在空循环处调用，补发本地进度。
+// 2. Cache Line Padding：heads_[MAX_CONSUMERS] 每个消费者 alignas(64) 独占
+//    一行，消除多消费者 false sharing。
+// 3. Batch Reclaim：push 满时重读 min_consumed() 批量回收已消费区（一次
+//    重读多个消费者进度），减少自旋重试次数。
+//
 // capacity 必须是 2 的幂（构造时校验）；MAX_CONSUMERS 是最大消费者数（编译期）。
 // 存储空间由用户传入（堆分配 / 共享内存），队列不拥有。
 //
@@ -32,80 +43,116 @@
 //   MarketEvent* slots = new MarketEvent[1 << 16];
 //   SPMCEventQueue<16> q(slots, 1 << 16);
 //   q.set_num_consumers(3);
+//   消费者循环：while (q.pop(id, ev)) { ... } q.progress_flush(id); // 空时补发
 template <size_t MAX_CONSUMERS = 16>
 class SPMCEventQueue {
     static_assert(MAX_CONSUMERS > 0, "need at least 1 consumer");
 
 public:
+    // 消费者本地攒批阈值：攒够 kLazyBatch 个才 publish 一次进度。
+    static constexpr size_t kLazyBatch = 64;
+
     // 用户传入槽位数组 + 容量。capacity 必须 2 的幂（不满足返回 false，需检查 valid()）。
     SPMCEventQueue(MarketEvent* slots, size_t capacity)
         : slots_(slots), capacity_(capacity), valid_((capacity & (capacity - 1)) == 0) {
-        wake_fd_ = eventfd(0, EFD_NONBLOCK);   // 学撮合引擎: 生产写1唤醒, 消费poll阻塞
-        if (wake_fd_ < 0) wake_fd_ = -1;
+        // 每个消费者独立 eventfd + 阻塞掩码(blocked-mask): 消费者阻塞前登记位,
+        // push 只写阻塞者的 fd。每消费者 poll 自己的 fd, 谁都不漏唤醒。
+        for (size_t i = 0; i < MAX_CONSUMERS; ++i) {
+            wake_fds_[i] = eventfd(0, EFD_NONBLOCK);
+            if (wake_fds_[i] < 0) wake_fds_[i] = -1;
+        }
     }
 
     ~SPMCEventQueue() {
-        if (wake_fd_ >= 0) close(wake_fd_);
+        for (size_t i = 0; i < MAX_CONSUMERS; ++i)
+            if (wake_fds_[i] >= 0) close(wake_fds_[i]);
     }
 
     // 默认构造：不绑定空间，需先 valid() 检查
-    SPMCEventQueue() = default;
+    SPMCEventQueue() {
+        for (size_t i = 0; i < MAX_CONSUMERS; ++i) wake_fds_[i] = -1;
+    }
     SPMCEventQueue(const SPMCEventQueue&) = delete;
     SPMCEventQueue& operator=(const SPMCEventQueue&) = delete;
 
     bool valid() const { return valid_ && slots_ != nullptr; }
     size_t capacity() const { return capacity_; }
 
-    // 生产者：写入一个事件。满时**尝试清理一次**, 仍满才返回 false。
+    // 生产者：写入一个事件。满时**批量回收一次**, 仍满才返回 false。
     // 元素槽队列: "清理已消费" = tail 覆盖 seq < min_head 的槽位(顺序写, 隐式回收)。
-    //   满 = 无已消费区可覆盖 → 尝试清理(一次检查) → 仍满返回 false(调用方决定)。
-    // 平时快速检查 free(不遍历); 仅 free==0(满)才尝试清理(找已消费区可覆盖)。
-    // 满 → 尝试清理一次(检查是否有已消费区) → 有则写入 / 仍满返回 false(调用方重试)。
+    //   满 = 无已消费区可覆盖 → 批量回收(重读 min_head) → 仍满返回 false(调用方决定)。
+    // 平时快速检查 free(不遍历); 仅 free==0(满)才批量回收(找已消费区可覆盖)。
+    // 唤醒: 每次成功 push 后查 blocked 掩码——有消费者阻塞(在 poll)才写其 fd(广播),
+    //   无阻塞零 syscall。**不按"空→非空"门控**: 一个消费者阻塞(pending==0)时,
+    //   其它消费者可能还落后, 队列未必全局空; 空转换门控会漏唤醒 → 无限阻塞的消费者饿死。
     bool push(const MarketEvent& ev) {
         const size_t tail = tail_.load(std::memory_order_relaxed);
-        // 快路径: 检查 free(最慢消费者进度)。空→非空才 notify, 避免每 push syscall。
+        // 快路径: 检查 free(最慢消费者进度)。
         size_t min_head = min_consumed();   // 最慢消费者已消费到哪
         if (tail - min_head < capacity_) {   // 有空间(fast path)
-            bool was_empty = (tail == min_head);
             slots_[tail & (capacity_ - 1)] = ev;
             tail_.store(tail + 1, std::memory_order_release);
-            if (was_empty) notify_all();   // 学撮合引擎: 生产写1唤醒阻塞消费者
+            notify_all();   // 有阻塞消费者才写其 fd(广播), 无则零 syscall
             return true;
         }
-        // 满(free==0): 尝试清理一次——重读 min_head(消费者可能刚推进)。
-        // 清理 = 已消费区(seq < min_head)可覆盖复用。仍满返回 false。
+        // 满(free==0): 批量回收——重读 min_head(消费者可能刚推进)。
+        // 批量 = 一次重读所有消费者进度(非逐条), 已消费区一次性标记可覆盖。
         min_head = min_consumed();
         if (tail - min_head < capacity_) {
             slots_[tail & (capacity_ - 1)] = ev;
             tail_.store(tail + 1, std::memory_order_release);
+            notify_all();
             return true;
         }
-        return false;   // 尝试清理后仍满, 调用方决定重试/失败策略
+        return false;   // 批量回收后仍满, 调用方决定重试/失败策略
     }
 
     // 消费者：读取一个事件。读到即推进该消费者进度（可跳过不处理）。
+    // Lazy Progress：本地攒 kLazyBatch 个才 publish 一次 heads_。
     // 队列空（该消费者已追上生产者）返回 false。
     bool pop(size_t consumer_id, MarketEvent& ev) {
         const size_t tail = tail_.load(std::memory_order_acquire);
-        const size_t head = heads_[consumer_id].load(std::memory_order_relaxed);
-        if (tail == head) return false;  // 该消费者已消费完
+        LocalState& ls = locals_[consumer_id];
+        const size_t head = ls.head.load(std::memory_order_relaxed);
+        if (tail == head) {
+            progress_flush(consumer_id);   // 追平生产者, 补发本地进度(见 flush)
+            return false;
+        }
 
         ev = slots_[head & (capacity_ - 1)];
-        heads_[consumer_id].store(head + 1, std::memory_order_release);
+        size_t new_head = head + 1;
+        ls.head.store(new_head, std::memory_order_relaxed);   // 本地推进(低开销)
+        // 攒够批量 或 追平生产者 → 发布本地进度(避免生产者看到滞后进度误判满)。
+        if (++ls.pending_publish >= kLazyBatch || new_head == tail) {
+            progress_flush(consumer_id);
+        }
         return true;
     }
 
     // 消费者：读到但不处理（跳过）。只推进进度，不返回事件。
-    // 等价于"读到即跳过"，用于消费者不关心的类型。
     void skip(size_t consumer_id) {
         MarketEvent tmp;
         (void)pop(consumer_id, tmp);
     }
 
+    // 消费者：把本地攒的进度发布到全局 heads_。空循环处调用（无数据时补齐进度，
+    // 生产者 min_consumed() 才能看到真实进度, 避免误判满）。
+    void progress_flush(size_t consumer_id) {
+        LocalState& ls = locals_[consumer_id];
+        size_t h = ls.head.load(std::memory_order_relaxed);
+        size_t published = heads_[consumer_id].load(std::memory_order_relaxed);
+        if (h != published) {
+            heads_[consumer_id].store(h, std::memory_order_release);
+        }
+        ls.pending_publish = 0;
+    }
+
     void set_num_consumers(size_t n) { num_consumers_ = n; }
     size_t num_consumers() const { return num_consumers_; }
 
-    // 该消费者尚未消费的事件数
+    // 该消费者尚未消费的事件数。注意 lazy progress 下本地已消费但未发布的部分
+    // 会计入 pending（尾部 - 已发布进度），消费者循环靠 pop 返回 false 判断空，
+    // 不必依赖 pending 的精确值。
     size_t pending(size_t consumer_id) const {
         return tail_.load(std::memory_order_relaxed) -
                heads_[consumer_id].load(std::memory_order_relaxed);
@@ -121,38 +168,68 @@ public:
         return min_head;
     }
 
-    // ── eventfd 唤醒（学撮合引擎 poll + eventfd 方案）──
-    // 消费者 pop 空时 poll(wake_fd) 阻塞，生产者 push 后 notify_all() 唤醒。
-    // eventfd 累积计数：多次 notify 只产生一次唤醒，不丢。写一次全醒（广播）。
+    // ── eventfd 广播唤醒（blocked-mask: 广播必唤醒, 无唤醒竞争）──
+    // 每个消费者独立 eventfd + 原子阻塞掩码:
+    //   消费者阻塞前在 blocked_ 登记自己的位, 才 poll 自己的 fd(无限阻塞)。
+    //   生产者每次 push 后查 blocked_: 有阻塞者才写对应 fd, 无则零 syscall。
+    // 解决两个历史问题:
+    //   1) 共享单 fd: notify 计数被一个消费者消费后其它漏唤醒 → 200ms 超时兜底 → 101ms 延迟
+    //   2) "空→非空"门控 notify(旧): 消费者已阻塞(pending==0)但其它消费者落后时,
+    //      队列未全局空 → 漏唤醒 → 无限阻塞饿死(旧 200ms 超时恰好兜底了这个竞态)
+    // 现在: 登记位 → 重查(注册间隙有数据则不阻塞) → poll; push 见位必写 fd, 广播必唤醒。
 
-    // 生产者：写完数据后唤醒可能阻塞在 poll 的消费者。
+    // 生产者：push 后广播唤醒所有登记为阻塞的消费者(无阻塞零 syscall)。
     void notify_all() {
-        if (wake_fd_ >= 0) {
-            uint64_t one = 1;
-            ssize_t r = write(wake_fd_, &one, sizeof(one)); (void)r;
-        }
+        uint32_t m = blocked_.load(std::memory_order_seq_cst);
+        if (m == 0) return;
+        uint64_t one = 1;
+        for (size_t i = 0; i < num_consumers_; ++i)
+            if ((m & (1u << i)) && wake_fds_[i] >= 0) {
+                ssize_t r = write(wake_fds_[i], &one, sizeof(one)); (void)r;
+            }
     }
 
-    // 消费者：阻塞等数据。poll(wake_fd) 直到被唤醒（或 timeout_ms 超时）。
-    // 返回 true 表示有唤醒（可能有数据），false 表示超时。
-    bool wait_for_data(int timeout_ms = 1000) {
-        if (wake_fd_ < 0) return false;
-        struct pollfd pfd = {wake_fd_, POLLIN, 0};
-        int ret = poll(&pfd, 1, timeout_ms);
-        if (ret > 0) {
-            uint64_t ev;
-            ssize_t r = read(wake_fd_, &ev, sizeof(ev)); (void)r;  // 消费唤醒计数(EFD_NONBLOCK)
+    // 消费者(consumer_id)：阻塞等数据。阻塞前登记 blocked 位, 再 poll 自己的 fd(无限)。
+    // 登记后重查 pending: 注册间隙已有数据 → 不阻塞直接返回(生产者对空 fd 的写无害)。
+    // 唤醒保证(seq_cst 全序 + 重查, 两种交错都不饿死):
+    //   - 生产者查 blocked_ 在登记之后 → 看到位 → 写 fd → poll 返回
+    //   - 生产者查 blocked_ 在登记之前(没写) → 登记发生在 push 之后,
+    //     重查在登记之后(happens-before 链)必然看到该 push 的数据 → 也不阻塞
+    // 若 fd 无效退化为忙等返回 false。
+    bool wait_for_data(size_t consumer_id) {
+        if (consumer_id >= MAX_CONSUMERS || wake_fds_[consumer_id] < 0) return false;
+        const uint32_t bit = 1u << consumer_id;
+        blocked_.fetch_or(bit, std::memory_order_seq_cst);   // 登记阻塞(先于重查)
+        if (pending(consumer_id) > 0) {   // 登记间隙有数据 → 不阻塞, 直接处理
+            blocked_.fetch_and(~bit, std::memory_order_seq_cst);
             return true;
         }
-        return false;  // 超时或错误
+        struct pollfd pfd = {wake_fds_[consumer_id], POLLIN, 0};
+        int ret = poll(&pfd, 1, -1);   // 无限阻塞: 有阻塞消费者被 push 写 fd 才醒
+        blocked_.fetch_and(~bit, std::memory_order_seq_cst);   // 醒来后注销
+        if (ret > 0) {
+            uint64_t ev;
+            ssize_t r = read(wake_fds_[consumer_id], &ev, sizeof(ev)); (void)r;  // 消费计数
+            return true;
+        }
+        return false;
     }
 
 private:
+    // 消费者本地状态: head 是本地消费游标(未发布), pending_publish 是攒批计数。
+    // alignas(64) 独占 cache line, 与全局 heads_ 隔离, 消除 false sharing。
+    struct alignas(64) LocalState {
+        std::atomic<size_t> head{0};        // 本地消费进度(未发布到 heads_)
+        size_t pending_publish = 0;         // 本地已消费但未发布的计数(仅本线程读写)
+    };
+
     alignas(64) std::atomic<size_t> tail_{0};
-    alignas(64) std::atomic<size_t> heads_[MAX_CONSUMERS]{};
+    alignas(64) std::atomic<size_t> heads_[MAX_CONSUMERS]{};  // 全局发布进度(消费者 flush)
+    LocalState locals_[MAX_CONSUMERS];      // 本地攒批(每消费者独立 cache line)
     size_t num_consumers_ = 1;
     MarketEvent* slots_ = nullptr;   // 用户传入的槽位数组（队列不拥有）
     size_t capacity_ = 0;            // 容量（运行时）
     bool   valid_ = false;           // 空间是否合法（2 的幂 + 已绑定）
-    int    wake_fd_ = -1;            // eventfd 唤醒（学撮合引擎 poll+eventfd）
+    int    wake_fds_[MAX_CONSUMERS]; // 每消费者独立 eventfd(广播唤醒, 避免唤醒竞争)
+    std::atomic<uint32_t> blocked_{0};  // 阻塞消费者掩码(bit=消费者id): push 只写阻塞者的 fd
 };

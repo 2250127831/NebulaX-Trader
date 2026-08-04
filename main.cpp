@@ -128,11 +128,13 @@ int main(int argc, char* argv[]) {
     TradeDirectionStrategy tds;   // 独立高频策略(消费成交, 不依赖订单簿)
 
     // ── 信号槽: 各策略线程写, arbitrate() 读(跨线程原子) ──
-    // 每个信号拆成 side/locate/strength 原子, 避免整 Signal 非原子的竞争。
+    // 每个信号拆成 side/locate/strength/seq 原子, 避免整 Signal 非原子的竞争。
+    // seq: 触发信号更新的成交 seq(unpacker 分配的唯一 seq), arbitrate 用它做 key 配对。
     struct SignalSlot {
         alignas(64) std::atomic<OrderSide> side{OrderSide::NONE};
         alignas(64) std::atomic<uint64_t> locate{0};
         alignas(64) std::atomic<int64_t> strength{0};
+        alignas(64) std::atomic<uint64_t> seq{0};   // 成交 seq(贯穿线索)
     } sig_ofi, sig_obi, sig_td;   // OFI/OBI(book_th 写) + TD(strategy_th 写)
 
     // ── 交易侧：风控 + OMS + 执行引擎 ──
@@ -155,7 +157,14 @@ int main(int argc, char* argv[]) {
     // 无定时器无独立线程——信号一更新同步仲裁, TD 后写也能触发。
     std::atomic<OrderSide> last_order_side{OrderSide::NONE};
     std::atomic<int64_t> last_order_str{-1};
+    // 仲裁抽样计数器: 抽中(kSample 的倍数)才调探针函数。uprobe 挂在函数入口,
+    // 只要调用就命中——抽样判断必须在调用点(跳过调用), 不能放函数内部。
+    size_t arb_sample_cnt = 0;
     auto arbitrate = [&]() {
+        // [LensX 级别3] 仲裁函数起点/终点: 抽中才打(同一次调用内局部变量保证成对)。
+        // 全采样(每次调用都打, ~8.7M/s)实测拖垮吞吐(5M→1.35M)。
+        bool arb_sample = (arb_sample_cnt++ % lensx::kSample == 0);
+        if (arb_sample) lensx::mark_arb_start();
         OrderSide so = sig_ofi.side.load(std::memory_order_acquire);
         OrderSide sb = sig_obi.side.load(std::memory_order_acquire);
         OrderSide st = sig_td.side.load(std::memory_order_acquire);
@@ -163,25 +172,31 @@ int main(int argc, char* argv[]) {
         bool ok;
         if (st != OrderSide::NONE) ok = (so != OrderSide::NONE && so == sb && so == st);
         else                      ok = (so != OrderSide::NONE && so == sb);
-        if (!ok) return;
-        // 用 OFI 方向(方向一致时任一方向都成立, 取 OFI)
-        uint64_t locate = sig_ofi.locate.load(std::memory_order_acquire);
-        int64_t strength = sig_ofi.strength.load(std::memory_order_acquire);
-        uint64_t pos = rm.position(locate);
-        if (so == OrderSide::BUY && pos >= cfg.risk.max_position) return;
-        if (so == OrderSide::SELL && pos == 0) return;
-        bool fresh = (so != last_order_side.load());
-        if (fresh) {
-            Signal decision{.side = so, .locate = locate,
-                            .price = 0, .timestamp = 0, .strength = strength};
-            lensx::mark_s5(0);   // [LensX s5] 下单决策
-            uint64_t oid = ex.submit_signal(decision, 1);
-            lensx::mark_s6(0);   // [LensX s6] 订单发出
-            if (oid != 0) {
-                last_order_side.store(so);
-                last_order_str.store(strength);
+        if (ok) {
+            // 用 OFI 方向(方向一致时任一方向都成立, 取 OFI)
+            uint64_t locate = sig_ofi.locate.load(std::memory_order_acquire);
+            int64_t strength = sig_ofi.strength.load(std::memory_order_acquire);
+            uint64_t pos = rm.position(locate);
+            bool blocked = (so == OrderSide::BUY && pos >= cfg.risk.max_position) ||
+                           (so == OrderSide::SELL && pos == 0);
+            bool fresh = (so != last_order_side.load());
+            if (!blocked && fresh) {
+                // [LensX 级别4] 下单决策→执行完毕(key=sig_ofi.seq 信号触发seq, 抽样)。
+                // 起点/终点都在决策块, send 或被拒都是终点状态 → 成对无残留。
+                // 抽样判断在调用点(抽中才调), 避免 uprobe 每次命中拖垮吞吐。
+                uint64_t order_seq = sig_ofi.seq.load(std::memory_order_acquire);
+                if (order_seq % lensx::kSample == 0) lensx::mark_order_start(order_seq);
+                Signal decision{.side = so, .locate = locate,
+                                .price = 0, .timestamp = 0, .strength = strength};
+                uint64_t oid = ex.submit_signal(decision, 1);
+                if (oid != 0) {
+                    last_order_side.store(so);
+                    last_order_str.store(strength);
+                }
+                if (order_seq % lensx::kSample == 0) lensx::mark_order_end(order_seq);
             }
         }
+        if (arb_sample) lensx::mark_arb_end();
     };
 
     // 成交回报接收端（← 模拟交易所）
@@ -240,7 +255,7 @@ int main(int argc, char* argv[]) {
                 if (!parse_done.load(std::memory_order_acquire)) {
                     if (spin_left > 0) { --spin_left; _mm_pause(); continue; }
                     spin_left = kSpinMax;
-                    channel.wait_for_data(200);
+                    channel.wait_for_data(1);   // 广播唤醒, 自己的 fd 无限阻塞
                     continue;
                 }
                 break;
@@ -255,6 +270,7 @@ int main(int argc, char* argv[]) {
                 sig_td.side.store(s.side, std::memory_order_release);
                 sig_td.locate.store(s.locate, std::memory_order_release);
                 sig_td.strength.store(s.strength, std::memory_order_release);
+                sig_td.seq.store(ev.seq_id, std::memory_order_release);
                 arbitrate();
             }
         }
@@ -272,20 +288,19 @@ int main(int argc, char* argv[]) {
                 if (!parse_done.load(std::memory_order_acquire)) {
                     if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
                     spin_left = kSpinMax;
-                    channel.wait_for_data(200);   // 持续空: 阻塞等 push 唤醒
+                    channel.wait_for_data(0);   // 持续空: 广播唤醒, 自己的 fd 无限阻塞
                     continue;
                 }
                 break;
             }
             spin_left = kSpinMax;   // 有数据: 重置自旋预算
             while (channel.pop(0, ev)) {
-                // [LensX s2] 只对成交打点(端到端: 成交→仲裁→下单→send 同 seq 配对)。
+                // [LensX 消息级] SPMC pop 出(完整链路终点)。抽样与 alloc 侧一致:
+                // ev.seq_id % kSample == 0, 同一消息在两侧都打, key 配对。
+                if (ev.seq_id % lensx::kSample == 0) lensx::mark_pop(ev.seq_id);
                 bool is_trade = (ev.type == MarketEvent::Type::TRADE ||
                                  ev.type == MarketEvent::Type::EXECUTE);
-                if (is_trade) {
-                    lensx::mark_s2(ev.seq_id);
-                    ++trade_count;
-                }
+                if (is_trade) ++trade_count;
                 obc.on_event(ev);
                 ++book_events;
                 const OrderBook* book = obc.book(ev.locate);
@@ -302,31 +317,29 @@ int main(int argc, char* argv[]) {
                         side = book->side_of(ev.order.order_ref);
                 }
                 if (side != OrderSide::NONE && cfg.strategy.use_ofi) {
-                    lensx::mark_book(ev.seq_id);   // [LensX 四类起点] 会更新OFI的委托
                     ofi.on_event(ev, side);
-                    lensx::mark_ofi(ev.seq_id);   // [LensX 四类终点] OFI 信号更新完成
                     if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
                         ofi.set_last_price((book->best_bid() + book->best_ask()) / 2);
                 }
                 if (book && cfg.strategy.use_obi) {
-                    lensx::mark_book(ev.seq_id);   // [LensX 三类起点] 会更新OBI的委托
                     obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
                                 book->best_ask(), book->best_ask_volume(), ev.timestamp);
-                    lensx::mark_obi(ev.seq_id);   // [LensX 三类终点] OBI 信号更新完成
                 }
 
-                // 更新信号槽(arbitrate 读): OFI/OBI 信号 → 原子槽
+                // 更新信号槽(arbitrate 读): OFI/OBI 信号 → 原子槽, 带触发 seq
                 if (cfg.strategy.use_ofi) {
                     Signal s = ofi.signal();
                     sig_ofi.side.store(s.side, std::memory_order_release);
                     sig_ofi.locate.store(s.locate, std::memory_order_release);
                     sig_ofi.strength.store(s.strength, std::memory_order_release);
+                    sig_ofi.seq.store(ev.seq_id, std::memory_order_release);
                 }
                 if (cfg.strategy.use_obi) {
                     Signal s = obi.signal();
                     sig_obi.side.store(s.side, std::memory_order_release);
                     sig_obi.locate.store(s.locate, std::memory_order_release);
                     sig_obi.strength.store(s.strength, std::memory_order_release);
+                    sig_obi.seq.store(ev.seq_id, std::memory_order_release);
                 }
                 arbitrate();   // 写完 OFI/OBI 信号, 检查是否齐 → 仲裁下单
             }

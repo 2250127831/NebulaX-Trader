@@ -1,5 +1,7 @@
 #include "io_uring_receiver.h"
 
+#include "core/prof/lensx_probe.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -90,6 +92,7 @@ ssize_t IoUringReceiver::recv(uint8_t* buf, size_t len)
         if (result >= 0) {
             size_t n = std::min<size_t>(static_cast<size_t>(result), len);
             std::memcpy(buf, poller_.buffer_ptr(buf_idx_), n);
+            lensx::mark_recv_pkt();   // [LensX 包级] recv 返回, 数据已进用户 buf
             return static_cast<ssize_t>(n);
         }
         if (result == -EAGAIN) return 0;  // 未就绪，下轮重提交
@@ -126,6 +129,7 @@ ssize_t IoUringReceiver::recv(uint8_t* buf, size_t len)
         if (result >= 0) {
             size_t n = std::min<size_t>(static_cast<size_t>(result), len);
             std::memcpy(buf, poller_.buffer_ptr(buf_idx_), n);
+            lensx::mark_recv_pkt();   // [LensX 包级] recv 返回, 数据已进用户 buf
             return static_cast<ssize_t>(n);
         }
         if (!running_) return 0;        // stop() 已调用，通道关闭优先返回 0

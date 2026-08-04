@@ -4,27 +4,51 @@
 
 // ── LensX eBPF 延迟追踪探针 ──
 // noinline 空函数: 只作为 uprobe 挂载点(符号必须存在且不内联, LensX 才能 attach)。
-// key 参数: 跨线程配对用(消息 seq)。同一条消息在多个阶段传同一 key。
+// key 参数: 跨线程配对用。同一条消息在多个阶段传同一 key。
 //
-// 五类延迟测量(见 docs/PERF_V1_ARCHIVE.md 第 5 节):
-//   第一类 收包→入ring    mark_recv (recv_th) → mark_s0 (recv_th)
-//   第二类 通道A→信号     mark_s2   (strategy_th) → mark_sig (strategy_th)
-//   第三类 通道B→OBI      mark_book (book_th) → mark_obi (book_th)
-//   第四类 通道B→OFI      mark_book (book_th) → mark_ofi (book_th)
-//   第五类 合成→send      mark_s5   (strategy_th) → mark_s6 (strategy_th)
+// 两级测量(以一条消息/一个包为单位, 从分配 seq 到被消费的完整旅程):
+//
+// 级别1 — 包级 recv_th 内部延迟(seq 模式, 同线程, 无 key)
+//   recv_pkt → unpack       IoUringReceiver::recv 返回 → MoldUdpUnpacker::feed 拆包开始
+//   测: 包到达 → 开始拆包(内核→用户态拷贝 + 提交 SQE 的开销)
+//   包级粒度: recv 每包 1 次, feed 每包 1 次, 1:1 seq 配对。
+//
+// 级别2 — 消息级完整链路(key 模式, 跨线程, key = 消息 seq, 抽样)
+//   alloc → pop             分配 seq → SPMC 消费 pop 出
+//   测: 一条消息从分配到被消费的完整旅程(含跨线程排队)
+//   key = unpacker 分配的 64 位消息 seq, 跨线程靠 MarketEvent.seq_id 贯穿。
+//   抽样: 每 N 条打 1 条(alloc/pop 独立计数器, 各按序号 mod N 判定, 抽中同一批)。
+//     全采样(每消息打)实测吞吐从 5M 跌到 543K(9x), 探针拖垮高频线程 → 延迟被污染。
+//     抽样把探针开销压到 ~1/N, 延迟才可信。
 //
 // 定义在 lensx_probe.cpp(避免头文件多翻译单元重复定义)。
 // -O3 下仅一次非内联函数调用开销, 测量完可移除插桩。
 namespace lensx {
 
-void mark_recv(uint64_t key);   // 第一类起点: recv 收到 UDP 包
-void mark_s0(uint64_t key);     // 第一类终点: 消息推入 ring
-void mark_s2(uint64_t key);     // 第二类起点: 策略线程 pop 成交
-void mark_sig(uint64_t key);    // 第二类终点: 信号合成完成(combine 后)
-void mark_book(uint64_t key);   // 第三/四类起点: 订单簿线程 pop 委托
-void mark_obi(uint64_t key);    // 第三类终点: OBI 信号更新完成
-void mark_ofi(uint64_t key);    // 第四类终点: OFI 信号更新完成
-void mark_s5(uint64_t key);     // 第五类起点: 合成成功触发下单(fresh)
-void mark_s6(uint64_t key);     // 第五类终点: send 发出
+// 消息级抽样比: 每 kSample 条消息打 1 条(msg_seq % kSample == 0)。
+// 调用点也按此判断(跳过调用), 探针开销压到 ~1/kSample。
+constexpr uint64_t kSample = 128;
+
+// 级别1 包级(recv_th 内部, seq 模式, 无 key)
+void mark_recv_pkt();     // IoUringReceiver::recv 返回后(数据已进用户 buf)
+void mark_unpack();       // MoldUdpUnpacker::feed 拆包开始前(每包一次)
+
+// 级别2 消息级完整链路(key 模式, key = 消息 seq, 抽样)
+void mark_alloc(uint64_t key);   // 分配 msg_seq 时(unpacker, 每 N 条打 1 条)
+void mark_pop(uint64_t key);     // SPMC pop 出时(book_th, 每 N 条打 1 条)
+
+// 级别3 仲裁函数完整执行耗时(seq 模式, 无 key)
+//   arb_start → arb_end  arbitrate 开头 → 统一出口(done:)
+//   单线程顺序执行, 无并发, seq 配对。arbitrate 改单出口(提前 return → 统一落 done:),
+//   保证开头打的起点、结尾必打终点, 无残留。
+void mark_arb_start();    // arbitrate 开头(每次进仲裁)
+void mark_arb_end();      // arbitrate 统一出口(done:)
+
+// 级别4 下单决策→执行完毕(key 模式, key = sig_ofi.seq, 抽样)
+//   order_start → order_end  决策点(fresh块内, submit_signal前) → 决策块末尾(无论 send/被拒)
+//   测: 下单决策 → 执行完毕(send 或被拒)。key=信号触发 seq(sig_ofi.seq)。
+//   起点/终点都在决策块, 成对无残留; send 和被拒都是终点状态。
+void mark_order_start(uint64_t key);   // 决策点: fresh 块内, submit_signal 前
+void mark_order_end(uint64_t key);     // 决策块末尾: send 或被拒都打
 
 }  // namespace lensx

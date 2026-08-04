@@ -9,14 +9,30 @@
 
 namespace lensx {
 
-LENSX_NOINLINE void mark_recv(uint64_t key) { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_s0(uint64_t key)   { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_s2(uint64_t key)   { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_sig(uint64_t key)  { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_book(uint64_t key) { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_obi(uint64_t key)  { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_ofi(uint64_t key)  { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_s5(uint64_t key)   { volatile uint64_t x = key; (void)x; }
-LENSX_NOINLINE void mark_s6(uint64_t key)   { volatile uint64_t x = key; (void)x; }
+// 级别1 包级(recv_th 内部, seq 模式, 无 key)
+LENSX_NOINLINE void mark_recv_pkt() { asm volatile("" ::: "memory"); }
+LENSX_NOINLINE void mark_unpack()   { asm volatile("" ::: "memory"); }
+
+// 级别2 消息级完整链路(key 模式, key = 消息 seq, 抽样)
+LENSX_NOINLINE void mark_alloc(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
+LENSX_NOINLINE void mark_pop(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
+
+// 级别3 仲裁函数完整执行耗时(seq 模式, 无 key)
+// 抽样判断在调用点(main.cpp arbitrate 内, 抽中才调本函数), 函数体只需 noinline 防优化。
+LENSX_NOINLINE void mark_arb_start() { asm volatile("" ::: "memory"); }
+LENSX_NOINLINE void mark_arb_end()   { asm volatile("" ::: "memory"); }
+
+// 级别4 下单决策→执行完毕(key 模式, key = sig_ofi.seq, 抽样)
+// 抽样判断在调用点(决策块内, 抽中才调), 函数体只需 noinline + 读 key 防优化。
+LENSX_NOINLINE void mark_order_start(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
+LENSX_NOINLINE void mark_order_end(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
 
 }  // namespace lensx

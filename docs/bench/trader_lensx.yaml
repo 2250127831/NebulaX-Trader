@@ -1,17 +1,21 @@
-# NebulaX-Trader 延迟追踪配置 (V1 归档, 方案A单通道)
-# 五类延迟 + 端到端。
+# NebulaX-Trader 延迟追踪配置 — 完整链路(包级 + 消息级 + 仲裁 + 下单)
+# 探针位置见 core/prof/lensx_probe.h。
 #
-#  第一类 recv_to_ring:   mark_recv → mark_s0   收包到消息入ring (recv_th, 成交)
-#  第二类 tick_to_sig:    mark_s2 → mark_sig    strategy_th pop成交到信号合成
-#  第三类 tick_to_obi:    mark_book → mark_obi  book_th 事件→OBI信号
-#  第四类 tick_to_ofi:    mark_book → mark_ofi  book_th 事件→OFI信号
-#  第五类 sig_to_send:    mark_s5 → mark_s6     合成成功触发下单到send
+# 四级测量:
+#  级别1 包级 recv_th 内部延迟(seq 模式, 同线程, 无 key)
+#     recv_pkt → unpack    IoUringReceiver::recv 返回 → MoldUdpUnpacker::feed 拆包开始
+#     测: 包到达 → 开始拆包。recv 每包 1 次, feed 每包 1 次, 1:1 seq 配对。
+#  级别2 消息级完整链路(key 模式, 跨线程, key = 消息 seq, 抽样 1/128)
+#     alloc → pop          分配 seq → SPMC 消费 pop 出
+#     测: 一条消息从分配到被消费的完整旅程(含跨线程排队)。
+#     抽样: msg_seq % kSample == 0 才打, 避免拖垮高频线程(全采样实测吞吐 5M→543K)。
+#  级别3 仲裁函数完整执行耗时(seq 模式, 同线程, 无 key, 抽样 1/128)
+#     arb_start → arb_end  arbitrate 开头 → 统一出口。arbitrate 单出口, 成对无残留。
+#  级别4 下单决策→执行完毕(key 模式, key = sig_ofi.seq, 抽样 1/128)
+#     order_start → order_end  决策点 → 决策块末尾(send/被拒都是终点, 成对无残留)。
 #
-#  端到端 e2e: mark_recv → mark_s2 → mark_s5 → mark_s6 (同一 seq 跨线程 key 配对)
-#    收包 → 入ring → 策略pop成交 → 下单决策 → send
-#    样本 = 走通全链路的成交(≈下单数)
-#
-# 五类用 seq(同线程按到达顺序); 端到端用 key(arg1=seq, 跨线程按 seq 归组)。
+# 配对模式: 级别1/3 用 seq(同线程顺序配对), 级别2/4 用 key(跨线程/事件级归组)。
+# 复用: 探针代码在 core/prof/lensx_probe.{h,cpp}, 测量脚本 scripts/measure_lensx.sh。
 target:
   process: trader
 
@@ -19,94 +23,75 @@ output:
   csv: /tmp/trader_lensx.csv
 
 probes:
-  - name: recv
+  # 级别1 包级(无 key, seq 模式)
+  - name: recv_pkt
     type: uprobe
-    symbol: lensx::mark_recv
+    symbol: lensx::mark_recv_pkt
     stage: 0
-    key: arg1
-  - name: s0_ring
+  - name: unpack
     type: uprobe
-    symbol: lensx::mark_s0
+    symbol: lensx::mark_unpack
     stage: 1
-    key: arg1
-  - name: s2_strategy
+  # 级别2 消息级(key = 消息 seq)
+  - name: alloc
     type: uprobe
-    symbol: lensx::mark_s2
+    symbol: lensx::mark_alloc
     stage: 2
     key: arg1
-  - name: sig
+  - name: pop
     type: uprobe
-    symbol: lensx::mark_sig
+    symbol: lensx::mark_pop
     stage: 3
     key: arg1
-  - name: book
+  # 级别3 仲裁(seq 模式, 无 key)
+  - name: arb_start
     type: uprobe
-    symbol: lensx::mark_book
+    symbol: lensx::mark_arb_start
     stage: 4
-    key: arg1
-  - name: obi
+  - name: arb_end
     type: uprobe
-    symbol: lensx::mark_obi
+    symbol: lensx::mark_arb_end
     stage: 5
-    key: arg1
-  - name: ofi
+  # 级别4 下单决策→执行完毕(key 模式, key = sig_ofi.seq)
+  - name: order_start
     type: uprobe
-    symbol: lensx::mark_ofi
+    symbol: lensx::mark_order_start
     stage: 6
     key: arg1
-  - name: s5_order
+  - name: order_end
     type: uprobe
-    symbol: lensx::mark_s5
+    symbol: lensx::mark_order_end
     stage: 7
-    key: arg1
-  - name: s6_send
-    type: uprobe
-    symbol: lensx::mark_s6
-    stage: 8
     key: arg1
 
 matchers:
-  # 第一类: recv_th 收包 → 消息入ring (seq 同线程)
-  - id: recv_to_ring
+  # 级别1: recv_th 内部 包到达→拆包(同线程 seq 配对)
+  - id: recv_to_unpack
     stages: [0, 1]
     mode: seq
-  # 第二类: strategy_th pop成交 → 信号合成 (seq 同线程)
-  - id: tick_to_sig
+  # 级别2: 消息级完整链路 分配→pop(跨线程 key 配对)
+  - id: alloc_to_pop
     stages: [2, 3]
-    mode: seq
-  # 第三类: book_th 事件 → OBI信号 (seq 同线程)
-  - id: tick_to_obi
+    mode: key
+  # 级别3: 仲裁函数完整执行(同线程 seq 配对)
+  - id: arb_to_end
     stages: [4, 5]
     mode: seq
-  # 第四类: book_th 事件 → OFI信号 (seq 同线程)
-  - id: tick_to_ofi
-    stages: [4, 6]
-    mode: seq
-  # 第五类: 下单决策 → send发出 (seq 同线程)
-  - id: sig_to_send
-    stages: [7, 8]
-    mode: seq
-  # 端到端: recv → s2 → s5 → s6 (key 跨线程, 同一成交)
-  - id: e2e
-    stages: [0, 2, 7, 8]
+  # 级别4: 下单决策→执行完毕(同线程 key 配对, send/被拒都是终点)
+  - id: order_to_end
+    stages: [6, 7]
     mode: key
 
 reports:
-  - name: recv_to_ring
+  - name: recv_to_unpack
     from: 0
     to: 1
-  - name: tick_to_sig
+  - name: alloc_to_pop
     from: 2
     to: 3
-  - name: tick_to_obi
+  - name: arb_to_end
     from: 4
     to: 5
-  - name: tick_to_ofi
-    from: 4
-    to: 6
-  - name: sig_to_send
-    from: 7
-    to: 8
-  - name: e2e
-    from: 0
-    to: 8
+  - name: order_to_end
+    from: 6
+    to: 7

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core/queue/spsc_byte_ring.h"
 #include "core/prof/lensx_probe.h"
+#include "core/queue/spsc_byte_ring.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +42,7 @@ public:
     // 每个包: [20 字节头][消息1][消息2]...；处理完一个包的 count 条后，
     // pos 指向下一个包的 20 字节头，循环处理。
     size_t feed(const uint8_t* pkt, size_t pkt_len) {
+        lensx::mark_unpack();   // [LensX 包级] 拆包开始前(每包一次, 与 recv_pkt seq 配对)
         size_t pos = 0;
         size_t unpacked = 0;
         uint8_t msg_buf[10 + 200];  // [seq 8][len 2][消息体]
@@ -61,6 +62,9 @@ public:
                 // 每条消息前加 8 字节完整 seq（包 seq + 包内偏移, 64 位不回绕）。
                 // 之前 16 位在 873 万条消息下回绕 133 次, 导致 seq_id 撞车/探针 key 错配。
                 uint64_t msg_seq = seq + i;
+                // [LensX 消息级] 分配 seq 时刻(完整链路起点)。抽样: msg_seq%N==0 才打,
+                // 探针开销压到 ~1/N(全采样实测拖垮吞吐)。key=msg_seq 与 pop 侧配对。
+                if (msg_seq % lensx::kSample == 0) lensx::mark_alloc(msg_seq);
                 be64_store(msg_buf, msg_seq);        // [seq 8]
                 msg_buf[8] = pkt[pos];               // [len 2 高字节]
                 msg_buf[9] = pkt[pos + 1];           // [len 2 低字节]
@@ -68,14 +72,6 @@ public:
 
                 // 推入 ring: 一次 push 整条消息(消息级, 让 push 处理跨回绕空洞)。
                 // push 返回 0 = 空间不足(含空洞跨越后仍不足), 忙等消费者释放。
-                // [LensX 第一类] 只对成交消息('P' Trade / 'E' Executed)打点:
-                //   mark_recv = 包到达(收包到拆出本条成交), mark_s0 = 入ring。
-                //   两者都在本条消息处, 频率一致(每成交一对), 可配对。
-                uint8_t mtype = msg_buf[10];
-                if (mtype == 'P' || mtype == 'E') {
-                    lensx::mark_recv(msg_seq);   // 包到达(完整 64 位 seq, 不回绕)
-                    lensx::mark_s0(msg_seq);     // 消息入ring
-                }
                 while (ring_.push(msg_buf, msg_len + 8) == 0)   // [seq 8][len 2][体]
                     __builtin_ia32_pause();
 

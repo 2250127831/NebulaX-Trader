@@ -1,0 +1,112 @@
+# NebulaX-Trader 延迟追踪配置 (V1 归档, 方案A单通道)
+# 五类延迟 + 端到端。
+#
+#  第一类 recv_to_ring:   mark_recv → mark_s0   收包到消息入ring (recv_th, 成交)
+#  第二类 tick_to_sig:    mark_s2 → mark_sig    strategy_th pop成交到信号合成
+#  第三类 tick_to_obi:    mark_book → mark_obi  book_th 事件→OBI信号
+#  第四类 tick_to_ofi:    mark_book → mark_ofi  book_th 事件→OFI信号
+#  第五类 sig_to_send:    mark_s5 → mark_s6     合成成功触发下单到send
+#
+#  端到端 e2e: mark_recv → mark_s2 → mark_s5 → mark_s6 (同一 seq 跨线程 key 配对)
+#    收包 → 入ring → 策略pop成交 → 下单决策 → send
+#    样本 = 走通全链路的成交(≈下单数)
+#
+# 五类用 seq(同线程按到达顺序); 端到端用 key(arg1=seq, 跨线程按 seq 归组)。
+target:
+  process: trader
+
+output:
+  csv: /tmp/trader_lensx.csv
+
+probes:
+  - name: recv
+    type: uprobe
+    symbol: lensx::mark_recv
+    stage: 0
+    key: arg1
+  - name: s0_ring
+    type: uprobe
+    symbol: lensx::mark_s0
+    stage: 1
+    key: arg1
+  - name: s2_strategy
+    type: uprobe
+    symbol: lensx::mark_s2
+    stage: 2
+    key: arg1
+  - name: sig
+    type: uprobe
+    symbol: lensx::mark_sig
+    stage: 3
+    key: arg1
+  - name: book
+    type: uprobe
+    symbol: lensx::mark_book
+    stage: 4
+    key: arg1
+  - name: obi
+    type: uprobe
+    symbol: lensx::mark_obi
+    stage: 5
+    key: arg1
+  - name: ofi
+    type: uprobe
+    symbol: lensx::mark_ofi
+    stage: 6
+    key: arg1
+  - name: s5_order
+    type: uprobe
+    symbol: lensx::mark_s5
+    stage: 7
+    key: arg1
+  - name: s6_send
+    type: uprobe
+    symbol: lensx::mark_s6
+    stage: 8
+    key: arg1
+
+matchers:
+  # 第一类: recv_th 收包 → 消息入ring (seq 同线程)
+  - id: recv_to_ring
+    stages: [0, 1]
+    mode: seq
+  # 第二类: strategy_th pop成交 → 信号合成 (seq 同线程)
+  - id: tick_to_sig
+    stages: [2, 3]
+    mode: seq
+  # 第三类: book_th 事件 → OBI信号 (seq 同线程)
+  - id: tick_to_obi
+    stages: [4, 5]
+    mode: seq
+  # 第四类: book_th 事件 → OFI信号 (seq 同线程)
+  - id: tick_to_ofi
+    stages: [4, 6]
+    mode: seq
+  # 第五类: 下单决策 → send发出 (seq 同线程)
+  - id: sig_to_send
+    stages: [7, 8]
+    mode: seq
+  # 端到端: recv → s2 → s5 → s6 (key 跨线程, 同一成交)
+  - id: e2e
+    stages: [0, 2, 7, 8]
+    mode: key
+
+reports:
+  - name: recv_to_ring
+    from: 0
+    to: 1
+  - name: tick_to_sig
+    from: 2
+    to: 3
+  - name: tick_to_obi
+    from: 4
+    to: 5
+  - name: tick_to_ofi
+    from: 4
+    to: 6
+  - name: sig_to_send
+    from: 7
+    to: 8
+  - name: e2e
+    from: 0
+    to: 8

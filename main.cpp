@@ -47,7 +47,25 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <unistd.h>
+
+// ── 线程绑核(V2.1 控制变量用) ──
+// 分簿并行(workers=4)给 6 个热线程各占独立 P 核, V1 单 book_th 也应同样绑核
+// 才能公平对比(否则 5 线程靠调度器侥幸, 延迟被调度噪声污染)。
+// i9-12900HX: P 核 0-15(SMT 成对), E 核 16-23。热线程用奇数 P 核(5/7/9/11/13/15
+// = 独立物理核), 避开 CPU0/1(P0 噪声)与 CPU3(benchmark 占用)。
+static void pin_cpu(int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+static const int kPinRecv     = 5;   // io_uring 收包
+static const int kPinParse    = 7;   // 解析
+static const int kPinStrategy = 9;   // TD 策略(消费成交)
+static const int kPinBook     = 11;  // 订单簿重建(主负载)
+static const int kPinFill     = 16;  // 成交回报(低频, E 核够用)
 
 static void usage(const char* prog) {
     printf("Usage: %s [--config <path>] [--no-shm]\n"
@@ -211,6 +229,7 @@ int main(int argc, char* argv[]) {
 
     // ── 接收线程：recv → unpacker → received++ ──
     std::thread recv_th([&]() {
+        pin_cpu(kPinRecv);   // 绑独立 P 核(控制变量, 与 V2.1 一致)
         receiver->set_blocking(false);
         uint8_t pre[65536];
         receiver->recv(pre, sizeof(pre));
@@ -233,6 +252,7 @@ int main(int argc, char* argv[]) {
     // ── 解析线程：解析 ITCH → 单通道广播(方案A, 全部事件) ──
     // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。排空 ring 后置 parse_done。
     std::thread parse_th([&]() {
+        pin_cpu(kPinParse);   // 绑独立 P 核(控制变量, 与 V2.1 一致)
         int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
         while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
             parser.parse_available();
@@ -248,6 +268,7 @@ int main(int argc, char* argv[]) {
     // ── 独立高频策略线程(consumer 1): 消费成交跑 TradeDirection, 产信号(不下单) ──
     // 验证 SPMC 多消费者广播: 独立于 book_th 并行消费单通道成交, 不依赖订单簿。
     std::thread strategy_th([&]() {
+        pin_cpu(kPinStrategy);   // 绑独立 P 核(控制变量, 与 V2.1 worker 同级)
         MarketEvent ev;
         int spin_left = 0;
         while (!parse_done.load(std::memory_order_acquire) || channel.pending(1) > 0) {
@@ -278,6 +299,7 @@ int main(int argc, char* argv[]) {
 
     // ── 订单簿线程(consumer 0): 单通道全部事件 → 订单簿重建 → OFI/OBI 信号 → 写信号槽 ──
     std::thread book_th([&]() {
+        pin_cpu(kPinBook);   // 绑独立 P 核(控制变量, 与 V2.1 worker 同级)
         MarketEvent ev;
         // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
         // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
@@ -349,6 +371,7 @@ int main(int argc, char* argv[]) {
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
     std::thread fill_th([&]() {
+        pin_cpu(kPinFill);   // 低频, E 核够用, 不占 P 核(控制变量, 与 V2.1 一致)
         fill_rcv->set_blocking(false);
         uint8_t pre[2048];
         fill_rcv->recv(pre, sizeof(pre));

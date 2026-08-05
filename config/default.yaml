@@ -25,6 +25,9 @@ order_book:
   # 共享挂单池槽位
   pool_slots: 1048576
 
+  # 分簿并行 book_worker 数（广播 + skip，V2.1）
+  workers: 4
+
 strategy:
   # 主策略（定方向）
   # volume_breakout : 成交量突破

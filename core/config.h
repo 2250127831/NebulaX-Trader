@@ -18,6 +18,7 @@ struct MarketConfig {
 struct OrderBookConfig {
     bool   enabled = true;              // 是否启用订单簿重建 + OBI/OFI
     size_t pool_slots = 1 << 20;        // 共享挂单池槽位
+    size_t workers = 4;                 // 分簿并行 book_worker 数(广播+skip)
 };
 
 // ── 策略配置 ──

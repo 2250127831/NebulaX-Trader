@@ -37,18 +37,21 @@ public:
     {
         // Treiber 无锁空闲栈(带 tag 消 ABA): 槽归还后立即复用, 并发 alloc/free 时
         // 无 tag 会因 ABA 让两个线程同时"拥有"同一槽。tag 随每次成功 CAS 递增, stale CAS 失败。
-        uint64_t fh = free_head_.load(std::memory_order_relaxed);
+        // free_head_ 读用 acquire, 与 deallocate 的 release 写配对: 槽被另一线程
+        // deallocate(release) 后本线程 allocate(acquire) 看到 → 建立 happens-before,
+        // 槽字段的写(前 owner)与读(新 owner)有序, TSAN 不误判节点复用为竞争。
+        uint64_t fh = free_head_.load(std::memory_order_acquire);
         while ((uint32_t)fh != UINT32_MAX) {
             uint32_t head = (uint32_t)fh;
-            uint32_t next = storage_[head].pool_next_free;
+            uint32_t next = storage_[head].pool_next_free.load(std::memory_order_relaxed);
             uint64_t expected = fh;
             uint64_t desired = (((fh >> 32) + 1) << 32) | next;
             if (free_head_.compare_exchange_weak(expected, desired,
-                    std::memory_order_release, std::memory_order_relaxed)) {
+                    std::memory_order_release, std::memory_order_acquire)) {
                 size_.fetch_add(1, std::memory_order_relaxed);
                 return &storage_[head];     // CAS 成功 → 取走头部
             }
-            fh = expected;   // CAS 失败, 重读栈头重试
+            fh = expected;   // CAS 失败, 重读栈头重试(acquire 失败序)
         }
         return nullptr;                     // 空池
     }
@@ -56,14 +59,14 @@ public:
     void deallocate(uint32_t idx)
     {
         // Treiber 无锁空闲栈(带 tag 消 ABA): CAS 循环压栈顶。
-        uint64_t fh = free_head_.load(std::memory_order_relaxed);
+        uint64_t fh = free_head_.load(std::memory_order_acquire);
         for (;;) {
             uint32_t head = (uint32_t)fh;
-            storage_[idx].pool_next_free = head;   // 新节点指向当前头
+            storage_[idx].pool_next_free.store(head, std::memory_order_relaxed);   // 新节点指向当前头
             uint64_t expected = fh;
             uint64_t desired = (((fh >> 32) + 1) << 32) | idx;
             if (free_head_.compare_exchange_weak(expected, desired,
-                    std::memory_order_release, std::memory_order_relaxed)) {
+                    std::memory_order_release, std::memory_order_acquire)) {
                 size_.fetch_sub(1, std::memory_order_relaxed);
                 return;
             }
@@ -90,8 +93,8 @@ public:
     // 从头扫描 storage 重建空闲链表（崩溃恢复用，V2）
     void rebuildFreelist() {
         for (uint32_t i = 0; i < capacity_ - 1; i++)
-            storage_[i].pool_next_free = i + 1;
-        storage_[capacity_ - 1].pool_next_free = UINT32_MAX;
+            storage_[i].pool_next_free.store(i + 1, std::memory_order_relaxed);
+        storage_[capacity_ - 1].pool_next_free.store(UINT32_MAX, std::memory_order_relaxed);
         free_head_.store(0, std::memory_order_release);
         size_.store(0, std::memory_order_relaxed);
     }
@@ -99,8 +102,8 @@ public:
 private:
     void initFreeList() {
         for (uint32_t i = 0; i < capacity_ - 1; ++i)
-            storage_[i].pool_next_free = i + 1;
-        storage_[capacity_ - 1].pool_next_free = UINT32_MAX;
+            storage_[i].pool_next_free.store(i + 1, std::memory_order_relaxed);
+        storage_[capacity_ - 1].pool_next_free.store(UINT32_MAX, std::memory_order_relaxed);
         free_head_.store(0, std::memory_order_release);
         size_.store(0, std::memory_order_relaxed);
     }

@@ -25,7 +25,7 @@ inline uint64_t rd_ts(const uint8_t* p) {  // 6 字节纳秒时间戳
 
 bool ItchParser::feed(const uint8_t* msg, size_t len) {
     if (len < 3) return false;  // 至少 type(1) + 少量字段
-    ++msg_count_;
+    msg_count_.fetch_add(1, std::memory_order_relaxed);
     // 注：不在此重置 cur_seq_。带 seq 版本(feed(msg,len,seq))先设 cur_seq_ 再调本函数,
     // 若这里重置为 0 会覆盖 seq, 导致 emit 的 seq_id 恒为 0。
     const uint8_t mt = msg[0];

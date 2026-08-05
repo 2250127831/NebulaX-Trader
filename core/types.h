@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -57,9 +58,11 @@ struct OrderSlot {
     uint64_t   sequence = 0;      // 时间优先（FIFO 顺序，同 NebulaX）
 
     // ── intrusive linked list (pool-managed) ──
-    uint32_t prev_idx = UINT32_MAX;   // 同价档前一个挂单
-    uint32_t next_idx = UINT32_MAX;   // 同价档后一个挂单
-    uint32_t pool_next_free = UINT32_MAX;  // 池空闲链表链接（仅释放时有效）
+    uint32_t prev_idx = UINT32_MAX;   // 同价档前一个挂单(仅 owner worker 访问, 无需原子)
+    uint32_t next_idx = UINT32_MAX;   // 同价档后一个挂单(仅 owner worker 访问, 无需原子)
+    // 池空闲链表链接(仅释放时有效)。原子: OrderPool::allocate 无锁读
+    // storage_[head].pool_next_free, 并发 deallocate 写同节点 → 非原子是 C++ UB。
+    std::atomic<uint32_t> pool_next_free = UINT32_MAX;
 };
 static_assert(sizeof(OrderSlot) == 64, "OrderSlot must be 64 bytes for cache line alignment");
 

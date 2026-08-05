@@ -18,10 +18,10 @@ class OrderMap {
     //   无锁 find 可能被带偏。find 每步校验 bucket==目标桶, 不匹配 = 链被并发跳走 → 重试,
     //   用数据结构规避节点复用导致的 ABA(跳链), 不需要惰性删除/hazard pointer/延迟回收。
     struct Node {
-        uint64_t          order_ref;
-        OrderSlot*        order;
+        std::atomic<uint64_t>  order_ref;   // 原子: find 无锁读 vs insert 写(节点复用)
+        std::atomic<OrderSlot*> order;      // 同上
         std::atomic<uint32_t> next_idx;   // 链指针 / 空闲链表(共用, 摘除 CAS 用)
-        uint32_t          bucket;     // 本节点所属桶(防 find 跳链, 只在 insert 时写, find 只读)
+        std::atomic<uint32_t> bucket;     // 本节点所属桶(防 find 跳链, 原子消除读写竞争)
     };
 
 public:
@@ -80,9 +80,9 @@ public:
 
         uint32_t idx = allocNode();
         if (idx == UINT32_MAX) return;   // 节点池耗尽, 丢弃(不越界写)
-        nodes_[idx].order_ref = order_ref;
-        nodes_[idx].order     = order;
-        nodes_[idx].bucket    = b;
+        nodes_[idx].order_ref.store(order_ref, std::memory_order_relaxed);
+        nodes_[idx].order.store(order, std::memory_order_relaxed);
+        nodes_[idx].bucket.store(b, std::memory_order_relaxed);
         // 链头 CAS 前重查状态: treeify 可能在 allocNode 期间启动(0→1), 读到则重试进 map。
         if (state_[b].load(std::memory_order_acquire)) {
             freeNode(idx);   // 归还节点(不落链)
@@ -126,9 +126,9 @@ public:
     retry:
         uint32_t idx = buckets_[b].load(std::memory_order_acquire);
         while (idx != UINT32_MAX) {
-            if (nodes_[idx].bucket != b) goto retry;   // 跳到别的桶 → 重试
-            if (nodes_[idx].order_ref == order_ref)
-                return nodes_[idx].order;
+            if (nodes_[idx].bucket.load(std::memory_order_relaxed) != b) goto retry;   // 跳到别的桶 → 重试
+            if (nodes_[idx].order_ref.load(std::memory_order_relaxed) == order_ref)
+                return nodes_[idx].order.load(std::memory_order_relaxed);
             idx = nodes_[idx].next_idx.load(std::memory_order_relaxed);
         }
         return nullptr;   // 正常走到链尾 → 真不存在
@@ -151,12 +151,12 @@ public:
         uint32_t idx = buckets_[b].load(std::memory_order_acquire);
         if (idx == UINT32_MAX) return;
 
-        if (nodes_[idx].order_ref == order_ref) {   // 链头
+        if (nodes_[idx].order_ref.load(std::memory_order_relaxed) == order_ref) {   // 链头
             // CAS 桶头跳过本节点。失败 → 其他 worker 改了链头, idx 更新为新链头。
             uint32_t nxt = nodes_[idx].next_idx.load(std::memory_order_relaxed);
             while (!buckets_[b].compare_exchange_weak(idx, nxt,
                         std::memory_order_release, std::memory_order_acquire)) {
-                if (nodes_[idx].order_ref != order_ref) goto retry;  // 新链头非 K → K 在链中, 重找
+                if (nodes_[idx].order_ref.load(std::memory_order_relaxed) != order_ref) goto retry;  // 新链头非 K → K 在链中, 重找
                 nxt = nodes_[idx].next_idx.load(std::memory_order_relaxed);
             }
             freeNode(idx);
@@ -170,10 +170,10 @@ public:
         //   读到 bucket≠b 的前驱 = 已被复用跳桶 → 重试。CAS 返回值是唯一权威(不靠
         //   re-read 判相等, 那正是 ABA 来源)。
         while (idx != UINT32_MAX) {
-            if (nodes_[idx].bucket != b) goto retry;   // 前驱被复用跳桶 → 重找
+            if (nodes_[idx].bucket.load(std::memory_order_relaxed) != b) goto retry;   // 前驱被复用跳桶 → 重找
             uint32_t next = nodes_[idx].next_idx.load(std::memory_order_relaxed);
             if (next == UINT32_MAX) return;            // K 不在此链(极端, 重试兜底)
-            if (nodes_[next].order_ref == order_ref) {
+            if (nodes_[next].order_ref.load(std::memory_order_relaxed) == order_ref) {
                 uint32_t nxt2 = nodes_[next].next_idx.load(std::memory_order_relaxed);
                 // CAS 前驱 next: idx→next 改为 idx→nxt2 (跳过本节点)。
                 if (nodes_[idx].next_idx.compare_exchange_weak(
@@ -228,14 +228,16 @@ private:
     uint32_t allocNode() {
         // Treiber 无锁栈取节点(带 tag 消 ABA)。success = head 高32位(tag) 也匹配,
         // 节点被并发归还复用(栈头变过)时 tag 变化 → stale CAS 失败 → 重读重试。
-        uint64_t fh = free_head_.load(std::memory_order_relaxed);
+        // free_head_ 读用 acquire 与 freeNode 的 release 配对(节点复用 happens-before,
+        // 消除 TSAN 对节点字段复用的误判)。
+        uint64_t fh = free_head_.load(std::memory_order_acquire);
         while ((uint32_t)fh != UINT32_MAX) {
             uint32_t head = (uint32_t)fh;
             uint32_t next = nodes_[head].next_idx.load(std::memory_order_relaxed);
             uint64_t expected = fh;
             uint64_t desired = (((fh >> 32) + 1) << 32) | next;   // tag+1, idx=next
             if (free_head_.compare_exchange_weak(expected, desired,
-                    std::memory_order_release, std::memory_order_relaxed))
+                    std::memory_order_release, std::memory_order_acquire))
                 return head;
             fh = expected;   // CAS 失败, expected 已更新为实际栈头, 重试
         }
@@ -243,14 +245,14 @@ private:
     }
 
     void freeNode(uint32_t idx) {
-        uint64_t fh = free_head_.load(std::memory_order_relaxed);
+        uint64_t fh = free_head_.load(std::memory_order_acquire);
         for (;;) {
             uint32_t head = (uint32_t)fh;
             nodes_[idx].next_idx.store(head, std::memory_order_relaxed);
             uint64_t expected = fh;
             uint64_t desired = (((fh >> 32) + 1) << 32) | idx;   // tag+1, idx=idx
             if (free_head_.compare_exchange_weak(expected, desired,
-                    std::memory_order_release, std::memory_order_relaxed))
+                    std::memory_order_release, std::memory_order_acquire))
                 return;
             fh = expected;   // CAS 失败, 重读栈头重试
         }
@@ -269,7 +271,8 @@ private:
         std::lock_guard<std::mutex> lk(overflow_lock_);
         uint32_t cur = buckets_[b].load(std::memory_order_relaxed);
         while (cur != UINT32_MAX) {
-            overflow_[nodes_[cur].order_ref] = nodes_[cur].order;
+            overflow_[nodes_[cur].order_ref.load(std::memory_order_relaxed)] =
+                nodes_[cur].order.load(std::memory_order_relaxed);
             cur = nodes_[cur].next_idx.load(std::memory_order_relaxed);
         }
         state_[b].store(2, std::memory_order_release);

@@ -53,7 +53,6 @@ public:
         order.timestamp   = sig.timestamp;
 
         uint8_t buf[kOrderMsgLen];
-        bool use_sender = false;
         uint64_t id;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -63,22 +62,19 @@ public:
                 return id;
             }
             if (sender_) {
-                encode_order(order, buf);                 // 序列化待发
-                use_sender = true;
+                // 发送在锁内: IoUringSender 内部是 SPSCByteRing 非线程安全,
+                // 分簿后多 worker 并发 submit_signal → 锁内串行化 send。
+                // 下单频率万级, io_uring SQE 提交非阻塞, 锁内可接受。
+                encode_order(order, buf);
+                ssize_t r = sender_->send(buf, kOrderMsgLen);
+                if (r != (ssize_t)kOrderMsgLen)
+                    order_manager_.on_reject(id);         // 发送失败
+                // 发送成功：保持 PENDING，等交易所成交回报
             } else {
                 // 无 sender：进程内模拟成交(单测/无网络模式)
                 order_manager_.on_fill(id, qty);
                 risk_manager_.on_fill(order);
             }
-        }
-
-        if (use_sender) {
-            ssize_t r = sender_->send(buf, kOrderMsgLen);
-            if (r != (ssize_t)kOrderMsgLen) {
-                std::lock_guard<std::mutex> lk(mtx_);
-                order_manager_.on_reject(id);             // 发送失败
-            }
-            // 发送成功：保持 PENDING，等交易所成交回报
         }
         return id;
     }

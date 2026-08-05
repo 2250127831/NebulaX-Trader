@@ -36,12 +36,14 @@
 #include "strategy/tick/order_book_imbalance_strategy.h"
 #include "strategy/tick/order_flow_imbalance_strategy.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <thread>
-#include <chrono>
+#include <vector>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -53,6 +55,172 @@ static void usage(const char* prog) {
            "  --no-shm   不挂共享内存(压测脚本模式): 无握手, 运行 idle_timeout_sec 后退出\n",
            prog);
 }
+
+// ══ V2.1 分簿并行：单 book_th → N 个 book_worker（广播 + skip）══
+// 每 worker 一套订单簿/策略/信号槽 + 独立仲裁(决策5)，共享无锁 OrderPool/OrderMap
+// 与 ExecutionEngine(锁)。归属用全局注册表(locate → owner)，registry 即关心判定。
+
+// ── 信号槽: 各策略线程写, arbitrate() 读(跨线程原子) ──
+// 每个信号拆成 side/locate/strength/seq 原子, 避免整 Signal 非原子的竞争。
+// seq: 触发信号更新的成交 seq(unpacker 分配的唯一 seq), arbitrate 用它做 key 配对。
+struct SignalSlot {
+    alignas(64) std::atomic<OrderSide> side{OrderSide::NONE};
+    alignas(64) std::atomic<uint64_t> locate{0};
+    alignas(64) std::atomic<int64_t> strength{0};
+    alignas(64) std::atomic<uint64_t> seq{0};   // 成交 seq(贯穿线索)
+};
+
+// ── 全局注册表: locate → owner worker ──
+// locate 是 ITCH 16-bit(0-65535) → 固定数组索引(比哈希还快)。registry 即关心判定,
+// 不需要 care_list: 每 worker pop 到事件查 owner, 不是自己就 skip。
+// 动态均衡: 新 locate 首次出现时由"先遇到它的 worker"代为注册到当前 cared_count 最小者
+// (最清闲), 之后固定 → 保序(一个 locate 只归一个 worker)。
+struct BookRegistry {
+    static constexpr uint32_t kNone = UINT32_MAX;
+    std::atomic<uint32_t> owner_[65536];   // locate → owner worker id
+
+    BookRegistry() {
+        for (auto& a : owner_) a.store(kNone, std::memory_order_relaxed);
+    }
+
+    uint32_t lookup_or_register(uint32_t locate, uint32_t my_id, uint32_t n,
+                                const std::atomic<uint64_t>* cared) {
+        uint32_t cur = owner_[locate].load(std::memory_order_acquire);
+        if (cur != kNone) return cur;
+        // 未注册: 选 cared_count 最小的 worker(最清闲) → CAS 写入。
+        // target 初始为 my_id: 启动期 cared_count 全 0(平局)时注册给自己,
+        // 每个 worker 把自己遇到的新 locate 收下 → 自然分散; 有 worker 超载后
+        // (cared 大)新 locate 才让给更清闲者。避免平局全堆 index 0。
+        uint32_t target = my_id;
+        for (uint32_t i = 0; i < n; ++i)
+            if (cared[i].load(std::memory_order_relaxed) <
+                cared[target].load(std::memory_order_relaxed)) target = i;
+        uint32_t expected = kNone;
+        if (owner_[locate].compare_exchange_strong(expected, target,
+                    std::memory_order_acq_rel, std::memory_order_relaxed))
+            return target;
+        return expected;   // 别人注册了(先到先得)
+    }
+};
+
+// 下单节奏(V1.5 定稿): 方向翻转 → 必下; 方向不变 → 强度相对上次下单跳变 ≥ 阈值才再下。
+static constexpr int64_t kStrengthStep = 500;   // 千分比定点(500 = 5% 满强度)
+
+// ── 单 book_worker: 自己的簿/策略/信号槽 + 独立仲裁 ──
+struct BookWorker {
+    OrderBookConsumer obc;                    // 自己关心的标的簿(共享池/索引)
+    OrderBookImbalanceStrategy obi;
+    OrderFlowImbalanceStrategy ofi;
+    SignalSlot sig_ofi, sig_obi;              // 自己标的的信号槽
+    std::atomic<OrderSide> last_order_side{OrderSide::NONE};
+    std::atomic<int64_t> last_order_str{-1};
+    size_t arb_sample_cnt = 0;                // 本线程私有, 非原子安全
+
+    // 运行上下文(init 绑定)
+    ExecutionEngine* ex = nullptr;
+    RiskManager* rm = nullptr;
+    const Config* cfg = nullptr;
+    std::atomic<size_t>* trade_count = nullptr;
+    std::atomic<size_t>* book_events = nullptr;
+
+    explicit BookWorker(OrderPool& pool, OrderMap& idx) : obc(pool, idx) {}
+
+    void init(ExecutionEngine* e, RiskManager* r, const Config* c,
+              std::atomic<size_t>* tc, std::atomic<size_t>* be) {
+        ex = e; rm = r; cfg = c; trade_count = tc; book_events = be;
+    }
+
+    // 统一仲裁: 读本 worker 两信号槽, 同向才下。独立仲裁 → 时序天然正确(决策5)。
+    // 下单节奏: 方向翻转必下; 方向不变仅强度跳变 ≥ 阈值才下(last_order_str 是
+    // 上次下单时强度, 保证"强→弱"不回补)。
+    void arbitrate() {
+        // [LensX 级别3] 仲裁函数起点/终点: 抽中才打(同一次调用内局部变量保证成对)。
+        bool arb_sample = (arb_sample_cnt++ % lensx::kSample == 0);
+        if (arb_sample) lensx::mark_arb_start();
+        OrderSide so = sig_ofi.side.load(std::memory_order_acquire);
+        OrderSide sb = sig_obi.side.load(std::memory_order_acquire);
+        // 仲裁: 两信号同向才下(OFI/OBI)。V1.5 删 TD 后仲裁即两信号。
+        bool ok = (so != OrderSide::NONE && so == sb);
+        if (ok) {
+            // 用 OFI 方向(方向一致时任一方向都成立, 取 OFI)
+            uint64_t locate = sig_ofi.locate.load(std::memory_order_acquire);
+            int64_t strength = sig_ofi.strength.load(std::memory_order_acquire);
+            uint64_t pos = rm->position(locate);
+            bool blocked = (so == OrderSide::BUY && pos >= cfg->risk.max_position) ||
+                           (so == OrderSide::SELL && pos == 0);
+            // 下单触发(强度阈值触发): 方向翻转必下; 方向不变仅强度跳变 ≥ 阈值才下。
+            int64_t last_str = last_order_str.load();
+            bool fresh_dir  = (so != last_order_side.load());
+            bool strength_ge = (strength >= last_str + kStrengthStep);
+            if (!blocked && (fresh_dir || strength_ge)) {
+                // [LensX 级别4] 下单决策→执行完毕(key=sig_ofi.seq 信号触发seq, 抽样)。
+                // 抽样判断在调用点(抽中才调), 避免 uprobe 每次命中拖垮吞吐。
+                uint64_t order_seq = sig_ofi.seq.load(std::memory_order_acquire);
+                if (order_seq % lensx::kSample == 0) lensx::mark_order_start(order_seq);
+                Signal decision{.side = so, .locate = locate,
+                                .price = 0, .timestamp = 0, .strength = strength};
+                uint64_t oid = ex->submit_signal(decision, 1);
+                if (oid != 0) {
+                    last_order_side.store(so);
+                    last_order_str.store(strength);
+                }
+                if (order_seq % lensx::kSample == 0) lensx::mark_order_end(order_seq);
+            }
+        }
+        if (arb_sample) lensx::mark_arb_end();
+    }
+
+    // 处理一个归属本 worker 的事件: 重建簿 → OFI/OBI 信号 → 仲裁下单。
+    void process(const MarketEvent& ev) {
+        // [LensX 消息级] 完整链路终点。每条消息仅 owner worker 打一次
+        // (抽样配对 alloc→pop 1:1, 勿在每个 worker 的 pop 处都打)。
+        if (ev.seq_id % lensx::kSample == 0) lensx::mark_pop(ev.seq_id);
+        bool is_trade = (ev.type == MarketEvent::Type::TRADE ||
+                         ev.type == MarketEvent::Type::EXECUTE);
+        if (is_trade) trade_count->fetch_add(1, std::memory_order_relaxed);
+        obc.on_event(ev);
+        book_events->fetch_add(1, std::memory_order_relaxed);
+        const OrderBook* book = obc.book(ev.locate);
+        // 方向：A/U 自带 side；D/X/E 查簿
+        OrderSide side = OrderSide::NONE;
+        if (ev.type == MarketEvent::Type::ADD ||
+            ev.type == MarketEvent::Type::REPLACE) {
+            side = ev.order.side;
+        } else if (book) {
+            if (ev.type == MarketEvent::Type::TRADE ||
+                ev.type == MarketEvent::Type::EXECUTE)
+                side = book->side_of(ev.trade.order_ref);
+            else
+                side = book->side_of(ev.order.order_ref);
+        }
+        if (side != OrderSide::NONE && cfg->strategy.use_ofi) {
+            ofi.on_event(ev, side);
+            if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
+                ofi.set_last_price((book->best_bid() + book->best_ask()) / 2);
+        }
+        if (book && cfg->strategy.use_obi) {
+            obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
+                        book->best_ask(), book->best_ask_volume(), ev.timestamp);
+        }
+
+        // 更新信号槽(arbitrate 读): OFI/OBI 信号 → 原子槽, 带触发 seq
+        if (cfg->strategy.use_ofi) {
+            Signal s = ofi.signal();
+            sig_ofi.side.store(s.side, std::memory_order_release);
+            sig_ofi.locate.store(s.locate, std::memory_order_release);
+            sig_ofi.strength.store(s.strength, std::memory_order_release);
+            sig_ofi.seq.store(ev.seq_id, std::memory_order_release);
+        }
+        if (cfg->strategy.use_obi) {
+            Signal s = obi.signal();
+            sig_obi.side.store(s.side, std::memory_order_release);
+            sig_obi.locate.store(s.locate, std::memory_order_release);
+            sig_obi.strength.store(s.strength, std::memory_order_release);
+            sig_obi.seq.store(ev.seq_id, std::memory_order_release);
+        }
+        arbitrate();   // 写完 OFI/OBI 信号, 检查是否齐 → 仲裁下单
+    }
+};
 
 int main(int argc, char* argv[]) {
     // ── 解析参数 + 加载配置 ──
@@ -105,35 +273,29 @@ int main(int argc, char* argv[]) {
                                           ring_buf.get(), cfg.market.ring_bytes);
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
-    // 单通道: 全部事件(成交+委托)进同一队列, SPMC 广播(当前单消费者 = book_th)。
-    // 同一序列 → 订单簿时序正确(成交不会先于对应委托处理)。
-    // V1.5 删 TradeDirection 后消费者降为 1; V2.1 分簿并行将回到 N 个 book_worker。
+    // 单通道: 全部事件(成交+委托)进同一队列, SPMC 广播(N 个 book_worker 分簿并行)。
+    // 同一序列 + 一个 locate 只归一个 worker → 订单簿时序正确(成交不先于对应委托)。
+    const size_t nworkers = std::max<size_t>(1, cfg.order_book.workers);
     auto* chan_slots = new MarketEvent[cfg.market.chan_slots];
     size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                          chan_slots, cfg.market.chan_slots, 1);
+                                          chan_slots, cfg.market.chan_slots, nworkers);
     auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
     MoldUdpUnpacker unpacker(shared_ring);
     ByteRingParser parser(shared_ring, channel);
 
-    // ── 高频策略(订单簿侧): 共享挂单池 + 共享索引(主线程全局, 所有订单簿引用) ──
-    // 独立信号 + 统一仲裁: OFI(逐笔委托) + OBI(盘口) 各产信号,
-    // arbitrate() 读两信号槽, 同向才下单。TD(V1.5 删)后两信号即全量信号。
+    // ── 分簿并行: 共享无锁挂单池/索引 + N 个 book_worker ──
+    // 共享 OrderPool/OrderMap 无锁(V2.1 前置), 跨 worker 同桶安全; 同一 locate 只归
+    // 一个 worker → 同 key 串行。每 worker 一套簿/策略/信号槽, 独立仲裁(决策5)。
     OrderPool shared_pool(cfg.order_book.pool_slots);
     OrderMap  shared_index(cfg.order_book.pool_slots);
-    OrderBookConsumer obc(shared_pool, shared_index);
-    OrderBookImbalanceStrategy obi;
-    OrderFlowImbalanceStrategy ofi;
-
-    // ── 信号槽: 各策略线程写, arbitrate() 读(跨线程原子) ──
-    // 每个信号拆成 side/locate/strength/seq 原子, 避免整 Signal 非原子的竞争。
-    // seq: 触发信号更新的成交 seq(unpacker 分配的唯一 seq), arbitrate 用它做 key 配对。
-    struct SignalSlot {
-        alignas(64) std::atomic<OrderSide> side{OrderSide::NONE};
-        alignas(64) std::atomic<uint64_t> locate{0};
-        alignas(64) std::atomic<int64_t> strength{0};
-        alignas(64) std::atomic<uint64_t> seq{0};   // 成交 seq(贯穿线索)
-    } sig_ofi, sig_obi;   // OFI/OBI(book_th 写)
+    // BookWorker 含引用成员(OrderBookConsumer)不可移动 → unique_ptr 规避 vector 重分配。
+    std::vector<std::unique_ptr<BookWorker>> bws;
+    bws.reserve(nworkers);
+    for (size_t i = 0; i < nworkers; ++i)
+        bws.emplace_back(std::make_unique<BookWorker>(shared_pool, shared_index));
+    std::vector<std::atomic<uint64_t>> cared_counts(nworkers);  // 每 worker 处理事件数(均衡依据)
+    BookRegistry registry;
 
     // ── 交易侧：风控 + OMS + 执行引擎 ──
     OrderManager om;
@@ -149,58 +311,6 @@ int main(int argc, char* argv[]) {
         "127.0.0.1", cfg.execution.order_port, order_send_ring.get(), 1 << 20);
     if (!order_sender->start()) { printf("订单发送端启动失败\n"); return 1; }
     ex.set_sender(order_sender.get());
-
-    // ── 统一仲裁(共享函数): 读两信号槽, 同向才下 ──
-    // 谁写信号谁调用(写完检查信号是否齐全, 齐则仲裁下单)。
-    // 无定时器无独立线程——信号一更新同步仲裁。
-    // 下单节奏(V1.5 定稿): 方向翻转 → 必下; 方向不变 → 强度相对上次下单跳变 ≥ 阈值才再下。
-    //   既不在牛市只下一单(强度爬坡会继续加仓), 又过滤 OFI 窗口的微抖动(强度小波动不触发)。
-    //   kStrengthStep: 强度跳变阈值, 千分比定点(500 = 5% 满强度)。
-    std::atomic<OrderSide> last_order_side{OrderSide::NONE};
-    std::atomic<int64_t> last_order_str{-1};
-    constexpr int64_t kStrengthStep = 500;
-    // 仲裁抽样计数器: 抽中(kSample 的倍数)才调探针函数。uprobe 挂在函数入口,
-    // 只要调用就命中——抽样判断必须在调用点(跳过调用), 不能放函数内部。
-    size_t arb_sample_cnt = 0;
-    auto arbitrate = [&]() {
-        // [LensX 级别3] 仲裁函数起点/终点: 抽中才打(同一次调用内局部变量保证成对)。
-        // 全采样(每次调用都打, ~8.7M/s)实测拖垮吞吐(5M→1.35M)。
-        bool arb_sample = (arb_sample_cnt++ % lensx::kSample == 0);
-        if (arb_sample) lensx::mark_arb_start();
-        OrderSide so = sig_ofi.side.load(std::memory_order_acquire);
-        OrderSide sb = sig_obi.side.load(std::memory_order_acquire);
-        // 仲裁: 两信号同向才下(OFI/OBI)。V1.5 删 TD 后仲裁即两信号。
-        bool ok = (so != OrderSide::NONE && so == sb);
-        if (ok) {
-            // 用 OFI 方向(方向一致时任一方向都成立, 取 OFI)
-            uint64_t locate = sig_ofi.locate.load(std::memory_order_acquire);
-            int64_t strength = sig_ofi.strength.load(std::memory_order_acquire);
-            uint64_t pos = rm.position(locate);
-            bool blocked = (so == OrderSide::BUY && pos >= cfg.risk.max_position) ||
-                           (so == OrderSide::SELL && pos == 0);
-            // 下单触发(强度阈值触发): 方向翻转必下; 方向不变仅强度跳变 ≥ 阈值才下。
-            //   last_order_str 是上次下单时的强度(非本次), 保证"强→弱"不回补(守成)。
-            int64_t last_str = last_order_str.load();
-            bool fresh_dir  = (so != last_order_side.load());
-            bool strength_ge = (strength >= last_str + kStrengthStep);
-            if (!blocked && (fresh_dir || strength_ge)) {
-                // [LensX 级别4] 下单决策→执行完毕(key=sig_ofi.seq 信号触发seq, 抽样)。
-                // 起点/终点都在决策块, send 或被拒都是终点状态 → 成对无残留。
-                // 抽样判断在调用点(抽中才调), 避免 uprobe 每次命中拖垮吞吐。
-                uint64_t order_seq = sig_ofi.seq.load(std::memory_order_acquire);
-                if (order_seq % lensx::kSample == 0) lensx::mark_order_start(order_seq);
-                Signal decision{.side = so, .locate = locate,
-                                .price = 0, .timestamp = 0, .strength = strength};
-                uint64_t oid = ex.submit_signal(decision, 1);
-                if (oid != 0) {
-                    last_order_side.store(so);
-                    last_order_str.store(strength);
-                }
-                if (order_seq % lensx::kSample == 0) lensx::mark_order_end(order_seq);
-            }
-        }
-        if (arb_sample) lensx::mark_arb_end();
-    };
 
     // 成交回报接收端（← 模拟交易所）
     auto fill_rcv = std::make_unique<IoUringReceiver>(cfg.execution.order_ret_port);
@@ -248,75 +358,41 @@ int main(int argc, char* argv[]) {
         parse_done.store(true, std::memory_order_release);
     });
 
-    // ── 订单簿线程(consumer 0): 单通道全部事件 → 订单簿重建 → OFI/OBI 信号 → 写信号槽 ──
-    std::thread book_th([&]() {
-        MarketEvent ev;
-        // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
-        // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
-        // 平衡高频吞吐(不牺牲)与空闲省CPU(不空转)。
-        int spin_left = 0;   // 剩余自旋次数(每空一轮减一, 耗完才阻塞)
-        while (!parse_done.load(std::memory_order_acquire) || channel.pending(0) > 0) {
-            if (channel.pending(0) == 0) {
-                if (!parse_done.load(std::memory_order_acquire)) {
-                    if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
-                    spin_left = kSpinMax;
-                    channel.wait_for_data(0);   // 持续空: 广播唤醒, 自己的 fd 无限阻塞
-                    continue;
+    // ── 分簿 book_worker 线程: 广播 + skip, 每 worker 只处理归属自己的 locate ──
+    for (size_t i = 0; i < nworkers; ++i)
+        bws[i]->init(&ex, &rm, &cfg, &trade_count, &book_events);
+    std::vector<std::thread> worker_th;
+    worker_th.reserve(nworkers);
+    for (size_t i = 0; i < nworkers; ++i) {
+        worker_th.emplace_back([&, i]() {
+            MarketEvent ev;
+            // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
+            // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
+            int spin_left = 0;   // 剩余自旋次数(每空一轮减一, 耗完才阻塞)
+            while (!parse_done.load(std::memory_order_acquire) || channel.pending(i) > 0) {
+                if (channel.pending(i) == 0) {
+                    if (!parse_done.load(std::memory_order_acquire)) {
+                        if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
+                        spin_left = kSpinMax;
+                        channel.wait_for_data(i);   // 持续空: 广播唤醒, 自己的 fd 无限阻塞
+                        continue;
+                    }
+                    break;
                 }
-                break;
+                spin_left = kSpinMax;   // 有数据: 重置自旋预算
+                while (channel.pop(i, ev)) {
+                    // 关心判定: 查注册表(首次出现注册给最清闲/平局归自己), 非本簿 → skip。
+                    // skip 也推进 pop 进度(广播 + skip 模型), 不处理不打探针。
+                    uint32_t owner = registry.lookup_or_register(
+                        static_cast<uint32_t>(ev.locate), static_cast<uint32_t>(i),
+                        static_cast<uint32_t>(nworkers), cared_counts.data());
+                    if (owner != i) continue;   // 非本簿: skip
+                    cared_counts[i].fetch_add(1, std::memory_order_relaxed);
+                    bws[i]->process(ev);        // 重建簿 → OFI/OBI 信号 → 独立仲裁
+                }
             }
-            spin_left = kSpinMax;   // 有数据: 重置自旋预算
-            while (channel.pop(0, ev)) {
-                // [LensX 消息级] SPMC pop 出(完整链路终点)。抽样与 alloc 侧一致:
-                // ev.seq_id % kSample == 0, 同一消息在两侧都打, key 配对。
-                if (ev.seq_id % lensx::kSample == 0) lensx::mark_pop(ev.seq_id);
-                bool is_trade = (ev.type == MarketEvent::Type::TRADE ||
-                                 ev.type == MarketEvent::Type::EXECUTE);
-                if (is_trade) ++trade_count;
-                obc.on_event(ev);
-                ++book_events;
-                const OrderBook* book = obc.book(ev.locate);
-                // 方向：A/U 自带 side；D/X/E 查簿
-                OrderSide side = OrderSide::NONE;
-                if (ev.type == MarketEvent::Type::ADD ||
-                    ev.type == MarketEvent::Type::REPLACE) {
-                    side = ev.order.side;
-                } else if (book) {
-                    if (ev.type == MarketEvent::Type::TRADE ||
-                        ev.type == MarketEvent::Type::EXECUTE)
-                        side = book->side_of(ev.trade.order_ref);
-                    else
-                        side = book->side_of(ev.order.order_ref);
-                }
-                if (side != OrderSide::NONE && cfg.strategy.use_ofi) {
-                    ofi.on_event(ev, side);
-                    if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
-                        ofi.set_last_price((book->best_bid() + book->best_ask()) / 2);
-                }
-                if (book && cfg.strategy.use_obi) {
-                    obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
-                                book->best_ask(), book->best_ask_volume(), ev.timestamp);
-                }
-
-                // 更新信号槽(arbitrate 读): OFI/OBI 信号 → 原子槽, 带触发 seq
-                if (cfg.strategy.use_ofi) {
-                    Signal s = ofi.signal();
-                    sig_ofi.side.store(s.side, std::memory_order_release);
-                    sig_ofi.locate.store(s.locate, std::memory_order_release);
-                    sig_ofi.strength.store(s.strength, std::memory_order_release);
-                    sig_ofi.seq.store(ev.seq_id, std::memory_order_release);
-                }
-                if (cfg.strategy.use_obi) {
-                    Signal s = obi.signal();
-                    sig_obi.side.store(s.side, std::memory_order_release);
-                    sig_obi.locate.store(s.locate, std::memory_order_release);
-                    sig_obi.strength.store(s.strength, std::memory_order_release);
-                    sig_obi.seq.store(ev.seq_id, std::memory_order_release);
-                }
-                arbitrate();   // 写完 OFI/OBI 信号, 检查是否齐 → 仲裁下单
-            }
-        }
-    });
+        });
+    }
 
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
@@ -406,8 +482,8 @@ int main(int argc, char* argv[]) {
     recv_th.join();
     parser.notify();
     parse_th.join();
-    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的消费者(book_th)
-    book_th.join();
+    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的所有 book_worker
+    for (auto& t : worker_th) t.join();
     fill_stop.store(true, std::memory_order_release);
     fill_rcv->stop();
     fill_th.join();
@@ -417,20 +493,21 @@ int main(int argc, char* argv[]) {
 
     // ── 汇总 ──
     printf("\n=== 运行汇总 ===\n");
-    printf("成交事件:   %zu  单通道丢=%llu\n", trade_count.load(), (unsigned long long)parser.drops_a());
-    printf("事件处理:   %zu  单通道丢=%llu\n", book_events.load(), (unsigned long long)parser.drops_b());
-    if (cfg.strategy.use_ofi)
-        printf("OFI 累计:   %lld  信号=%d\n",
-               (long long)ofi.ofi(), (int)ofi.signal().side);
-    if (cfg.strategy.use_obi)
-        printf("OBI 信号:   %d\n", (int)obi.signal().side);
+    printf("成交事件:   %zu\n", trade_count.load());
+    printf("事件处理:   %zu  (book_workers=%zu)\n", book_events.load(), nworkers);
+    for (size_t i = 0; i < nworkers; ++i)
+        printf("  worker%zu: 处理=%llu  OFI=%lld信号=%d  OBI信号=%d\n",
+               i, (unsigned long long)cared_counts[i].load(),
+               (long long)bws[i]->ofi.ofi(), (int)bws[i]->ofi.signal().side,
+               (int)bws[i]->obi.signal().side);
     printf("订单:       %zu  成交=%zu 风控拒=%zu\n",
            om.order_count(),
            om.count_by_status(OrderStatus::FILLED),
            om.count_by_status(OrderStatus::REJECTED));
-    printf("持仓:       %llu  已实现盈亏=%lld 分\n",
-           (unsigned long long)rm.position(ofi.signal().locate),
-           (long long)rm.realized_pnl());
+    printf("持仓(各worker信号标的):");
+    for (size_t i = 0; i < nworkers; ++i)
+        printf(" w%zu=%llu", i, (unsigned long long)rm.position(bws[i]->ofi.signal().locate));
+    printf("  已实现盈亏=%lld 分\n", (long long)rm.realized_pnl());
 
     delete[] chan_slots;
     if (fc) munmap(fc, sizeof(FlowControl));

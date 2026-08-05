@@ -44,7 +44,8 @@ public:
     // uint64_t: 完整消息序号不回绕(之前 uint16_t 在 873 万条下回绕 133 次)。
     bool feed(const uint8_t* msg, size_t len, uint64_t seq);
 
-    uint64_t message_count() const { return msg_count_; }
+    // 原子: parse_th 线程 ++, 主线程 idle 监测循环读(跨线程无锁)
+    uint64_t message_count() const { return msg_count_.load(std::memory_order_relaxed); }
 
 private:
     // ITCH int32 价格 → 内部定点（分）
@@ -70,6 +71,6 @@ private:
     }
 
     Sink sink_;
-    uint64_t msg_count_ = 0;
+    std::atomic<uint64_t> msg_count_ = 0;
     uint64_t cur_seq_ = 0;   // 当前消息序号（feed 带 seq 时设置, 64 位不回绕）
 };

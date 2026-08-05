@@ -22,6 +22,7 @@ Config ConfigLoader::load(const std::string& path) {
     if (auto n = root["order_book"]) {
         if (n["enabled"])     cfg.order_book.enabled    = n["enabled"].as<bool>();
         if (n["pool_slots"])  cfg.order_book.pool_slots = n["pool_slots"].as<size_t>();
+        if (n["workers"])     cfg.order_book.workers    = n["workers"].as<size_t>();
     }
 
     // strategy

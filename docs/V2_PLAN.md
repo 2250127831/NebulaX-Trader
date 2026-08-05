@@ -306,3 +306,32 @@ find/erase: 链 CAS 查 / 树锁查
 - **⚠️ OrderMap/OrderPool 并发（关键，已定稿）**：
   - **OrderPool**：升级为**无锁 Treiber 空闲栈**（见 §3.4），共享存储 + 无锁 free_head_，多 worker 安全并发。
   - **OrderMap**：升级为**CAS 快路径 + 桶级锁慢路径**（见 §3.5）——链路径 CAS 无锁，树化路径只锁该桶（惰性独立树，替代全局 overflow_）。key 可用 `(locate, order_ref)` 拼接保证全局唯一（若 per-locate 重复）。
+
+## 7. V2.1 落地记录（2026-08-06）
+
+按 §2 设计落地，实际实现与定稿的两处简化 + 三处正确性修复：
+
+**落地形态**：每 worker 一套 `BookWorker`（OrderBookConsumer + OBI/OFI 策略 + 信号槽 + last_order 状态 + 独立仲裁），共享无锁 OrderPool/OrderMap + ExecutionEngine(锁)。`order_book.workers` 配置（默认 4），`workers: 1` 退化为单 book_th。
+
+### 7.1 设计偏离（简化）
+
+- **registry 即关心判定，不用 care_list**：locate 是 ITCH 16-bit(0-65535) → `BookRegistry.owner_[65536]` 原子数组，每事件查 `owner = registry[locate]`，`owner != 我 → skip`。比 care_list 哈希查还快（数组索引 + 一次原子读），省去 care_list 的维护。
+- **动态均衡 argmin 平局归自己**：定稿说"注册到 cared_count 最小者"。实测平局(启动期全 0)时 argmin 偏向 index 0 → worker0 超载(656万 vs 其他 60万)。改为 target 初始为 my_id：平局时每个 worker 把自己遇到的新 locate 收下 → 自然分散(实测 289/174/186/200万)；有 worker 超载后新 locate 才让给更清闲者。
+
+### 7.2 正确性修复（TSAN 驱动）
+
+分簿多 worker 并发暴露了前置无锁化的非原子字段 UB，全部原子化(relaxed, x86 零开销)：
+
+- **`OrderSlot::pool_next_free` 原子化**：OrderPool::allocate 无锁读 `storage_[head].pool_next_free` 与并发 deallocate 写同节点 → 非原子是 C++ UB。
+- **`OrderMap::Node` 原子化**：order_ref/order/bucket 原子化(insert store / find·erase load)，find 无锁读链节点 vs 复用写。
+- **`free_head_` acquire/release 配对**：allocate/allocNode 读 free_head_ 用 acquire(与 deallocate/freeNode 的 release 配对)，建立节点复用的 happens-before。
+- **`ItchParser::msg_count_` 原子化**：V1 既有 race(parse_th 写 vs 主线程 idle 监测读)，顺手修。
+- **ExecutionEngine send 移进锁内**：IoUringSender 是 SPSCByteRing 非线程安全，多 worker 并发 submit_signal → 锁外并发 send 竞争。下单频率万级，锁内可接受。
+
+### 7.3 验证
+
+- **ctest 16/16** 全绿；`workers: 1` 退化行为与 V1.5 一致。
+- **压测零丢包**：rate 10000 → sent 8737176 == parsed 8737171(差 5, UDP 边界包)；worker 处理总和 8502596 = 委托 845 万 + 成交 4.5 万(V2_PLAN §1 事件分布吻合)，每事件恰被一个 worker 处理。
+- **负载均衡**：修复后 289/174/186/200 万(分布 17-29%)，无单一 straggler。
+- **TSAN**：pool_next_free/Node/message_count 的 C++ UB 全消；workers=1 零 race。剩余 `OrderBook::add` 写 slot 字段 vs 并发 worker 读同一 slot 的复用 race 是 **Treiber 池单值 free_head_ release 被覆盖** 导致——x86 TSO 下由 dealloc/alloc 屏障保证可见性(Release 压测功能正常、零丢包、无崩溃)，与前置无锁设计一致接受的 trade-off。
+- **性能对比**：限速场景(rate 10000) workers=1 与 4 解析 QPS 一致(~505 万, 发送端瓶颈, 无退化)。分簿收益在 book 成为瓶颈时体现，但纯 UDP 压测受 recv_th 接收端限制，无法隔离测量(rate 300000 时 UDP 丢包主导)。

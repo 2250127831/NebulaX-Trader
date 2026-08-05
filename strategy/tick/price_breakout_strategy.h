@@ -2,6 +2,7 @@
 
 #include "strategy/base/strategy.h"
 
+#include <algorithm>   // std::max_element/min_element (g++-12+ 不再传递包含, 需显式引入)
 #include <deque>
 
 // ── 价格突破策略 ──

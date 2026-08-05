@@ -20,5 +20,8 @@ Thumbs.db
 docs/benchmark/**/*.png
 
 # Test data (ITCH binaries, etc.)
-test_data/
+# 仅入库单元测试必需的小样本(CI 上编译后跑 ctest 需要)，压测大文件(itch_100mb*.bin)不进 git
+test_data/*
+!test_data/itch_parser_sample.bin
+!test_data/itch_chain_sample.bin
 trader_parsed.txt

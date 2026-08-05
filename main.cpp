@@ -48,7 +48,28 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <unistd.h>
+
+// ── 线程绑核 ──
+// V2.1 分簿并行的前提: N 个 worker + recv/parse 各占独立 P 核(避免内核调度器把
+// 并行线程随机撒在 24 核上互相抢核/和 parse 抢核, 污染延迟)。benchmark 绑 CPU3(低
+// 中断核), trader 线程避开 CPU0/1(P0 噪声)与 CPU3。
+// i9-12900HX: P 核 0-15(SMT 成对: 0/1, 2/3, 4/5...), E 核 16-23。热线程用奇数
+// P 核(5/7/9/11/13/15 = 6 个不同物理核的独立 SMT), 避免两热线程共享物理核。
+static void pin_cpu(int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+static const int kPinRecv    = 5;   // io_uring 收包(高吞吐)
+static const int kPinParse   = 7;   // 解析(高吞吐)
+static const int kPinWorker0 = 9;   // 4 个 worker 占独立 P 核
+static const int kPinWorker1 = 11;
+static const int kPinWorker2 = 13;
+static const int kPinWorker3 = 15;
+static const int kPinFill    = 16;  // 成交回报(低频, E 核够用)
 
 static void usage(const char* prog) {
     printf("Usage: %s [--config <path>] [--no-shm]\n"
@@ -334,6 +355,7 @@ int main(int argc, char* argv[]) {
 
     // ── 接收线程：recv → unpacker → received++ ──
     std::thread recv_th([&]() {
+        pin_cpu(kPinRecv);   // 绑独立 P 核, 避免被调度器挪走
         receiver->set_blocking(false);
         uint8_t pre[65536];
         receiver->recv(pre, sizeof(pre));
@@ -356,6 +378,7 @@ int main(int argc, char* argv[]) {
     // ── 解析线程：解析 ITCH → 单通道广播(方案A, 全部事件) ──
     // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。排空 ring 后置 parse_done。
     std::thread parse_th([&]() {
+        pin_cpu(kPinParse);   // 绑独立 P 核
         int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
         while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
             parser.parse_available();
@@ -375,6 +398,12 @@ int main(int argc, char* argv[]) {
     worker_th.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i) {
         worker_th.emplace_back([&, i]() {
+            // 每个 worker 绑独立 P 核(分簿并行的前提: 不绑核会被调度器随机撒核,
+            // 4 个 worker 互相抢核/和 parse 抢核 → 长尾被调度噪声污染)。
+            // i < 4 时用 9/11/13/15(奇数 P 核, 与 recv=5/parse=7 不共享物理核);
+            // workers>4 时退回内核调度(不绑核)。
+            constexpr int kPinWorkers[4] = {kPinWorker0, kPinWorker1, kPinWorker2, kPinWorker3};
+            if (i < 4) pin_cpu(kPinWorkers[i]);
             MarketEvent ev;
             // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
             // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
@@ -411,6 +440,7 @@ int main(int argc, char* argv[]) {
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
     std::thread fill_th([&]() {
+        pin_cpu(kPinFill);   // 低频, E 核够用, 不占 P 核
         fill_rcv->set_blocking(false);
         uint8_t pre[2048];
         fill_rcv->recv(pre, sizeof(pre));
@@ -429,6 +459,9 @@ int main(int argc, char* argv[]) {
 
     // ── 就绪 → 等回放客户端开始发数据 ──
     printf("接收端就绪，等待回放客户端...\n");
+    if (nworkers > 4)
+        printf("注意: workers=%zu>4, 超出预留 P 核(recv=5 parse=7 worker=9/11/13/15 fill=16), 额外 worker 未绑核\n",
+               nworkers);
     if (fc) fc->ready.store(true, std::memory_order_release);
 
     // 运行直到回放结束：

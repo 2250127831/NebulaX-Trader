@@ -87,7 +87,6 @@ add_library(strategy
     strategy/kline/kline_consumer.h
     strategy/tick/volume_breakout_strategy.h
     strategy/tick/price_breakout_strategy.h
-    strategy/tick/trade_direction_strategy.h
     strategy/tick/tick_momentum_strategy.h
     strategy/tick/order_book_imbalance_strategy.h
     strategy/tick/order_flow_imbalance_strategy.h

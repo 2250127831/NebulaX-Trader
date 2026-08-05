@@ -35,7 +35,6 @@
 #include "strategy/base/strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
 #include "strategy/tick/order_flow_imbalance_strategy.h"
-#include "strategy/tick/trade_direction_strategy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -106,26 +105,25 @@ int main(int argc, char* argv[]) {
                                           ring_buf.get(), cfg.market.ring_bytes);
     auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
-    // 单通道: 全部事件(成交+委托)进同一队列, 多消费者(SPMC 广播)。
-    // 消费者0 = book_th(订单簿+OFI/OBI+仲裁), 消费者1 = strategy_th(独立高频策略)。
+    // 单通道: 全部事件(成交+委托)进同一队列, SPMC 广播(当前单消费者 = book_th)。
     // 同一序列 → 订单簿时序正确(成交不会先于对应委托处理)。
+    // V1.5 删 TradeDirection 后消费者降为 1; V2.1 分簿并行将回到 N 个 book_worker。
     auto* chan_slots = new MarketEvent[cfg.market.chan_slots];
     size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                          chan_slots, cfg.market.chan_slots, 2);
+                                          chan_slots, cfg.market.chan_slots, 1);
     auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
     MoldUdpUnpacker unpacker(shared_ring);
     ByteRingParser parser(shared_ring, channel);
 
     // ── 高频策略(订单簿侧): 共享挂单池 + 共享索引(主线程全局, 所有订单簿引用) ──
-    // 独立信号 + 统一仲裁: OFI(逐笔委托) + OBI(盘口) + TradeDirection(成交) 各产信号,
-    // arbitrate() 读三信号槽, 同向才下单。
+    // 独立信号 + 统一仲裁: OFI(逐笔委托) + OBI(盘口) 各产信号,
+    // arbitrate() 读两信号槽, 同向才下单。TD(V1.5 删)后两信号即全量信号。
     OrderPool shared_pool(cfg.order_book.pool_slots);
     OrderMap  shared_index(cfg.order_book.pool_slots);
     OrderBookConsumer obc(shared_pool, shared_index);
     OrderBookImbalanceStrategy obi;
     OrderFlowImbalanceStrategy ofi;
-    TradeDirectionStrategy tds;   // 独立高频策略(消费成交, 不依赖订单簿)
 
     // ── 信号槽: 各策略线程写, arbitrate() 读(跨线程原子) ──
     // 每个信号拆成 side/locate/strength/seq 原子, 避免整 Signal 非原子的竞争。
@@ -135,7 +133,7 @@ int main(int argc, char* argv[]) {
         alignas(64) std::atomic<uint64_t> locate{0};
         alignas(64) std::atomic<int64_t> strength{0};
         alignas(64) std::atomic<uint64_t> seq{0};   // 成交 seq(贯穿线索)
-    } sig_ofi, sig_obi, sig_td;   // OFI/OBI(book_th 写) + TD(strategy_th 写)
+    } sig_ofi, sig_obi;   // OFI/OBI(book_th 写)
 
     // ── 交易侧：风控 + OMS + 执行引擎 ──
     OrderManager om;
@@ -152,9 +150,9 @@ int main(int argc, char* argv[]) {
     if (!order_sender->start()) { printf("订单发送端启动失败\n"); return 1; }
     ex.set_sender(order_sender.get());
 
-    // ── 统一仲裁(共享函数): 读三信号槽, 同向才下 ──
+    // ── 统一仲裁(共享函数): 读两信号槽, 同向才下 ──
     // 谁写信号谁调用(写完检查信号是否齐全, 齐则仲裁下单)。
-    // 无定时器无独立线程——信号一更新同步仲裁, TD 后写也能触发。
+    // 无定时器无独立线程——信号一更新同步仲裁。
     std::atomic<OrderSide> last_order_side{OrderSide::NONE};
     std::atomic<int64_t> last_order_str{-1};
     // 仲裁抽样计数器: 抽中(kSample 的倍数)才调探针函数。uprobe 挂在函数入口,
@@ -167,11 +165,8 @@ int main(int argc, char* argv[]) {
         if (arb_sample) lensx::mark_arb_start();
         OrderSide so = sig_ofi.side.load(std::memory_order_acquire);
         OrderSide sb = sig_obi.side.load(std::memory_order_acquire);
-        OrderSide st = sig_td.side.load(std::memory_order_acquire);
-        // 仲裁: TD 有方向时要求三同向; TD 无方向(NONE, E 多无主动方)退化为 OFI/OBI 两信号。
-        bool ok;
-        if (st != OrderSide::NONE) ok = (so != OrderSide::NONE && so == sb && so == st);
-        else                      ok = (so != OrderSide::NONE && so == sb);
+        // 仲裁: 两信号同向才下(OFI/OBI)。V1.5 删 TD 后仲裁即两信号。
+        bool ok = (so != OrderSide::NONE && so == sb);
         if (ok) {
             // 用 OFI 方向(方向一致时任一方向都成立, 取 OFI)
             uint64_t locate = sig_ofi.locate.load(std::memory_order_acquire);
@@ -227,7 +222,7 @@ int main(int argc, char* argv[]) {
     });
 
     // 消费者混合退避参数: 短暂空自旋顶住唤醒延迟, 持续空才 eventfd 阻塞。
-    // parse_th/strategy_th/book_th 共用(kSpinMax ~ 几十µs)。
+    // parse_th/book_th 共用(kSpinMax ~ 几十µs)。
     constexpr int kSpinMax = 2000;
 
     // ── 解析线程：解析 ITCH → 单通道广播(方案A, 全部事件) ──
@@ -243,37 +238,6 @@ int main(int argc, char* argv[]) {
         }
         parser.parse_available();   // 排空剩余
         parse_done.store(true, std::memory_order_release);
-    });
-
-    // ── 独立高频策略线程(consumer 1): 消费成交跑 TradeDirection, 产信号(不下单) ──
-    // 验证 SPMC 多消费者广播: 独立于 book_th 并行消费单通道成交, 不依赖订单簿。
-    std::thread strategy_th([&]() {
-        MarketEvent ev;
-        int spin_left = 0;
-        while (!parse_done.load(std::memory_order_acquire) || channel.pending(1) > 0) {
-            if (channel.pending(1) == 0) {
-                if (!parse_done.load(std::memory_order_acquire)) {
-                    if (spin_left > 0) { --spin_left; _mm_pause(); continue; }
-                    spin_left = kSpinMax;
-                    channel.wait_for_data(1);   // 广播唤醒, 自己的 fd 无限阻塞
-                    continue;
-                }
-                break;
-            }
-            spin_left = kSpinMax;
-            while (channel.pop(1, ev)) {
-                if (ev.type != MarketEvent::Type::TRADE &&
-                    ev.type != MarketEvent::Type::EXECUTE) continue;   // 只处理成交
-                tds.on_event(ev);   // TradeDirection: 独立信号(不依赖订单簿)
-                // 写信号槽, 检查是否齐 → 仲裁下单(TD 后写也能触发)
-                Signal s = tds.signal();
-                sig_td.side.store(s.side, std::memory_order_release);
-                sig_td.locate.store(s.locate, std::memory_order_release);
-                sig_td.strength.store(s.strength, std::memory_order_release);
-                sig_td.seq.store(ev.seq_id, std::memory_order_release);
-                arbitrate();
-            }
-        }
     });
 
     // ── 订单簿线程(consumer 0): 单通道全部事件 → 订单簿重建 → OFI/OBI 信号 → 写信号槽 ──
@@ -434,8 +398,7 @@ int main(int argc, char* argv[]) {
     recv_th.join();
     parser.notify();
     parse_th.join();
-    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的消费者(strategy_th/book_th)
-    strategy_th.join();
+    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的消费者(book_th)
     book_th.join();
     fill_stop.store(true, std::memory_order_release);
     fill_rcv->stop();

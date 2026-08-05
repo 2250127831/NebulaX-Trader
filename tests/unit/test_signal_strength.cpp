@@ -1,11 +1,10 @@
 // 策略信号强度单测
-// 验证 4 个 tick 策略 + 趋势/动量 的 Signal.strength 计算符合预期。
+// 验证 3 个 tick 策略 + 趋势/动量 的 Signal.strength 计算符合预期。
 // strength 语义: 万分比定点 [0, kStrengthScale]，满强度 = kStrengthScale。
 
 #include "strategy/base/strategy.h"
 #include "strategy/tick/volume_breakout_strategy.h"
 #include "strategy/tick/price_breakout_strategy.h"
-#include "strategy/tick/trade_direction_strategy.h"
 #include "strategy/tick/tick_momentum_strategy.h"
 #include "strategy/trend/trend_strategy.h"
 #include "strategy/momentum/momentum_strategy.h"
@@ -59,20 +58,6 @@ int main() {
     CHECK(s.side == OrderSide::BUY);
     CHECK(s.strength == (110 - 105) * Signal::kStrengthScale / 5);  // 满强度(幅度=波动)
     printf("价格突破强度: %lld\n", (long long)s.strength);
-
-    // ── 成交方向: 有方向满强度，E 消息(无方向) 0 ──
-    TradeDirectionStrategy tds;
-    tds.on_event(make_trade(3, 1, OrderSide::SELL, 5000, 10));
-    CHECK(tds.signal().side == OrderSide::SELL);
-    CHECK(tds.signal().strength == Signal::kStrengthScale);
-    MarketEvent e{};
-    e.type = MarketEvent::Type::EXECUTE;   // E 无方向(解析器填 side=NONE, price=-1)
-    e.locate = 3; e.timestamp = 2;
-    e.trade.side = OrderSide::NONE;
-    e.trade.price = -1;
-    tds.on_event(e);
-    CHECK(tds.signal().side == OrderSide::NONE);
-    CHECK(tds.signal().strength == 0);
 
     // ── tick 动量: window=4, threshold=10 ──
     TickMomentumStrategy tms(4, 10);

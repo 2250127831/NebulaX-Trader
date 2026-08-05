@@ -1,5 +1,5 @@
 // 端到端验证测试：benchmark 发送 MoldUDP64 + 接收端完整链路
-//   recv → 拆包加seq → 字节ring → ByteRingParser → 通道A → 4策略 + K线
+//   recv → 拆包加seq → 字节ring → ByteRingParser → 通道A → 3策略 + K线
 //
 // 验证:
 //   - benchmark 完整发送(子进程 exit 0)
@@ -23,7 +23,6 @@
 #include "strategy/combo/signal_combiner.h"
 #include "strategy/tick/price_breakout_strategy.h"
 #include "strategy/tick/tick_momentum_strategy.h"
-#include "strategy/tick/trade_direction_strategy.h"
 #include "strategy/tick/volume_breakout_strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
 #include "strategy/tick/order_flow_imbalance_strategy.h"
@@ -133,7 +132,6 @@ int main(int argc, char* argv[]) {
 
     VolumeBreakoutStrategy vbs;
     PriceBreakoutStrategy pbs;
-    TradeDirectionStrategy tds;
     TickMomentumStrategy tms;
     KLineAggregator kagg(0, 10);   // 按数量: 每 10 笔成交一根 K线(与时间无关, 回放小数据也成形)
     TrendStrategy trend;            // 低频主策略候选(趋势, 需长周期均线)
@@ -221,7 +219,7 @@ int main(int argc, char* argv[]) {
         parse_done.store(true, std::memory_order_release);
     });
 
-    // ── 策略线程: 从通道 A 收成交, 喂 4 策略 + K线 ──
+    // ── 策略线程: 从通道 A 收成交, 喂 3 策略 + K线 ──
     // 交易侧: 信号翻转时经执行引擎真发送(风控→OMS→模拟交易所→回报)
     std::thread strategy_th([&]() {
         MarketEvent ev;
@@ -231,7 +229,7 @@ int main(int argc, char* argv[]) {
             if (channel.pop(0, ev)) {
                 if (ev.type != MarketEvent::Type::TRADE &&
                     ev.type != MarketEvent::Type::EXECUTE) continue;   // skip 委托
-                vbs.on_event(ev); pbs.on_event(ev); tds.on_event(ev); tms.on_event(ev);
+                vbs.on_event(ev); pbs.on_event(ev); tms.on_event(ev);
                 kagg.on_trade(ev);      // 成交 → K线聚合
                 ++trade_count;
                 uint64_t l = last_seq.load();
@@ -412,9 +410,9 @@ int main(int argc, char* argv[]) {
     printf("解析消息数: %zu\n", parsed_total.load());
     printf("成交事件数: %zu\n", trade_count.load());
     printf("seq 连续:   %s\n", seq_contiguous.load() ? "yes" : "NO");
-    printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d OBI盘口=%d OFI订单流=%d (0=BUY 1=SELL 2=NONE)\n",
+    printf("策略信号:   成交量突破=%d 价格突破=%d 动量=%d OBI盘口=%d OFI订单流=%d (0=BUY 1=SELL 2=NONE)\n",
            (int)vbs.signal().side, (int)pbs.signal().side,
-           (int)tds.signal().side, (int)tms.signal().side,
+           (int)tms.signal().side,
            (int)obi.signal().side, (int)ofi.signal().side);
     combiner.set_primary(vbs.signal());
     combiner.add_slave(ofi.signal());

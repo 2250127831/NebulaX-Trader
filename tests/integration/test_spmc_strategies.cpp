@@ -7,7 +7,6 @@
 // 这验证 SPMC 的核心：一个事件被所有消费者各自读，各自进度，生产者按最慢限速。
 #include "core/queue/spmc_event_queue.h"
 #include "strategy/kline/kline_aggregator.h"
-#include "strategy/tick/trade_direction_strategy.h"
 #include "strategy/tick/volume_breakout_strategy.h"
 
 #include <cstdio>

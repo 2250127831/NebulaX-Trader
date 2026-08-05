@@ -171,6 +171,11 @@ int main(int argc, char* argv[]) {
            parsed_count.load(), expected_msgs, seq_contiguous.load());
     CHECK(parsed_count.load() == expected_msgs);
 
+    // 释放用户分配的队列存储(QueueManager 不拥有 buf)。
+    // 线程已 join, 队列不再访问 buffer; 静态析构发生在 main 返回后, 不触及此处。
+    delete[] ring_buf;
+    delete[] ev_slots;
+
     if (g_failures == 0) {
         printf("\nMoldUDP64 拆包管道集成测试 PASS ✓\n");
         return 0;

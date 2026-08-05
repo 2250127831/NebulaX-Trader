@@ -52,7 +52,10 @@ parse_th ──SPMC广播──▶  ├── book_worker1（关心列表 [D,E],
 
 **关键：一次只改一个变量（工程归因原则）**
 - **本版只加消费者**：SPMC 广播模型、parse_th、订单簿实现全部不变，只把单 book_th 拆成 N 个 worker（各 skip 非本簿事件）。
-- **下版（V3）升级队列为分片 SPMC**：不做多 SPSC——SPSC 需 parse_th 按 locate 路由分发（破坏广播 + skip 简单模型）；**分片 SPMC**（parse_th 广播全部事件，但按 locate 分片，每 worker pop 自己分片、免 skip）保留多消费者能力又消除全量 pop 浪费。
+- **下版（V3）升级为分发器 + 多条 SPSC**（V2.1 实测后修正，见下）：
+  - **旧方案「分片 SPMC」有内在矛盾**：SPMC 消费者推进进度是全量的，要 worker 只 pop 自己分片仍需读全部消息确认归属——skip 判定从查 registry 变成算 `locate%N`，**pop 成本不会降到 1/N**。V2.1 实测 worker 总 CPU 73% 中相当部分是 pop×4 固定成本，证实广播 + skip 的浪费真实存在。
+  - **新方案「分发器 + 多条 SPSC」**：parse_th 算 `locate%N` 把每条消息**只推入一个 worker 的专属 SPSC**。每 worker 只 pop 自己的分片，pop 成本降到 1/N。
+  - **为什么分簿场景下放弃广播**：分簿后每个事件只需一个 worker 处理，**广播本来就是浪费**（多策略广播在 TD 时代有意义，已删）。分发 + 多 SPSC 是分簿的正确最终形态。
 - **再下版**：订单簿缓存友好化（§3.1）等。
 - **理由**：一次改太多（如同时改队列 + 分簿 + 订单簿结构）无法区分哪个改动带来收益。
 
@@ -62,7 +65,7 @@ parse_th ──SPMC广播──▶  ├── book_worker1（关心列表 [D,E],
 |---|---|---|---|
 | 1 | 分簿归属 | **全局注册表 + 动态负载均衡**：每个 worker 维护关心列表；新 locate 首次出现时注册到"收到关心事件最少"的 worker（最清闲），之后固定归该 worker | 动态均衡优于静态哈希——静态 `locate % N` 可能把大标的堆到同一 worker；动态注册让新标的分布到清闲 worker |
 | 2 | 队列模型（本版） | **保持单通道 SPMC 广播不变** | 本版只加消费者，不改队列（归因原则） |
-| 3 | 队列模型（V3） | **分片 SPMC**（按 locate 分片，每 worker pop 自己分片，免 skip） | 不做多 SPSC（需路由分发，破坏广播 + skip 简单模型）；分片 SPMC 保留多消费者又免全量 pop |
+| 3 | 队列模型（V3） | **分发器 + 多条 SPSC**（parse_th 按 locate%N 分发，每 worker 只 pop 自己分片） | 分片 SPMC 有内在矛盾：SPMC 全量推进进度，worker 仍需读全部确认归属，pop 不降。分发 + 多 SPSC 真正把 pop 降到 1/N；分簿后无需广播 |
 | 4 | 时序保证 | **一个 locate 只注册到一个 worker，之后固定 → 保序** | 成交不先于对应委托（V1 方案A 时序保证延续） |
 | 5 | 仲裁形态 | **每 worker 独立仲裁**：处理自己的 locate、更新自己的信号、对自己的标的仲裁下单 | 时序天然正确（一个 locate 只归一个 worker）；不做全局共享仲裁（竞争 + 时序乱） |
 | 6 | OrderPool/OrderMap | 共享 OrderPool（无锁，§3.4）+ 共享 OrderMap（CAS 快路径 + 桶级锁，§3.5） | pool 无锁栈；map 链路径无锁、树化只锁桶 |
@@ -292,9 +295,9 @@ find/erase: 链 CAS 查 / 树锁查
 | **V2.2** | 订单簿缓存友好化（§3.1，std::map → 开地址哈希） | vs V2.1：数据结构收益 |
 | **V2.3** | 多解析器（§3.3） | vs V2.2：解析并行收益 |
 | **V2.4** | 网络层升级：多在途 recv（§3.6，单线程预提交多 SQE） | vs V2.3：分簿后吞吐上去，网络层是否成新瓶颈 |
-| **V3（下一阶段）** | 队列升级为**分片 SPMC**（按 locate 分片，每 worker pop 自己分片、免 skip） | vs V2.4：分片 SPMC 消除全量 pop 浪费 |
+| **V3（下一阶段）** | 队列升级为**分发器 + 多条 SPSC**（parse_th 按 locate%N 分发到专属 SPSC，每 worker 只 pop 自己分片） | vs V2.4：消除广播 + skip 的全量 pop 浪费（V2.1 实测 worker 总 CPU 73% 中 pop×4 是主要部分） |
 
-> **不做多 SPSC**：SPSC 需 parse_th 按 locate 路由分发（破坏广播 + skip 简单模型）；分片 SPMC 保留多消费者能力又免全量 pop。
+> **V2.1 实测修正（2026-08-06）**：原计划「分片 SPMC」有内在矛盾——SPMC 消费者推进进度是全量，worker 仍需读全部消息确认归属，pop 不降。改为**分发器 + 多条 SPSC**：parse_th 算 `locate%N` 每条消息只推入一个 worker 的专属 SPSC，每 worker 只 pop 自己的分片，pop 成本从 N× 降到 1×。分簿后每事件只需一个 worker，广播本是浪费，故放弃广播能力。
 
 > **本版（V2.1）只加消费者**：SPMC 广播模型、parse_th、订单簿结构全部不变，只把单 book_th 拆成 N 个 worker（各 skip 非本簿事件）。这样才能归因"分簿并行"本身的收益，不被队列/数据结构改动污染。
 
@@ -302,10 +305,48 @@ find/erase: 链 CAS 查 / 树锁查
 
 - **负载均衡**：测试数据 **2089 个 locate，事件分布极不均匀**（实测最大 35384 条 vs 中位 3 条）。**已定稿用全局注册表 + 动态负载均衡**（§2.5）——新 locate 注册到 cared_count_ 最小（最清闲）的 worker，替代静态 `locate % N`。
 - **仲裁形态（已定：每 worker 独立仲裁）**：每个 worker 处理自己的 locate、更新自己的 OFI/OBI、**对自己的标的仲裁下单**——时序天然正确（一个 locate 只归一个 worker，该 worker 的顺序即标的顺序），无跨 worker 竞争。**不做全局共享仲裁**（N worker 写同一信号槽会竞争 + 时序乱）。仲裁为两信号（OFI/OBI），TD 已删（§3.7）。
-- **worker 线程数**：广播 + skip 方案下队列仍是 1 个 SPMC（不增加队列/内存/eventfd），唯一成本是 **N 个线程** → N 取 CPU 核数/2 左右（避免线程争 CPU；V3 分片 SPMC 才涉及 N 队列的资源考量）
+- **worker 线程数**：广播 + skip 方案下队列仍是 1 个 SPMC（不增加队列/内存/eventfd），唯一成本是 **N 个线程** → N 取 CPU 核数/2 左右（避免线程争 CPU；V3 分发器 + 多 SPSC 才涉及 N 队列的资源考量，SPSC 每队列 1 个 eventfd + 独立缓冲）
 - **⚠️ OrderMap/OrderPool 并发（关键，已定稿）**：
   - **OrderPool**：升级为**无锁 Treiber 空闲栈**（见 §3.4），共享存储 + 无锁 free_head_，多 worker 安全并发。
   - **OrderMap**：升级为**CAS 快路径 + 桶级锁慢路径**（见 §3.5）——链路径 CAS 无锁，树化路径只锁该桶（惰性独立树，替代全局 overflow_）。key 可用 `(locate, order_ref)` 拼接保证全局唯一（若 per-locate 重复）。
+
+## 6.5 V3 设计：分发器 + 多条 SPSC（2026-08-06 定稿）
+
+**背景（V2.1 实测驱动）**：广播 + skip 下每个 worker pop 全部消息（V2.1 实测 worker 总 CPU 73% 中相当部分是 pop×4 固定成本，IPC 0.39 反映多核争抢）。分簿后每事件只需一个 worker，广播本是浪费。
+
+### 6.5.1 架构
+
+```
+parse_th 按 locate%N 算分片 → 每条消息只推入一个 worker 的专属 SPSC
+worker0 ←── SPSC0 (locate%N==0 的消息)
+worker1 ←── SPSC1 (locate%N==1)
+...
+每 worker 只 pop 自己的分片, pop 成本 1/N(非 N×)
+```
+
+### 6.5.2 分发算法
+
+- **静态 `locate % N`**：解析时算分片，O(1) 零状态。但只保证 locate 数均分，不保证事件量均分（V2.1 实测大 locate 35384 条 vs 中位 3 条）——与 §2.5 动态均衡的目标冲突。
+- **方案：注册表 + 分发映射**（复用 V2.1 `BookRegistry`）：locate → owner worker（动态注册，按 cared_count 均衡）→ parse_th 查表分发。把 §2.5 的"消费者侧 skip 判定"前移到"生产者侧路由"。
+- **保序**：一个 locate 只归一个 worker → 该 worker 顺序即标的顺序（与 V2.1 相同）。
+
+### 6.5.3 正确性
+
+- **SPSC 单写单读**：parse_th 是唯一写者（每条消息只推一个 SPSC），worker 是唯一读者 → 无竞争，SPSC 天然无锁。
+- **OrderPool/OrderMap 仍共享无锁**：worker 并发 alloc/dealloc 同一池/索引（V2.1 前置已无锁化），不受队列改造影响。
+- **背压**：SPSC 满时 parse_th 阻塞/自旋（单写者背压），不再有"最慢消费者拖累"（SPMC 特性），但快 worker 的 SPSC 空转。
+
+### 6.5.4 预期收益
+
+- **pop 成本 4× → 1×**：每 worker 只 pop 1/N 消息，72B 拷贝 + 进度推进省掉 3/4。
+- **IPC 提升**：消除共享 OrderMap/OrderPool 的多核争抢（分发后单 worker 处理自己分片，共享结构访问降 1/N）。
+- **吞吐**：parse_th 路由成本（哈希/查表 + push 到 N 队列之一）≈ 广播 push 成本，但 worker 侧省掉 N×pop → 吞吐可能突破 5.5M（受 recv_th 限制仍可能封顶）。
+- **代价**：N 个 SPSC 队列（N 个缓冲 + eventfd）；worker 负载不均时快 worker 空转。
+
+### 6.5.5 与 V2.1 的关系
+
+- V2.1 已定稿 registry（locate→owner 原子数组）+ 双键负载均衡。V3 只改**路由位置**（消费者 skip → 生产者分发），registry/均衡/仲裁/无锁池全部复用。
+- **一次只改一个变量**：V3 只动队列 + 路由，订单簿/策略/无锁池不动，才能归因"队列改造"的收益。
 
 ## 7. V2.1 落地记录（2026-08-06）
 

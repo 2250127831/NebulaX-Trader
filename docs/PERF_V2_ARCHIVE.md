@@ -18,7 +18,7 @@ recv_th(io_uring) → 字节ring → parse_th ──SPMC广播──▶ book_wor
 归属: BookRegistry(locate→owner 原子数组), 广播+skip, 每事件只被 owner 处理
 ```
 
-- **广播 + skip**：parse_th 单通道 SPMC 广播全部事件，每个 worker pop 全部（非本簿 skip 也算推进进度），只有归属 worker 处理。
+- **广播 + skip**：parse_th 单通道 SPMC 广播全部事件，每个 worker 都 pop 全部（非本簿 skip 也算推进进度），只有归属 worker 才真正处理。
 - **关键代价（本次测量揭示）**：N 个 worker 各 pop 全部消息 → **pop 成本 ×N**。V1 单 book_th pop 全部 + 处理全部；V2.1 每 worker pop 全部 + 处理 1/N。
 
 ## 1. 测量环境

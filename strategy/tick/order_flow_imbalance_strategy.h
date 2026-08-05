@@ -28,11 +28,18 @@
 //   之前无限累计导致信号一旦超阈值就恒为 BUY/SELL 永不回摆, 高频下单锁死。
 //   窗口化后信号随行情回摆, 方向能翻转, 高频下单才有意义。
 //
-// 强度：窗口 OFI 超出阈值的部分，万分比，封顶满强度。
+// 强度：窗口 OFI 超阈值后分段线性(净流越强强度越高, 到 kSaturate×threshold 封顶满)。
+//   连续化强度让"同方向强度爬坡"可被仲裁的强度阈值触发捕捉(牛市多次加仓);
+//   旧公式(超阈值即满)导致同向强度恒满, 强度触发退化为只方向翻转。
 class OrderFlowImbalanceStrategy : public Strategy {
 public:
     explicit OrderFlowImbalanceStrategy(int64_t threshold = 500)
         : threshold_(threshold) {}
+
+    // 强度饱和倍数: 窗口净流达到 kSaturate×threshold 时强度封顶满。
+    //   2 = 两倍阈值满强度。调大 → 强度更平缓(更多中间档, 触发更频繁);
+    //   调小 → 更快封顶(更少加仓)。5% 满强度为一档(kStrengthStep 在仲裁侧)。
+    static constexpr int64_t kSaturate = 2;
 
     // 消费一个通道事件。direction 由调用方从订单簿查得(仅 D/X/E 需要)。
     // A/U 事件自带 side，direction 传 side 即可。
@@ -68,15 +75,21 @@ public:
         ofi_ += delta;
         ++widx_;
 
-        // 信号：|窗口 OFI| 超阈值 → 方向；强度 = |OFI|/阈值 封顶
+        // 信号：|窗口 OFI| 超阈值 → 方向；强度 = 分段线性, 到 kSaturate×threshold 封顶满
         if (ofi_ > threshold_)      current_ = OrderSide::BUY;
         else if (ofi_ < -threshold_) current_ = OrderSide::SELL;
         else                         current_ = OrderSide::NONE;
 
-        int64_t mag = (ofi_ > 0) ? ofi_ : -ofi_;
-        int64_t s = mag * Signal::kStrengthScale / (threshold_ + 1);
-        strength_ = s > Signal::kStrengthScale ? Signal::kStrengthScale : s;
-        if (current_ == OrderSide::NONE) strength_ = 0;
+        if (current_ == OrderSide::NONE) {
+            strength_ = 0;
+        } else {
+            // 强度 ∝ 超阈值的净流: (|ofi_| - threshold) / ((kSaturate-1)×threshold) → [0, 满]。
+            int64_t mag = (ofi_ > 0) ? ofi_ : -ofi_;
+            int64_t over = mag - threshold_;                 // 超阈值量
+            int64_t span = threshold_ * (kSaturate - 1);     // 从阈值到饱和的跨度
+            if (over >= span) strength_ = Signal::kStrengthScale;              // 饱和: 满强度
+            else              strength_ = over * Signal::kStrengthScale / span; // 分段线性
+        }
     }
 
     // Strategy 接口：单参 on_event（OFI 需要方向，走上面的双参重载）

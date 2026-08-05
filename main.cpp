@@ -153,8 +153,12 @@ int main(int argc, char* argv[]) {
     // ── 统一仲裁(共享函数): 读两信号槽, 同向才下 ──
     // 谁写信号谁调用(写完检查信号是否齐全, 齐则仲裁下单)。
     // 无定时器无独立线程——信号一更新同步仲裁。
+    // 下单节奏(V1.5 定稿): 方向翻转 → 必下; 方向不变 → 强度相对上次下单跳变 ≥ 阈值才再下。
+    //   既不在牛市只下一单(强度爬坡会继续加仓), 又过滤 OFI 窗口的微抖动(强度小波动不触发)。
+    //   kStrengthStep: 强度跳变阈值, 千分比定点(500 = 5% 满强度)。
     std::atomic<OrderSide> last_order_side{OrderSide::NONE};
     std::atomic<int64_t> last_order_str{-1};
+    constexpr int64_t kStrengthStep = 500;
     // 仲裁抽样计数器: 抽中(kSample 的倍数)才调探针函数。uprobe 挂在函数入口,
     // 只要调用就命中——抽样判断必须在调用点(跳过调用), 不能放函数内部。
     size_t arb_sample_cnt = 0;
@@ -174,8 +178,12 @@ int main(int argc, char* argv[]) {
             uint64_t pos = rm.position(locate);
             bool blocked = (so == OrderSide::BUY && pos >= cfg.risk.max_position) ||
                            (so == OrderSide::SELL && pos == 0);
-            bool fresh = (so != last_order_side.load());
-            if (!blocked && fresh) {
+            // 下单触发(强度阈值触发): 方向翻转必下; 方向不变仅强度跳变 ≥ 阈值才下。
+            //   last_order_str 是上次下单时的强度(非本次), 保证"强→弱"不回补(守成)。
+            int64_t last_str = last_order_str.load();
+            bool fresh_dir  = (so != last_order_side.load());
+            bool strength_ge = (strength >= last_str + kStrengthStep);
+            if (!blocked && (fresh_dir || strength_ge)) {
                 // [LensX 级别4] 下单决策→执行完毕(key=sig_ofi.seq 信号触发seq, 抽样)。
                 // 起点/终点都在决策块, send 或被拒都是终点状态 → 成对无残留。
                 // 抽样判断在调用点(抽中才调), 避免 uprobe 每次命中拖垮吞吐。

@@ -83,22 +83,31 @@ struct BookRegistry {
         for (auto& a : owner_) a.store(kNone, std::memory_order_relaxed);
     }
 
-    uint32_t lookup_or_register(uint32_t locate, uint32_t my_id, uint32_t n,
-                                const std::atomic<uint64_t>* cared) {
+    uint32_t lookup_or_register(uint32_t locate, uint32_t n,
+                                const std::atomic<uint64_t>* cared,
+                                std::atomic<uint64_t>* registered) {
         uint32_t cur = owner_[locate].load(std::memory_order_acquire);
         if (cur != kNone) return cur;
-        // 未注册: 选 cared_count 最小的 worker(最清闲) → CAS 写入。
-        // target 初始为 my_id: 启动期 cared_count 全 0(平局)时注册给自己,
-        // 每个 worker 把自己遇到的新 locate 收下 → 自然分散; 有 worker 超载后
-        // (cared 大)新 locate 才让给更清闲者。避免平局全堆 index 0。
-        uint32_t target = my_id;
-        for (uint32_t i = 0; i < n; ++i)
-            if (cared[i].load(std::memory_order_relaxed) <
-                cared[target].load(std::memory_order_relaxed)) target = i;
+        // 未注册: 选 (cared_count, registered_count) 字典序最小的 worker。
+        //   cared_count    = 处理事件数(主键, 运行期让新 locate 去最清闲者)
+        //   registered_count = 已注册给它的 locate 数(次键, 破启动期全 0 平局)
+        // 双键从 0 开始遍历: 启动期 cared 全 0, registered 先注册的涨 → 严格轮流
+        // 分散(即使同一 worker 先遇到所有新 locate 也均匀), 避免"平局归自己"的
+        // 竞速正反馈(先调度者连续抢注册 → 单一 straggler 拖垮 SPMC)。
+        uint32_t target = 0;
+        uint64_t tc = cared[0].load(std::memory_order_relaxed);
+        uint64_t tr = registered[0].load(std::memory_order_relaxed);
+        for (uint32_t i = 1; i < n; ++i) {
+            uint64_t c = cared[i].load(std::memory_order_relaxed);
+            uint64_t r = registered[i].load(std::memory_order_relaxed);
+            if (c < tc || (c == tc && r < tr)) { target = i; tc = c; tr = r; }
+        }
         uint32_t expected = kNone;
         if (owner_[locate].compare_exchange_strong(expected, target,
-                    std::memory_order_acq_rel, std::memory_order_relaxed))
+                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            registered[target].fetch_add(1, std::memory_order_relaxed);
             return target;
+        }
         return expected;   // 别人注册了(先到先得)
     }
 };
@@ -172,9 +181,9 @@ struct BookWorker {
 
     // 处理一个归属本 worker 的事件: 重建簿 → OFI/OBI 信号 → 仲裁下单。
     void process(const MarketEvent& ev) {
-        // [LensX 消息级] 完整链路终点。每条消息仅 owner worker 打一次
-        // (抽样配对 alloc→pop 1:1, 勿在每个 worker 的 pop 处都打)。
-        if (ev.seq_id % lensx::kSample == 0) lensx::mark_pop(ev.seq_id);
+        // [LensX 消息级] 处理起点。每条消息仅 owner worker 打一次
+        // (抽样配对 alloc→process 1:1, 勿在每个 worker 的 pop 处都打)。
+        if (ev.seq_id % lensx::kSample == 0) lensx::mark_process(ev.seq_id);
         bool is_trade = (ev.type == MarketEvent::Type::TRADE ||
                          ev.type == MarketEvent::Type::EXECUTE);
         if (is_trade) trade_count->fetch_add(1, std::memory_order_relaxed);
@@ -294,7 +303,8 @@ int main(int argc, char* argv[]) {
     bws.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i)
         bws.emplace_back(std::make_unique<BookWorker>(shared_pool, shared_index));
-    std::vector<std::atomic<uint64_t>> cared_counts(nworkers);  // 每 worker 处理事件数(均衡依据)
+    std::vector<std::atomic<uint64_t>> cared_counts(nworkers);     // 每 worker 处理事件数(均衡主键)
+    std::vector<std::atomic<uint64_t>> registered_counts(nworkers); // 每 worker 注册 locate 数(均衡次键)
     BookRegistry registry;
 
     // ── 交易侧：风控 + OMS + 执行引擎 ──
@@ -384,9 +394,13 @@ int main(int argc, char* argv[]) {
                     // 关心判定: 查注册表(首次出现注册给最清闲/平局归自己), 非本簿 → skip。
                     // skip 也推进 pop 进度(广播 + skip 模型), 不处理不打探针。
                     uint32_t owner = registry.lookup_or_register(
-                        static_cast<uint32_t>(ev.locate), static_cast<uint32_t>(i),
-                        static_cast<uint32_t>(nworkers), cared_counts.data());
+                        static_cast<uint32_t>(ev.locate),
+                        static_cast<uint32_t>(nworkers), cared_counts.data(),
+                        registered_counts.data());
                     if (owner != i) continue;   // 非本簿: skip
+                    // [LensX 消息级] 排队终点: 消息被归属 worker 从 SPMC 取走(process 前)。
+                    // push_spmc→pop 段 = 生产者到 owner 取走(排队等待, 长尾主段)。
+                    if (ev.seq_id % lensx::kSample == 0) lensx::mark_pop(ev.seq_id);
                     cared_counts[i].fetch_add(1, std::memory_order_relaxed);
                     bws[i]->process(ev);        // 重建簿 → OFI/OBI 信号 → 独立仲裁
                 }

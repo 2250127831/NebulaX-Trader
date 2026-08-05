@@ -1,13 +1,17 @@
 # NebulaX-Trader 延迟追踪配置 — 完整链路(包级 + 消息级 + 仲裁 + 下单)
 # 探针位置见 core/prof/lensx_probe.h。
 #
-# 四级测量:
+# 四级测量(V2.1 分簿后):
 #  级别1 包级 recv_th 内部延迟(seq 模式, 同线程, 无 key)
 #     recv_pkt → unpack    IoUringReceiver::recv 返回 → MoldUdpUnpacker::feed 拆包开始
 #     测: 包到达 → 开始拆包。recv 每包 1 次, feed 每包 1 次, 1:1 seq 配对。
 #  级别2 消息级完整链路(key 模式, 跨线程, key = 消息 seq, 抽样 1/128)
-#     alloc → pop          分配 seq → SPMC 消费 pop 出
-#     测: 一条消息从分配到被消费的完整旅程(含跨线程排队)。
+#     alloc → process      分配 seq → 被归属 worker 开始处理
+#     测: 一条消息从分配到被处理的完整旅程(含跨线程排队)。
+#     V2.1 分簿后语义: SPMC 广播下每个 worker 都 pop 所有消息(非本簿 skip 也算推进
+#     进度), 但只有归属 worker 处理。故 pop 探针在 owner 判定后打(排队终点),
+#     process 探针在处理起点打。push_spmc→pop = 排队等待(长尾主段),
+#     pop→process = 取走到处理(同线程, 应极小, 证明长尾在排队不在处理)。
 #     抽样: msg_seq % kSample == 0 才打, 避免拖垮高频线程(全采样实测吞吐 5M→543K)。
 #  级别3 仲裁函数完整执行耗时(seq 模式, 同线程, 无 key, 抽样 1/128)
 #     arb_start → arb_end  arbitrate 开头 → 统一出口。arbitrate 单出口, 成对无残留。
@@ -58,25 +62,30 @@ probes:
     symbol: lensx::mark_pop
     stage: 6
     key: arg1
+  - name: process
+    type: uprobe
+    symbol: lensx::mark_process
+    stage: 7
+    key: arg1
   # 级别3 仲裁(seq 模式, 无 key)
   - name: arb_start
     type: uprobe
     symbol: lensx::mark_arb_start
-    stage: 7
+    stage: 8
   - name: arb_end
     type: uprobe
     symbol: lensx::mark_arb_end
-    stage: 8
+    stage: 9
   # 级别4 下单决策→执行完毕(key 模式, key = sig_ofi.seq)
   - name: order_start
     type: uprobe
     symbol: lensx::mark_order_start
-    stage: 9
+    stage: 10
     key: arg1
   - name: order_end
     type: uprobe
     symbol: lensx::mark_order_end
-    stage: 10
+    stage: 11
     key: arg1
 
 matchers:
@@ -84,7 +93,7 @@ matchers:
   - id: recv_to_unpack
     stages: [0, 1]
     mode: seq
-  # 级别2 细化: alloc→pop 拆 4 段(跨线程 key 配对, 每段成对无残留)
+  # 级别2 细化: alloc→process 拆 5 段(跨线程 key 配对, 每段成对无残留)
   - id: alloc_to_push_ring
     stages: [2, 3]
     mode: key
@@ -97,16 +106,22 @@ matchers:
   - id: push_spmc_to_pop
     stages: [5, 6]
     mode: key
+  - id: pop_to_process
+    stages: [6, 7]
+    mode: key
   - id: alloc_to_pop
     stages: [2, 3, 4, 5, 6]
     mode: key
+  - id: alloc_to_process
+    stages: [2, 3, 4, 5, 6, 7]
+    mode: key
   # 级别3: 仲裁函数完整执行(同线程 seq 配对)
   - id: arb_to_end
-    stages: [7, 8]
+    stages: [8, 9]
     mode: seq
   # 级别4: 下单决策→执行完毕(同线程 key 配对, send/被拒都是终点)
   - id: order_to_end
-    stages: [9, 10]
+    stages: [10, 11]
     mode: key
 
 reports:
@@ -125,12 +140,18 @@ reports:
   - name: push_spmc_to_pop
     from: 5
     to: 6
+  - name: pop_to_process
+    from: 6
+    to: 7
   - name: alloc_to_pop
     from: 2
     to: 6
+  - name: alloc_to_process
+    from: 2
+    to: 7
   - name: arb_to_end
-    from: 7
-    to: 8
+    from: 8
+    to: 9
   - name: order_to_end
-    from: 9
-    to: 10
+    from: 10
+    to: 11

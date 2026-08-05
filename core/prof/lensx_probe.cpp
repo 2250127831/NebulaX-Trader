@@ -20,6 +20,9 @@ LENSX_NOINLINE void mark_alloc(uint64_t key) {
 LENSX_NOINLINE void mark_pop(uint64_t key) {
     if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
 }
+LENSX_NOINLINE void mark_process(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
 // 级别2 细化: alloc→pop 拆 4 段(key = 消息 seq, 抽样, 与 alloc/pop 相同 kSample)
 LENSX_NOINLINE void mark_push_ring(uint64_t key) {
     if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }

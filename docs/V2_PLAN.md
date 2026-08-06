@@ -376,3 +376,25 @@ worker1 ←── SPSC1 (locate%N==1)
 - **负载均衡**：修复后 289/174/186/200 万(分布 17-29%)，无单一 straggler。
 - **TSAN**：pool_next_free/Node/message_count 的 C++ UB 全消；workers=1 零 race。剩余 `OrderBook::add` 写 slot 字段 vs 并发 worker 读同一 slot 的复用 race 是 **Treiber 池单值 free_head_ release 被覆盖** 导致——x86 TSO 下由 dealloc/alloc 屏障保证可见性(Release 压测功能正常、零丢包、无崩溃)，与前置无锁设计一致接受的 trade-off。
 - **性能对比**：限速场景(rate 10000) workers=1 与 4 解析 QPS 一致(~505 万, 发送端瓶颈, 无退化)。分簿收益在 book 成为瓶颈时体现，但纯 UDP 压测受 recv_th 接收端限制，无法隔离测量(rate 300000 时 UDP 丢包主导)。
+
+## 8. V2.2 落地记录（2026-08-06）
+
+按 §3.1 落地订单簿缓存友好化：`OrderBook` 价格档从 `std::map<int64_t, PriceLevel>`（红黑树）改为**开地址哈希 + 极值缓存**。
+
+### 8.1 设计（与 §3.1 的偏差）
+
+- **确认只读极值**：生产路径（main.cpp BookWorker::process）每事件只读 `best_bid/best_ask/best_*_volume`（TopOfBook），**没有任何代码读中间档**。唯一用到 `bid_levels()` 的是测试断言。故价格档**不需要全序** → 开地址哈希 + 极值缓存。
+- **PriceLevelTable**：每边独立，`kCapacity=1024` 槽开地址哈希（线性探测），`operator[]`/`erase`/`find`/`best()`/`best_qty()`/`size()`。价格是"分"单位整数，黄金常数乘高位取模（避免 `price&63` 把 64 的倍数全映射同槽）。
+- **极值缓存**：`best_` 存当前极值价（买=最高/卖=最低），插入更新，删 best 时降级重扫全表（档数少，几乎零成本）。
+- **public API 零改动**：OrderBookConsumer / main.cpp 未动。
+
+### 8.2 两个实测踩坑（哈希表经典坑）
+
+- **tombstone 断裂（正确性）**：初版把"空槽"和"已删除"混用同一哨兵 `INT64_MIN`。线性探测查找遇到 tombstone 就停 → 探测链断裂 → 同一 price 被插到多个槽 → count 膨胀。修复：**空槽 `kEmpty` 与 `kTombstone` 分离**——查找只停空槽、穿过 tombstone，插入优先复用 tombstone。
+- **表满死循环（性能，压测暴露）**：初版 `kCapacity=64`，真实数据有标的单边价格档 >64 → 表满 → `operator[]` 探测循环无空槽且 key 不在 → **无限循环卡死 worker** → SPMC 背压 → 全线解析从 5M/s 暴跌到 1.1M/s。修复：**kCapacity=1024** + 所有探测循环带 `for (n<kCapacity)` 上界（防死循环）。
+
+### 8.3 验证
+
+- **ctest 16/16**（补了同价两单 / 档空重建 / best 降级重扫 / 空簿测试）。
+- **压测零丢包 + 性能恢复**：rate 10000 → sent 8737176, parsed 8633934（差 = UDP 边界包）；峰值 QPS 4.97M/s（恢复 V2.1 水平）。
+- **perf 对比（收益确认）**：`OrderBook::add`（红黑树价格档插入）**从 V2.1 的 10.75% 热点消失**（哈希 O(1)）；新热点变为 `OrderMap::insert 15.67%` + `OrderMap::erase 8.47%`（分离链接哈希索引，一直存在，之前被 add 掩盖）。订单簿缓存优化达成目标。

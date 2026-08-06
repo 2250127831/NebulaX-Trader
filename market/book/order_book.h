@@ -4,8 +4,8 @@
 #include "core/memory/order_pool.h"
 #include "core/types.h"
 
+#include <cstddef>
 #include <cstdint>
-#include <map>
 
 // ── 高性能订单簿（单标的盘口）──
 // 迁移自 NebulaX matching 引擎的 OrderBook 核心设计，按行情簿语义适配。
@@ -140,19 +140,17 @@ public:
         return s ? s->side : OrderSide::NONE;
     }
 
-    // TopOfBook：best bid / best ask
-    int64_t best_bid() const { return bids_.empty() ? -1 : bids_.begin()->first; }
-    int64_t best_ask() const { return asks_.empty() ? -1 : asks_.begin()->first; }
-    uint64_t bid_volume_at(int64_t price) const { return level_qty(bids_, price); }
-    uint64_t ask_volume_at(int64_t price) const { return level_qty(asks_, price); }
-    uint64_t best_bid_volume() const {
-        auto it = bids_.begin();
-        return it == bids_.end() ? 0 : it->second.total_qty;
+    // TopOfBook：best bid / best ask（V2.2: 哈希表 + 极值缓存, O(1)）
+    int64_t best_bid() const { return bids_.empty() ? -1 : bids_.best(); }
+    int64_t best_ask() const { return asks_.empty() ? -1 : asks_.best(); }
+    uint64_t bid_volume_at(int64_t price) const {
+        PriceLevel lvl; return bids_.find(price, lvl) ? lvl.total_qty : 0;
     }
-    uint64_t best_ask_volume() const {
-        auto it = asks_.begin();
-        return it == asks_.end() ? 0 : it->second.total_qty;
+    uint64_t ask_volume_at(int64_t price) const {
+        PriceLevel lvl; return asks_.find(price, lvl) ? lvl.total_qty : 0;
     }
+    uint64_t best_bid_volume() const { return bids_.best_qty(); }
+    uint64_t best_ask_volume() const { return asks_.best_qty(); }
     size_t bid_levels() const { return bids_.size(); }
     size_t ask_levels() const { return asks_.size(); }
     bool empty() const { return bids_.empty() && asks_.empty(); }
@@ -167,6 +165,113 @@ private:
         uint32_t tail_idx = UINT32_MAX;   // 档内链表尾（最早挂单）
         uint32_t count = 0;               // 档内单数
         uint32_t total_qty = 0;           // 档内总挂单量
+    };
+
+    // ── 价格档表（V2.2: std::map → 开地址哈希 + 极值缓存）──
+    // 生产路径只读 best_bid/best_ask（TopOfBook），中间档从不读 → 无需全序。
+    // 开地址哈希 O(1) 插/删/查 + 缓存极值 O(1) 读 TopOfBook；删 best 时降级重扫
+    // （档数实测仅 4，几乎零成本）。替代红黑树 std::map（O(log n) erase + 指针追逐，
+    // 是 V2.1 perf 的 worker CPU 热点）。
+    class PriceLevelTable {
+    public:
+        static constexpr size_t kCapacity = 1024;        // 单边档数上限(实测 VOD 4 档; 真实数据大标的有超 64 档, 1024 留足余量)
+        static constexpr int64_t kEmpty = INT64_MIN;     // 从未占用的空槽(查找终止哨兵)
+        static constexpr int64_t kTombstone = INT64_MIN + 1;   // 已删除(查找穿过, 插入复用)
+
+        explicit PriceLevelTable(bool is_bid)
+            : is_bid_(is_bid), best_(is_bid ? INT64_MIN : INT64_MAX) {
+            for (auto& s : slots_) s.price = kEmpty;
+        }
+
+        // 语义同 std::map::operator[]：取或插入（返回可修改引用）。
+        // 查找穿过 tombstone、只停在空槽；未命中时优先复用探测链上第一个 tombstone。
+        // 新插入清空 lvl（tombstone 残留旧值，须重置为默认——等同 std::map 新节点）。
+        // 探测循环带容量上界：表满(无空槽)且 key 不在时 break 而非无限转(防 worker 卡死)。
+        PriceLevel& operator[](int64_t price) {
+            size_t i = probe(price);
+            size_t first_tomb = kCapacity;               // 探测链上第一个 tombstone
+            for (size_t n = 0; n < kCapacity; ++n) {
+                if (slots_[i].price == price) {          // 已存在
+                    if (is_bid_ ? price > best_ : price < best_) best_ = price;
+                    return slots_[i].lvl;
+                }
+                if (slots_[i].price == kTombstone && first_tomb == kCapacity)
+                    first_tomb = i;
+                if (slots_[i].price == kEmpty) break;    // 空槽终止(查找结束)
+                i = (i + 1) & (kCapacity - 1);
+            }
+            // 未命中 → 插入到 first_tomb 或遇到的空槽
+            size_t ins = (first_tomb != kCapacity) ? first_tomb : i;
+            slots_[ins].price = price;
+            slots_[ins].lvl = PriceLevel{};              // 清残留
+            ++count_;
+            if (is_bid_ ? price > best_ : price < best_) best_ = price;   // 更新极值
+            return slots_[ins].lvl;
+        }
+
+        // 删除（标 tombstone，不立即腾位——查找穿过 tombstone 链不破）。
+        // 删的是 best_ 则降级重扫找新极值。
+        void erase(int64_t price) {
+            size_t i = probe(price);
+            for (size_t n = 0; n < kCapacity; ++n) {
+                if (slots_[i].price == price) {
+                    slots_[i].price = kTombstone;
+                    --count_;
+                    if (price == best_) rescan_best();
+                    return;
+                }
+                if (slots_[i].price == kEmpty) return;   // 空槽终止, 不存在
+                i = (i + 1) & (kCapacity - 1);
+            }
+        }
+
+        bool find(int64_t price, PriceLevel& out) const {
+            size_t i = probe(price);
+            for (size_t n = 0; n < kCapacity; ++n) {
+                if (slots_[i].price == price) { out = slots_[i].lvl; return true; }
+                if (slots_[i].price == kEmpty) return false;   // 空槽终止, 不存在
+                i = (i + 1) & (kCapacity - 1);
+            }
+            return false;
+        }
+
+        int64_t best() const { return best_; }      // 买=最高价 / 卖=最低价
+        size_t size() const { return count_; }      // 有效档数(不含 tombstone)
+        bool empty() const { return count_ == 0; }
+
+        // TopOfBook 档的总挂单量（best_ 对应的 total_qty）
+        uint64_t best_qty() const {
+            if (empty()) return 0;
+            size_t i = probe(best_);
+            for (size_t n = 0; n < kCapacity; ++n) {
+                if (slots_[i].price == best_) return slots_[i].lvl.total_qty;
+                if (slots_[i].price == kEmpty) break;
+                i = (i + 1) & (kCapacity - 1);
+            }
+            return 0;                                    // best_ 不在(逻辑上不应发生)
+        }
+
+    private:
+        // 黄金常数乘高位取模：避免直接 price&63 把 64 的倍数价格全映射到同槽。
+        static size_t probe(int64_t price) {
+            uint64_t h = (uint64_t)price * 0x9E3779B97F4A7C15ULL;
+            return (h >> (64 - 6)) & (kCapacity - 1);   // 取高 6 位
+        }
+
+        // 删 best 后降级重扫全表找新极值（档数少，几乎零成本）
+        void rescan_best() {
+            best_ = is_bid_ ? INT64_MIN : INT64_MAX;
+            for (auto& s : slots_) {
+                if (s.price == kEmpty || s.price == kTombstone) continue;
+                if (is_bid_ ? s.price > best_ : s.price < best_) best_ = s.price;
+            }
+        }
+
+        struct Slot { int64_t price; PriceLevel lvl; };
+        Slot slots_[kCapacity];
+        bool is_bid_;                 // true=买边(best 取最大价), false=卖边(取最小价)
+        int64_t best_;                // 当前极值价缓存(买=最高, 卖=最低)
+        size_t count_ = 0;            // 有效档数
     };
 
     // 从档内链表摘除并归还池
@@ -195,16 +300,8 @@ private:
         }
     }
 
-    static uint64_t level_qty(const std::map<int64_t, PriceLevel, std::greater<>>& m,
-                              int64_t p) {
-        auto it = m.find(p); return it == m.end() ? 0 : it->second.total_qty;
-    }
-    static uint64_t level_qty(const std::map<int64_t, PriceLevel>& m, int64_t p) {
-        auto it = m.find(p); return it == m.end() ? 0 : it->second.total_qty;
-    }
-
     OrderPool& pool_;                                     // 共享挂单池（外部持有）
     OrderMap&  order_index_;                              // 共享挂单索引（外部持有）
-    std::map<int64_t, PriceLevel, std::greater<>> bids_;  // 买档：价降序
-    std::map<int64_t, PriceLevel> asks_;                  // 卖档：价升序
+    PriceLevelTable bids_{true};                          // 买档（best=最高价）
+    PriceLevelTable asks_{false};                         // 卖档（best=最低价）
 };

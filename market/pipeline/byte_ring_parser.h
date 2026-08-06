@@ -100,7 +100,7 @@ public:
         size_t parsed = 0;
         for (;;) {
             // 1. 读头（10 字节: [seq 8][len 2]）。n 是连续部分；used 是 ring 实际占用。
-            //    实验A(头帧不跨回绕)由 SPSCByteRing 保证 kHeaderBytes=8 字节头完整。
+            //    实验A(头帧不跨回绕)由 SPSCByteRing 保证 kHeaderBytes=10(=kHeadBytes) 头完整。
             const uint8_t* p;
             constexpr size_t kHeadBytes = 10;   // [seq 8][len 2]
             constexpr size_t kSeqBytes  = 8;

@@ -21,8 +21,11 @@ class SPSCByteRing
 {
 public:
     // 消息头长度(跨回绕时保证头不跨回绕)。调用方(unpacker)写入消息 = [kHeaderBytes 头][body]。
-    // 之前是 4 字节 [seq 2][len 2], 现扩为 8 字节 [seq 8](64 位完整 seq 不回绕)。
-    static constexpr size_t kHeaderBytes = 8;
+    // 之前是 4 字节 [seq 2][len 2], 后扩为 8 字节 [seq 8], 现为 10 字节 [seq 8][len 2]。
+    // kHeaderBytes=10 = 解析器读的完整头(seq8+len2)整体不跨回绕; "体"= 消息剩余可跨回绕。
+    // (原 8 字节只保护 seq8, len2 属"体"会跨回绕 → tail_room∈{8,9} 时解析器读 10 字节头
+    //  只拿到 8/9 字节 → 失步。见 /tmp/verify4 实验。)
+    static constexpr size_t kHeaderBytes = 10;
 
     // 用户传入存储空间 + 容量。capacity 必须 2 的幂（不满足返回 false，需检查 valid()）。
     SPSCByteRing(uint8_t* buf, size_t capacity)

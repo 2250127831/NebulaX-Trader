@@ -130,6 +130,23 @@ int main() {
     CHECK(bbook.best_bid_volume() == 300);
     CHECK(bbook.bid_levels() == 2);
 
+    // ── 扩容（超初始 1024 槽触发 grow, 验证 rehash 正确 + 引用有效）──
+    OrderPool gpool(1 << 20);
+    OrderMap  gindex(1 << 20);
+    OrderBook gbook(gpool, gindex);
+    for (int i = 0; i < 2000; ++i)   // 2000 档 > 1024 → 触发 grow
+        CHECK(gbook.add(100 + i, OrderSide::BUY, 100000 - i * 100, 10, i) != UINT32_MAX);
+    CHECK(gbook.bid_levels() == 2000);       // 全部档都在
+    CHECK(gbook.best_bid() == 100000);       // 最高价(第一个插入)
+    CHECK(gbook.best_bid_volume() == 10);
+    // 随机删一档 + 查档量
+    CHECK(gbook.remove(100 + 500));
+    CHECK(gbook.bid_levels() == 1999);
+    CHECK(gbook.bid_volume_at(100000 - 500 * 100) == 0);   // 被删档量 0
+    // 删 best 后降级重扫
+    CHECK(gbook.remove(100));
+    CHECK(gbook.best_bid() == 100000 - 100); // 次高价
+
     if (g_failures == 0) {
         printf("\n高性能订单簿单测 PASS ✓ (池用量=%zu)\n", book.pool_usage());
         return 0;

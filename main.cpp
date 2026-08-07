@@ -69,10 +69,10 @@ static void pin_cpu(int cpu) {
 //   解析器         E 16 起(小核, 协作流水线大核优势被拉平, 全小核独占)
 //   worker         E 20-23(小核无 SMT 真独占; P 核虽算力强但 SMT 兄弟被系统
 //                  进程抢占, 实际只一半算力, 真实速率下 E 核够用且独占更优)
-//   fill/主线程    共享 E 核 18(低频, 两线程不互争, 不占 P 核)
+//   fill/主线程    共享 P 核 9(低频, 不占 E 核, P 核空闲)
 static const int kPinRecv    = 5;   // io_uring 收包(高吞吐, 大核)
 static const int kPinParseE0 = 16;  // 解析器小核起点(E 16-19, nparsers 个)
-static const int kPinIdle    = 18;  // 低频共享核(fill + 主线程, E 核, 不占 P)
+static const int kPinIdle    = 9;   // 低频共享核(fill + 主线程, P 核空闲, 不占 E 核)
 
 static void usage(const char* prog) {
     printf("Usage: %s [--config <path>] [--no-shm]\n"
@@ -256,7 +256,7 @@ struct BookWorker {
 };
 
 int main(int argc, char* argv[]) {
-    pin_cpu(kPinIdle);   // 主线程低频(配置/汇总), 与 fill 共享 E 核 18
+    pin_cpu(kPinIdle);   // 主线程低频(配置/汇总), 与 fill 共享 P 核 9
     // ── 解析参数 + 加载配置 ──
     std::string config_path = "config/default.yaml";
     bool no_shm = false;
@@ -460,7 +460,7 @@ int main(int argc, char* argv[]) {
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
     std::thread fill_th([&]() {
-        pin_cpu(kPinIdle);   // 低频回报, 与主线程共享 E 核 18(不占热核)
+        pin_cpu(kPinIdle);   // 低频回报, 与主线程共享 P 核 9(不占热核)
         fill_rcv->set_blocking(false);
         uint8_t pre[2048];
         fill_rcv->recv(pre, sizeof(pre));

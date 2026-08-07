@@ -67,12 +67,12 @@ static void pin_cpu(int cpu) {
 // 绑核原则(V2 最终版, 实测驱动):
 //   recv=5         大核高吞吐收包(不抢)
 //   解析器         E 16 起(小核, 协作流水线大核优势被拉平, 全小核独占)
-//   worker         P 11/10 + 13/12(2 worker 共享一个物理 P 核的 SMT 兄弟;
-//                  订单簿操作轻重不均, E 核算力不足致排队, P 核够)
-//   fill/主线程    共享大核 9(低频, 两线程不互争, 不占热核)
+//   worker         E 20-23(小核无 SMT 真独占; P 核虽算力强但 SMT 兄弟被系统
+//                  进程抢占, 实际只一半算力, 真实速率下 E 核够用且独占更优)
+//   fill/主线程    共享 E 核 18(低频, 两线程不互争, 不占 P 核)
 static const int kPinRecv    = 5;   // io_uring 收包(高吞吐, 大核)
 static const int kPinParseE0 = 16;  // 解析器小核起点(E 16-19, nparsers 个)
-static const int kPinIdle    = 9;   // 低频共享核(fill + 主线程, 大核空闲)
+static const int kPinIdle    = 18;  // 低频共享核(fill + 主线程, E 核, 不占 P)
 
 static void usage(const char* prog) {
     printf("Usage: %s [--config <path>] [--no-shm]\n"
@@ -256,7 +256,7 @@ struct BookWorker {
 };
 
 int main(int argc, char* argv[]) {
-    pin_cpu(kPinIdle);   // 主线程低频(配置/汇总), 与 fill 共享大核 9
+    pin_cpu(kPinIdle);   // 主线程低频(配置/汇总), 与 fill 共享 E 核 18
     // ── 解析参数 + 加载配置 ──
     std::string config_path = "config/default.yaml";
     bool no_shm = false;
@@ -420,12 +420,10 @@ int main(int argc, char* argv[]) {
     worker_th.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i) {
         worker_th.emplace_back([&, i]() {
-            // 绑核: worker 共享 P 核(订单簿操作轻重不均, P 核算力够; 2 worker 一组
-            // 共享一个物理 P 核的 SMT 兄弟)。worker0/1 → P11+P10, worker2/3 → P13+P12。
-            // (V2.4 实验修正: worker 绑 E 核算力不足 → 重订单簿操作慢 → SPMC 排队;
-            //  改 P 核后全链路 P99 35→26µs, push_spmc→pop P999 9 倍改善。)
-            static const int kWorkerP[4] = {11, 10, 13, 12};   // 2组 SMT 兄弟
-            if (i < 4) pin_cpu(kWorkerP[i]);
+            // 绑核: 每个 worker 独立 P 核(单事件重是固有边界, 尽量给足算力)。
+            // 7/11/13/15 独立物理核(奇数, 避开 SMT 兄弟被系统占用)。
+            static const int kWorkerE[4] = {20, 21, 22, 23};   // E 核无 SMT 真独占
+            if (i < 4) pin_cpu(kWorkerE[i]);
             MarketEvent ev;
             // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
             // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
@@ -462,7 +460,7 @@ int main(int argc, char* argv[]) {
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
     std::thread fill_th([&]() {
-        pin_cpu(kPinIdle);   // 低频回报, 与主线程共享大核 9(不占热核)
+        pin_cpu(kPinIdle);   // 低频回报, 与主线程共享 E 核 18(不占热核)
         fill_rcv->set_blocking(false);
         uint8_t pre[2048];
         fill_rcv->recv(pre, sizeof(pre));

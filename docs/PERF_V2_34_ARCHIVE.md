@@ -81,7 +81,48 @@ recv_th(io_uring 多在途 recv, P5) → SPMC字节ring → 2 解析器(E16-17)
 
 **负载均衡分析**：当前双键算法（cared_count 事件数 + registered_count locate 数）均衡"事件数"，但**重标的处理成本 ≠ 事件数**——单 worker 仍可能超载。彻底解决需**拆大标的**（按价格区间分片订单簿，每 worker 处理部分价格档）或**动态迁移**（破坏保序），V2_PLAN 明确不做。**0.5% 长尾是分簿广播的固有代价，可接受**。
 
+## 3.5 perf CPU 热点 + 硬件事件（与 V1 同颗粒度）
+
+**测量**：`scripts/perf_measure.sh`（perf record + perf stat，按样本时间戳裁剪 2.5%~97.5% 纯负载段），真实速率 rate 1000/4000。
+
+### 3.5.1 CPU 热点（rate 4000，worker 线程）
+
+| 热点 | V1 | V2.3 | 说明 |
+|---|---:|---:|---|
+| book_th / worker 总 | 29.68%（单核） | **worker 总 ~61%**（4 核分摊） | 分簿后订单簿处理摊到 4 worker |
+| └ BookWorker::process | - | 13.49% | 处理核心 |
+| └ OrderBookConsumer::handle_delete | 3.97% | 4.14% | 撤单（含 OrderMap::find 0.91%）|
+| └ OrderMap::insert | - | 2.90% | 挂单索引插入 |
+| └ OrderBookConsumer::handle_add | 4.99% | 2.25% | 加单（V2.2 哈希化后大降）|
+| parse_th | ~16% | 解析器 ×2（E 核） **<1%** | 真实速率下解析能力强不饱和, 未进 Top15 |
+
+**对比 V1**：`OrderBook::add`（红黑树价格档）从 4.99% **消失**（V2.2 开地址哈希 O(1)）；新热点为 OrderMap::insert/erase（分离链接哈希索引）。**订单簿缓存友好化达成目标**。
+
+### 3.5.2 硬件事件（perf stat，真实速率）
+
+| 事件 | V1 | V2.3 rate1000 | V2.3 rate4000 | 解读 |
+|---|---:|---:|---:|---|
+| **IPC** | 0.62 | **6.60** | **2.22** | **大幅提升（V2.2 哈希消除红黑树指针追逐）** |
+| cache miss率 | 8.1% | 5.9% | 12.6% | 多线程摊薄/竞争 |
+| L1 miss率 | - | 1.7% | 1.4% | 良好 |
+| LLC miss率 | - | 0.2% | 0.3% | 良好 |
+| ctx/s | 3558 | 50669 | 23339 | 线程更多（2 解析器 + 4 worker + fill）|
+| cpu迁移/s | - | 0 | 0 | 绑核生效（无跨核迁移）|
+| sendto/recvfrom | 0 | 0 | 0 | io_uring 生效 |
+
+**IPC 0.62 → 2.22（峰值）/ 6.60（常态）**：V2.2 订单簿哈希化消除 std::map 红黑树的指针追逐 + 缓存 miss，CPU 每周期执行指令数 3.6-10 倍提升。**这是 V2 系列最核心的硬件级收益证据**。
+
 ## 4. 吞吐（UDP 栈限制下的结论）
+
+**临界吞吐扫描**（平滑限速扫档，`发送==解析` 判零丢）：
+
+| --rate | QPS(msg/s) | 解析/发送 | 结果 |
+|---|---:|---:|---|
+| 8000 | ~4.0M | 8737176/8737176 | **零丢** |
+| 10000 | ~5.0M | 8737176/8737176 | **零丢（临界）** |
+| 12000 | ~6.0M | 7273599/8737176 | 丢 16.7% |
+
+**临界 ≈ 5.0M msg/s，与 V1/V2.1 相同**——瓶颈仍在 UDP 接收栈（io_uring 单线程），解析器多核能力未被充分利用。
 
 **实测**：UDP + io_uring 单线程接收上限 ~83 万包/秒（415MB/s，纯收包）。SPSC 单解析器 ~5M 条/s。
 **真实市场峰值 ~200 万条/秒** << 解析能力（5M），**吞吐不是实盘瓶颈**。
@@ -94,6 +135,7 @@ recv_th(io_uring 多在途 recv, P5) → SPMC字节ring → 2 解析器(E16-17)
 2. **长尾在 worker 排队（0.5%）**：单超载 worker 分到重标的所致，分簿广播固有代价，可接受
 3. **对照 V2.1 优 2-3 倍**：多解析器 + 真实速率定档的净收益
 4. **吞吐非实盘瓶颈**：UDP 栈限制下 SPSC/SPMC 都够，延迟才是核心
+5. **⚠️ 解析应回退 SPSC（V3 回调）**：实测 **SPSC 单解析器 P99=11.7µs（峰值 rate4000）vs SPMC parse2 35.8µs——SPSC 快 3 倍**（无 claim/commit 开销）。真实市场 ≤200 万条/秒 << SPSC 单解析能力 5M，SPMC 多解析器的高吞吐能力用不上（UDP 栈封顶），只剩 claim/commit 延迟劣势。**V3 计划：解析链路回退 SPSC 字节 ring + 单解析器**（延迟优先），SPMC 多解析器代码保留（面向未来 AF_XDP 突破 UDP 栈后的高吞吐场景）。
 
 ## 6. 测量复现
 
@@ -104,5 +146,9 @@ SUDO_PASS=<密码> ./scripts/measure_lensx.sh 4000   # 峰值
 
 # 解析侧两探针(干扰最小): docs/bench/trader_lensx_2probe.yaml
 SUDO_PASS=<密码> ./scripts/measure_lensx.sh 1000 docs/bench/trader_lensx_2probe.yaml
+
+# perf 热点 + 硬件事件(与 V1 同颗粒度)
+SUDO_PASS=<密码> ./scripts/perf_measure.sh 4000   # 峰值
+SUDO_PASS=<密码> ./scripts/perf_measure.sh 1000   # 常态
 ```
 

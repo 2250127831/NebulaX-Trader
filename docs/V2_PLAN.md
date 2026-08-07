@@ -310,45 +310,14 @@ find/erase: 链 CAS 查 / 树锁查
   - **OrderPool**：升级为**无锁 Treiber 空闲栈**（见 §3.4），共享存储 + 无锁 free_head_，多 worker 安全并发。
   - **OrderMap**：升级为**CAS 快路径 + 桶级锁慢路径**（见 §3.5）——链路径 CAS 无锁，树化路径只锁该桶（惰性独立树，替代全局 overflow_）。key 可用 `(locate, order_ref)` 拼接保证全局唯一（若 per-locate 重复）。
 
-## 6.5 V3 设计：分发器 + 多条 SPSC（2026-08-06 定稿）
+## 6.5 V3 设计：分发器 + 多条 SPSC（2026-08-06 定稿，2026-08-07 补 retry 桶）
 
-> **V2.3 实测修正（2026-08-07）——解析回退 SPSC**：V2.3 多解析器（SPMC 字节 ring）在真实市场速率下**劣于 SPSC**——实测 SPSC 单解析器 P99=11.7µs（峰值 rate4000）vs SPMC parse2 35.8µs，**SPSC 快 3 倍**（无 claim/commit 开销）。真实市场峰值 ≤200 万条/秒 << SPSC 单解析能力 5M，SPMC 多解析器的高吞吐能力用不上（UDP 栈封顶），只剩延迟劣势。**V3 解析链路回退 SPSC 字节 ring + 单解析器（延迟优先）**；SPMC 多解析器代码保留，面向未来 AF_XDP 突破 UDP 栈后的高吞吐场景。
+> **设计已独立成文 → [V3_PLAN.md](V3_PLAN.md)**。本节点只留结论与演进记录，细节以 V3_PLAN.md 为准。
 
-**背景（V2.1 实测驱动）**：广播 + skip 下每个 worker pop 全部消息（V2.1 实测 worker 总 CPU 73% 中相当部分是 pop×4 固定成本，IPC 0.39 反映多核争抢）。分簿后每事件只需一个 worker，广播本是浪费。
-
-### 6.5.1 架构
-
-```
-parse_th 按 locate%N 算分片 → 每条消息只推入一个 worker 的专属 SPSC
-worker0 ←── SPSC0 (locate%N==0 的消息)
-worker1 ←── SPSC1 (locate%N==1)
-...
-每 worker 只 pop 自己的分片, pop 成本 1/N(非 N×)
-```
-
-### 6.5.2 分发算法
-
-- **静态 `locate % N`**：解析时算分片，O(1) 零状态。但只保证 locate 数均分，不保证事件量均分（V2.1 实测大 locate 35384 条 vs 中位 3 条）——与 §2.5 动态均衡的目标冲突。
-- **方案：注册表 + 分发映射**（复用 V2.1 `BookRegistry`）：locate → owner worker（动态注册，按 cared_count 均衡）→ parse_th 查表分发。把 §2.5 的"消费者侧 skip 判定"前移到"生产者侧路由"。
-- **保序**：一个 locate 只归一个 worker → 该 worker 顺序即标的顺序（与 V2.1 相同）。
-
-### 6.5.3 正确性
-
-- **SPSC 单写单读**：parse_th 是唯一写者（每条消息只推一个 SPSC），worker 是唯一读者 → 无竞争，SPSC 天然无锁。
-- **OrderPool/OrderMap 仍共享无锁**：worker 并发 alloc/dealloc 同一池/索引（V2.1 前置已无锁化），不受队列改造影响。
-- **背压**：SPSC 满时 parse_th 阻塞/自旋（单写者背压），不再有"最慢消费者拖累"（SPMC 特性），但快 worker 的 SPSC 空转。
-
-### 6.5.4 预期收益
-
-- **pop 成本 4× → 1×**：每 worker 只 pop 1/N 消息，72B 拷贝 + 进度推进省掉 3/4。
-- **IPC 提升**：消除共享 OrderMap/OrderPool 的多核争抢（分发后单 worker 处理自己分片，共享结构访问降 1/N）。
-- **吞吐**：parse_th 路由成本（哈希/查表 + push 到 N 队列之一）≈ 广播 push 成本，但 worker 侧省掉 N×pop → 吞吐可能突破 5.5M（受 recv_th 限制仍可能封顶）。
-- **代价**：N 个 SPSC 队列（N 个缓冲 + eventfd）；worker 负载不均时快 worker 空转。
-
-### 6.5.5 与 V2.1 的关系
-
-- V2.1 已定稿 registry（locate→owner 原子数组）+ 双键负载均衡。V3 只改**路由位置**（消费者 skip → 生产者分发），registry/均衡/仲裁/无锁池全部复用。
-- **一次只改一个变量**：V3 只动队列 + 路由，订单簿/策略/无锁池不动，才能归因"队列改造"的收益。
+- **V2.3 实测修正（2026-08-07）——解析回退 SPSC**：SPMC 多解析器（字节 ring claim/commit 开销）在真实市场速率下劣于 SPSC——实测 SPSC 单解析器 P99=11.7µs（峰值 rate4000）vs SPMC parse2 35.8µs，**SPSC 快 3 倍**。真实市场峰值 ≤200 万条/秒 << SPSC 单解析能力 5M（UDP 栈封顶），SPMC 只剩延迟劣势。**V3 解析链路回退 SPSC 字节 ring + 单解析器（延迟优先）**；SPMC 多解析器代码保留，面向真实网卡 AF_XDP 高吞吐场景。
+- **V3 定稿**：分发器 + 多条 SPSC + retry 桶（慢消费者隔离）。单解析器按 registry 分发，每 worker 只 pop 自己的分片（无 skip）；慢队列事件卸载到 retry 桶（每 SPSC 独立容量），retry 线程逐桶推能推的。
+- **诚实边界**：分发器把慢消费者触发概率降 4×（每 worker 只处理 1/N 负载），但**不解决负载不均**——持续超载（重标的归属使某 worker 长期满载）仍拖累全链，与 V2.1 相同（拆大标的/动态迁移不做）。
+- **后续阶段**：AF_XDP（突破 UDP 栈，需真实设备网线直连，本地回环无法体现收益）；DPDK 排除（网卡不支持）。
 
 ## 7. V2.1 落地记录（2026-08-06）
 

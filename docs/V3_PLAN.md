@@ -1,15 +1,16 @@
-# V3 计划：分发器 + 多条 SPSC + retry 桶（定稿）
+# V3 计划：分发器 + 多条 SPSC + retry 桶 + AF_XDP（定稿）
 
 > 日期：2026-08-07 · 分支：V2（V3 从 V2 最终版 4f0c7f6 起）· 前置：V2 全版本完成
 > 与 VERSION_PLAN.md 的关系：V3 是业务线"并行 Pipeline（Dispatcher 分发层）"的最后一环——
 > V2 细化成 V2.1-V2.4（分簿/哈希/多解析器/多在途），Dispatcher 分发层顺延到 V3。
 
-## 0. 目标（两个升级，一次只改一个变量）
+## 0. 目标（三个升级，一次只改一个变量）
 
 1. **解析回退 SPSC + 单解析器**（延迟优先，V2.3 实测驱动）
 2. **分发器 + 多条 SPSC**（parse_th 按 registry 分发，每 worker 只 pop 自己的分片）
+3. **AF_XDP 网络后端**（突破 UDP 栈吞吐：驱动层零拷贝，绕过协议栈，UMEM 直搬）
 
-**归因纪律**：V3 只动队列 + 路由，订单簿/策略/无锁池不动，才能归因"队列改造"的收益。
+**归因纪律**：V3 前两项只动队列 + 路由，订单簿/策略/无锁池不动，才能归因"队列改造"的收益；AF_XDP 是独立的网络后端（新增 `AF_XDPReceiver`，业务代码不改，走 `IMarketDataReceiver` 抽象）。
 
 ## 1. 背景与实测依据
 
@@ -59,7 +60,7 @@ worker0 ←── spsc0    worker1 ←── spsc1    ...    worker3 ←── s
 
 - SPMCByteRing（多解析器版）→ SPSCByteRing + 单解析器，解析循环大幅简化（无 claim_lock/claim/commit/空洞/保序屏障）。
 - **分发**：解析出事件后 `owner = registry.lookup(ev.locate)` → `push(spsc[owner], ev)`，满则 `retry_bucket[owner].push(ev)` + 唤醒 retry。
-- SPMC 多解析器代码保留（git 历史保存，面向真实网卡 AF_XDP 后高吞吐场景）。
+- SPMC 多解析器代码保留（git 历史保存，面向 AF_XDP 后高吞吐场景——AF_XDP 突破 UDP 栈封顶后，SPMC 多解析器的并行能力才能用上）。
 
 ### 3.4 修改：BookRegistry 分发侧
 
@@ -117,13 +118,17 @@ fill/主线程 = P9 低频共享
 4. BookRegistry 生产者侧路由(双键均衡复用) → 验证: 负载分布实测
 5. worker 简化(无 skip) → 验证: 压测 sent==parsed, 事件 seq 连续
 6. 配置 + 绑核 → 验证: 压测 + LensX + perf(与 V1/V2 同颗粒度归档)
+7. AF_XDPReceiver(零拷贝网络后端) → 验证: 用户自备真实设备, 对比 io_uring 延迟/吞吐
 ```
 
-## 8. 后续阶段（真实设备）
+## 8. AF_XDP 网络后端（V3 实现内容）
 
-- **AF_XDP（下一网络阶段）**：突破 UDP 栈吞吐需驱动层零拷贝（绕过协议栈，UMEM 直搬），**本地回环无驱动层、无法体现收益**，需两台真实设备网线直连验证。届时 SPMC 多解析器代码可复用（UDP 栈封顶解除后高吞吐场景）。
-- **DPDK**：排除（网卡不支持）。
-- **L2 真实行情（V5）**：接入上证/深证 L2 UDP，业务代码不改（走 IMarketDataReceiver 抽象）。
+- **目标**：突破 UDP 栈吞吐（临界 ~5.0M msg/s 被 io_uring 单线程焊死）。AF_XDP 驱动层零拷贝，绕过协议栈，UMEM 直搬 → 高吞吐 + 低延迟双收益。
+- **实现**：新增 `AF_XDPReceiver`（基于 AF_XDP 的零拷贝网络后端，`IMarketDataReceiver` 的第二个实现），业务代码一行不改。**在模拟行情源下对比 io_uring 与 AF_XDP 的延迟/吞吐差异**。
+- **依赖硬件**：AF_XDP 零拷贝需网卡驱动支持 + 真实网卡（驱动层零拷贝，本地回环无驱动层、无法体现收益）。**测试环境由用户自备**（两台设备网线直连）。
+- **与 SPMC 多解析器的关系**：AF_XDP 解除 UDP 栈封顶后，SPMC 多解析器的高吞吐并行能力才用得上（本地回环阶段 SPSC 单解析器是延迟最优，V2.3 实测）。
+
+**排除项**：DPDK（网卡不支持）；L2 真实行情（V5，后续阶段，走 IMarketDataReceiver 抽象，业务代码不改）。
 
 ## 9. 与 V2 的关系
 

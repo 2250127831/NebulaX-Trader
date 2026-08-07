@@ -63,13 +63,19 @@ static void pin_cpu(int cpu) {
     CPU_SET(cpu, &set);
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
-static const int kPinRecv    = 5;   // io_uring 收包(高吞吐)
-static const int kPinParse   = 7;   // 解析(高吞吐)
-static const int kPinWorker0 = 9;   // 4 个 worker 占独立 P 核
-static const int kPinWorker1 = 11;
-static const int kPinWorker2 = 13;
-static const int kPinWorker3 = 15;
-static const int kPinFill    = 16;  // 成交回报(低频, E 核够用)
+// i9-12900HX: 8 大核(P, SMT成对 0-15) + 8 小核(E, 独立 16-23)。
+// 绑核原则(V2.4 实验结论): 重负载高吞吐(recv)跑大核; 职责单一的消费者线程
+// (解析器/worker)各占一个小核——独占确定性 > 大核被 SMT 抢占的随机性。
+//   解析器是协作流水线(抢头串行/提交保序), 快的大核解析器被小核拉到同速,
+//   故全部解析器占小核(大核优势被拉平, 不如全小核独占)。
+//   recv=5       大核高吞吐收包(不抢)
+//   解析器       小核 16 起顺序(nparsers 个)
+//   worker       小核 20 起顺序(nworkers 个)
+//   fill/主线程  共享大核 9(低频, 两线程不互争, 不占热核)
+static const int kPinRecv    = 5;   // io_uring 收包(高吞吐, 大核)
+static const int kPinParseE0 = 16;  // 解析器小核起点(E 16-19, nparsers 个)
+static const int kPinWorkerE0 = 20; // worker 小核起点(E 20-23, nworkers 个)
+static const int kPinIdle    = 9;   // 低频共享核(fill + 主线程, 大核空闲)
 
 static void usage(const char* prog) {
     printf("Usage: %s [--config <path>] [--no-shm]\n"
@@ -253,6 +259,7 @@ struct BookWorker {
 };
 
 int main(int argc, char* argv[]) {
+    pin_cpu(kPinIdle);   // 主线程低频(配置/汇总), 与 fill 共享大核 9
     // ── 解析参数 + 加载配置 ──
     std::string config_path = "config/default.yaml";
     bool no_shm = false;
@@ -366,16 +373,13 @@ int main(int argc, char* argv[]) {
     std::atomic<size_t> trade_count{0};
     std::atomic<size_t> book_events{0};
 
-    // ── 接收线程：recv → unpacker → received++ ──
+    // ── 接收线程(V2.4 多在途 recv): 预提交多 SQE 内核并行收包, recv_batch 逐包 reap ──
     std::thread recv_th([&]() {
         pin_cpu(kPinRecv);   // 绑独立 P 核, 避免被调度器挪走
-        receiver->set_blocking(false);
-        uint8_t pre[65536];
-        receiver->recv(pre, sizeof(pre));
-        receiver->set_blocking(true);
+        receiver->begin_batch();   // 预提交在途 recv SQE(内核并行收包)
         uint8_t buf[65536];
         while (!stop.load(std::memory_order_acquire)) {
-            ssize_t n = receiver->recv(buf, sizeof(buf));
+            ssize_t n = receiver->recv_batch(buf, sizeof(buf));
             if (n > 0) {
                 if (fc) fc->received.fetch_add(1, std::memory_order_release);
                 unpacker.feed(buf, (size_t)n);
@@ -395,8 +399,10 @@ int main(int argc, char* argv[]) {
     parse_th.reserve(nparsers);
     for (size_t i = 0; i < nparsers; ++i) {
         parse_th.emplace_back([&, i]() {
-            // 绑核: 解析器占独立 P 核(i 用 7 起)。奇数 P 核预算: recv=5, parser0=7, parser1=8(超4 worker场景退回)
-            if (i == 0) pin_cpu(kPinParse);
+            // 绑核: 全部解析器占小核 16 起(各占一个)。
+            // 解析器是协作流水线(抢头串行/提交保序), 快的大核解析器会被小核
+            // 解析器拉到同速——大核优势被拉平, 不如全部小核独占。
+            pin_cpu(kPinParseE0 + i);
             auto& p = *parsers[i];
             int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
             while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
@@ -417,12 +423,9 @@ int main(int argc, char* argv[]) {
     worker_th.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i) {
         worker_th.emplace_back([&, i]() {
-            // 每个 worker 绑独立 P 核(分簿并行的前提: 不绑核会被调度器随机撒核,
-            // 4 个 worker 互相抢核/和 parse 抢核 → 长尾被调度噪声污染)。
-            // i < 4 时用 9/11/13/15(奇数 P 核, 与 recv=5/parse=7 不共享物理核);
-            // workers>4 时退回内核调度(不绑核)。
-            constexpr int kPinWorkers[4] = {kPinWorker0, kPinWorker1, kPinWorker2, kPinWorker3};
-            if (i < 4) pin_cpu(kPinWorkers[i]);
+            // 绑核(V2.4 实验): worker 各占小核 20 起(独占确定性)。小核 16-19 已给
+            // 解析器(parser1+), 20-23 给 4 个 worker。workers>4 退回内核调度。
+            if (i < 4) pin_cpu(kPinWorkerE0 + i);
             MarketEvent ev;
             // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
             // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
@@ -459,7 +462,7 @@ int main(int argc, char* argv[]) {
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
     std::thread fill_th([&]() {
-        pin_cpu(kPinFill);   // 低频, E 核够用, 不占 P 核
+        pin_cpu(kPinIdle);   // 低频回报, 与主线程共享大核 9(不占热核)
         fill_rcv->set_blocking(false);
         uint8_t pre[2048];
         fill_rcv->recv(pre, sizeof(pre));

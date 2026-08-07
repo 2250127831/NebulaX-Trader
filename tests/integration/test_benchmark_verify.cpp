@@ -176,8 +176,34 @@ int main(int argc, char* argv[]) {
     struct State { std::atomic<bool> armed{false}; };
     State st;
 
-    // ── 接收线程: recv → unpacker → fc->received++ ──
+    // ── 接收线程(V2.4 多在途 recv): io_uring 走 recv_batch, 其他后端走单包 recv ──
     std::thread recv_th([&]() {
+        auto* uring = dynamic_cast<IoUringReceiver*>(receiver.get());
+        if (uring) {
+            uring->begin_batch();   // 预提交在途 recv SQE(不阻塞, 才可先置 armed)
+            st.armed.store(true, std::memory_order_release);
+            uint8_t buf[65536];
+            static bool dumped = false;
+            std::atomic<size_t>& rc = recv_count;
+            while (!stop.load(std::memory_order_acquire)) {
+                ssize_t n = uring->recv_batch(buf, sizeof(buf));
+                if (n <= 0) break;
+                ++rc;
+                if (!dumped) {
+                    FILE* df = fopen("/tmp/pkt_dump.txt", "w");
+                    fprintf(df, "recv n=%zd\n", n);
+                    for (int i = 0; i < (n < 32 ? n : 32); ++i) fprintf(df, "%02x ", buf[i]);
+                    fprintf(df, "\n");
+                    fclose(df);
+                    dumped = true;
+                }
+                fc->received.fetch_add(1, std::memory_order_release);  // 先确认收到包
+                size_t unpacked = unpacker.feed(buf, (size_t)n);
+                unpacked_total += unpacked;
+            }
+            return;
+        }
+        // 非 io_uring 后端: 原单包阻塞循环
         receiver->set_blocking(false);
         uint8_t pre[65536];
         receiver->recv(pre, sizeof(pre));

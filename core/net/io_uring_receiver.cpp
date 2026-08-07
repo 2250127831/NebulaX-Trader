@@ -62,8 +62,17 @@ void IoUringReceiver::stop()
         close(fd_);
         fd_ = -1;
     }
-    poller_.free_buffer(buf_idx_);
-    buf_idx_ = UINT32_MAX;
+    // 单包路径的 buffer 归还自由池
+    if (buf_idx_ != UINT32_MAX) {
+        poller_.free_buffer(buf_idx_);
+        buf_idx_ = UINT32_MAX;
+    }
+    // 批量路径: ready 队列里未处理的 buffer 也归还(退出前清理)
+    int unused;
+    while (!poller_.ready_empty()) {
+        uint32_t b = poller_.take_ready(unused);
+        poller_.free_buffer(b);
+    }
 }
 
 void IoUringReceiver::set_blocking(bool blocking)
@@ -137,4 +146,39 @@ ssize_t IoUringReceiver::recv(uint8_t* buf, size_t len)
         errno = -result;
         return -1;
     }
+}
+
+// 多在途 recv(V2.4): 预提交多个在途 recv SQE, 内核并行收包。
+void IoUringReceiver::begin_batch()
+{
+    if (batch_started_) return;
+    poller_.submit_inflight(fd_, IoUringPoller::MAX_BUFFERS);
+    batch_started_ = true;
+}
+
+// 阻塞 reap 一个已完成的包。数据在固定 buffer, 处理后循环复用。
+// 返回包长, 0 = stop 打断(recv_th 退出), -1 = 错误。
+ssize_t IoUringReceiver::recv_batch(uint8_t* buf, size_t len)
+{
+    if (!running_ || len == 0) return 0;
+    if (!batch_started_) return -1;   // 必须先 begin_batch()(防御)
+
+    // 保证 ready 队列非空(有数据待处理才返回)。
+    for (;;) {
+        if (!poller_.ready_empty()) break;
+        int r = poller_.reap_more(fd_);
+        if (r < 0) return running_ ? -1 : 0;  // 错误(如 stop close(fd) 打断在途 recv)
+        if (r == 0) {                          // 只有 timeout CQE
+            if (!running_) return 0;
+            continue;                          // 重试(在途 recv 仍在 ring)
+        }
+    }
+
+    int nbytes = 0;
+    uint32_t bidx = poller_.take_ready(nbytes);
+    size_t n = std::min<size_t>(static_cast<size_t>(nbytes), len);
+    std::memcpy(buf, poller_.buffer_ptr(bidx), n);
+    lensx::mark_recv_pkt();   // [LensX 包级] recv 返回, 数据已进用户 buf
+    poller_.resubmit_recv(fd_, bidx);   // 循环复用: 处理完立即重新提交 recv
+    return static_cast<ssize_t>(n);
 }

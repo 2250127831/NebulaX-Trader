@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/queue/spmc_byte_ring.h"
 #include "core/queue/spmc_event_queue.h"
 #include "core/queue/spsc_byte_ring.h"
 
@@ -25,7 +26,8 @@
 class QueueManager {
 public:
     enum class Type {
-        SPSC_BYTE_RING,     // 字节流（第1级：收包→解析）
+        SPSC_BYTE_RING,     // 字节流单消费者（发送方向等）
+        SPMC_BYTE_RING,     // 字节流多消费者（第1级：收包→解析, V2.3）
         SPMC_EVENT_QUEUE,   // 定长槽位多消费者（第2级：通道A/B）
     };
 
@@ -40,6 +42,10 @@ public:
         switch (type) {
             case Type::SPSC_BYTE_RING:
                 queues_[id] = std::make_unique<SPSCByteRing>(
+                    static_cast<uint8_t*>(buf), capacity);
+                break;
+            case Type::SPMC_BYTE_RING:
+                queues_[id] = std::make_unique<SPMCByteRing>(
                     static_cast<uint8_t*>(buf), capacity);
                 break;
             case Type::SPMC_EVENT_QUEUE: {
@@ -64,6 +70,7 @@ public:
 
 private:
     using AnyQueue = std::variant<std::unique_ptr<SPSCByteRing>,
+                                  std::unique_ptr<SPMCByteRing>,
                                   std::unique_ptr<SPMCEventQueue<16>>>;
 
     static AnyQueue queues_[kMaxQueues];
@@ -72,6 +79,7 @@ private:
 
 // 静态成员定义（头文件内，需 C++17 inline 或 .cpp）
 inline std::variant<std::unique_ptr<SPSCByteRing>,
+                    std::unique_ptr<SPMCByteRing>,
                     std::unique_ptr<SPMCEventQueue<16>>>
     QueueManager::queues_[QueueManager::kMaxQueues];
 inline size_t QueueManager::count_ = 0;

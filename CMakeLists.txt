@@ -36,6 +36,7 @@ add_library(core
     core/config.h
     core/config_loader.cpp
     core/queue/spsc_byte_ring.h
+    core/queue/spmc_byte_ring.h
     core/queue/spmc_ring.h
     core/queue/spmc_event_queue.h
     core/queue/queue_manager.h

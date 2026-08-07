@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <memory>
 
 static int g_failures = 0;
 #define CHECK(cond)                                                       \
@@ -108,35 +109,48 @@ int main(int argc, char* argv[]) {
     CHECK(total_seq == expected_msgs);  // seq 全局连续 = 消息数
 
     // ── 管道: QueueManager 创建共享 ring + 通道A → 拆包器写 → 解析分流 → 策略消费 ──
+    // V2.3: 字节 ring 用 SPMC(单生产者+多消费者), 测试用单解析器(退化 SPSC 语义)。
     uint8_t* ring_buf = new uint8_t[1 << 20];
-    size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
+    size_t ring_id = QueueManager::create(QueueManager::Type::SPMC_BYTE_RING,
                                           ring_buf, 1 << 20);
-    auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
+    auto& shared_ring = QueueManager::get<SPMCByteRing>(ring_id);
 
     // 单通道广播(方案A): 全部事件, 多消费者各自处理关心的类型
+    // 只有 strategy_th 一个消费者(consumer 0), set_num_consumers=1
+    // (原 2 会让 consumer 1 永不消费 → push 等最慢消费者 → 死锁)
     auto* ev_slots = new MarketEvent[1 << 16];
     size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                          ev_slots, 1 << 16, 2);
+                                          ev_slots, 1 << 16, 1);
     auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
-    ByteRingParser bp(shared_ring, channel);
+    // V2.3: N 个解析器并行抢 SPMC ring 消息(解析器数 argv[2], 默认 2)
+    int nparsers = 2;
+    if (argc >= 3) nparsers = std::atoi(argv[2]);
+    if (nparsers < 1) nparsers = 1;
+    std::vector<std::unique_ptr<ByteRingParser>> parsers;
+    for (int i = 0; i < nparsers; ++i)
+        parsers.emplace_back(std::make_unique<ByteRingParser>(shared_ring, channel));
     MoldUdpUnpacker unpacker(shared_ring);  // 共享同一个 ring
     std::atomic<size_t> parsed_count{0};
     std::atomic<bool> stop{false};
     std::atomic<bool> seq_contiguous{true};
     std::atomic<uint64_t> last_seq{0};
 
-    // ── 解析线程: 从共享 ring 读, 成交事件分流进通道 A ──
-    // 退出条件: stop 且 ring 空(消费完所有数据)。避免主线程置 stop 后
+    // ── 解析线程: N 个解析器从共享 ring 抢消息并行解析, 提交保序进通道 A ──
+    // 退出条件: stop 且 ring 全部 drain(commit==tail)。避免主线程置 stop 后
     // 解析线程还没消费完 ring 就退出导致漏解析。
-    std::thread parse_th([&] {
-        while (true) {
-            size_t n = bp.parse_available();
-            parsed_count += n;
-            if (bp.ring().empty() && stop.load(std::memory_order_acquire)) break;
-            if (n == 0) bp.wait_for_data(200);
-        }
-    });
+    std::vector<std::thread> parse_threads;
+    for (int i = 0; i < nparsers; ++i) {
+        parse_threads.emplace_back([&, i] {
+            auto& bp = *parsers[i];
+            while (true) {
+                size_t n = bp.parse_available();
+                parsed_count += n;
+                if (bp.ring().drained() && stop.load(std::memory_order_acquire)) break;
+                if (n == 0) bp.wait_for_data(200);
+            }
+        });
+    }
 
     // ── 策略消费线程: 从单通道收成交事件(委托 skip), 验证 seq 连续 ──
     std::thread strategy_th([&] {
@@ -156,15 +170,15 @@ int main(int argc, char* argv[]) {
 
     // ── 生产线程（主线程）: 拆包器拆 → 推共享 ring ──
     unpacker.feed(pkts.data(), pkts.size());   // 同步推入 ring(满则等解析腾空间)
-    bp.notify();                                // 唤醒解析线程
+    for (auto& p : parsers) p->notify();        // 唤醒所有解析线程
 
-    // 等解析线程消费完(ring 空)再 stop, 避免 feed 尾部消息漏解析。
-    while (!shared_ring.empty())
+    // 等解析线程消费完(ring 全部提交)再 stop, 避免 feed 尾部消息漏解析。
+    while (!shared_ring.drained())
         std::this_thread::yield();
 
     stop.store(true, std::memory_order_release);
-    bp.notify();
-    parse_th.join();
+    for (auto& p : parsers) p->notify();
+    for (auto& th : parse_threads) th.join();
     strategy_th.join();
 
     printf("解析消息数 = %zu, 期望 = %zu, seq连续=%d\n",

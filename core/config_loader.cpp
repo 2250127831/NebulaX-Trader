@@ -16,6 +16,7 @@ Config ConfigLoader::load(const std::string& path) {
         if (n["uring_entries"])  cfg.market.uring_entries = n["uring_entries"].as<uint32_t>();
         if (n["ring_bytes"])     cfg.market.ring_bytes    = n["ring_bytes"].as<size_t>();
         if (n["chan_slots"])     cfg.market.chan_slots    = n["chan_slots"].as<size_t>();
+        if (n["parse_workers"])  cfg.market.parse_workers = n["parse_workers"].as<size_t>();
     }
 
     // order_book

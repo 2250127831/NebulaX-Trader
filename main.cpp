@@ -298,10 +298,11 @@ int main(int argc, char* argv[]) {
     }
 
     // ── 双通道 + 共享 ring ──
+    // V2.3: 字节 ring 从 SPSC 换 SPMC(单生产 recv_th + 多消费者 N 个解析器)。
     auto ring_buf = std::make_unique<uint8_t[]>(cfg.market.ring_bytes);
-    size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
+    size_t ring_id = QueueManager::create(QueueManager::Type::SPMC_BYTE_RING,
                                           ring_buf.get(), cfg.market.ring_bytes);
-    auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
+    auto& shared_ring = QueueManager::get<SPMCByteRing>(ring_id);
 
     // 单通道: 全部事件(成交+委托)进同一队列, SPMC 广播(N 个 book_worker 分簿并行)。
     // 同一序列 + 一个 locate 只归一个 worker → 订单簿时序正确(成交不先于对应委托)。
@@ -312,7 +313,19 @@ int main(int argc, char* argv[]) {
     auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
 
     MoldUdpUnpacker unpacker(shared_ring);
-    ByteRingParser parser(shared_ring, channel);
+    // V2.3: N 个解析器, 每个一个 ByteRingParser(共享 ring + channel)。
+    // 含引用成员不可移动/拷贝 → unique_ptr 规避 vector 重分配。
+    const size_t nparsers = std::max<size_t>(1, cfg.market.parse_workers);
+    std::vector<std::unique_ptr<ByteRingParser>> parsers;
+    parsers.reserve(nparsers);
+    for (size_t i = 0; i < nparsers; ++i)
+        parsers.emplace_back(std::make_unique<ByteRingParser>(shared_ring, channel));
+    // 解析总数 = 各解析器 message_count 之和(每解析器独立 ItchParser)
+    auto total_parsed_count = [&]() -> uint64_t {
+        uint64_t total = 0;
+        for (auto& p : parsers) total += p->message_count();
+        return total;
+    };
 
     // ── 分簿并行: 共享无锁挂单池/索引 + N 个 book_worker ──
     // 共享 OrderPool/OrderMap 无锁(V2.1 前置), 跨 worker 同桶安全; 同一 locate 只归
@@ -366,7 +379,7 @@ int main(int argc, char* argv[]) {
             if (n > 0) {
                 if (fc) fc->received.fetch_add(1, std::memory_order_release);
                 unpacker.feed(buf, (size_t)n);
-                parser.notify();   // 新数据已写入 ring → 立即唤醒可能阻塞在 poll 的解析线程
+                for (auto& p : parsers) p->notify();   // 唤醒所有可能阻塞的解析线程
             } else break;
         }
     });
@@ -375,21 +388,27 @@ int main(int argc, char* argv[]) {
     // parse_th/book_th 共用(kSpinMax ~ 几十µs)。
     constexpr int kSpinMax = 2000;
 
-    // ── 解析线程：解析 ITCH → 单通道广播(方案A, 全部事件) ──
-    // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。排空 ring 后置 parse_done。
-    std::thread parse_th([&]() {
-        pin_cpu(kPinParse);   // 绑独立 P 核
-        int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
-        while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
-            parser.parse_available();
-            if (!parser.ring().empty()) { spin_left = kSpinMax; continue; }
-            if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
-            spin_left = kSpinMax;
-            parser.wait_for_data(200);   // 持续空: 阻塞等 recv_th notify
-        }
-        parser.parse_available();   // 排空剩余
-        parse_done.store(true, std::memory_order_release);
-    });
+    // ── N 个解析线程(V2.3): 从 SPMCByteRing 并行抢消息、并行解析、保序提交 ──
+    // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。
+    // 退出: stop/done 且 ring 全部 drain(commit_==tail_, 所有消息已提交)。
+    std::vector<std::thread> parse_th;
+    parse_th.reserve(nparsers);
+    for (size_t i = 0; i < nparsers; ++i) {
+        parse_th.emplace_back([&, i]() {
+            // 绑核: 解析器占独立 P 核(i 用 7 起)。奇数 P 核预算: recv=5, parser0=7, parser1=8(超4 worker场景退回)
+            if (i == 0) pin_cpu(kPinParse);
+            auto& p = *parsers[i];
+            int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
+            while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
+                p.parse_available();
+                if (!p.ring().drained()) { spin_left = kSpinMax; continue; }
+                if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
+                spin_left = kSpinMax;
+                p.wait_for_data(200);   // 持续空: 阻塞等 recv_th notify
+            }
+            p.parse_available();   // 排空剩余
+        });
+    }
 
     // ── 分簿 book_worker 线程: 广播 + skip, 每 worker 只处理归属自己的 locate ──
     for (size_t i = 0; i < nworkers; ++i)
@@ -475,7 +494,7 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         auto t_shm_end = std::chrono::steady_clock::now();
         double wall = std::chrono::duration<double>(t_shm_end - t_shm_start).count();
-        uint64_t parsed = parser.message_count();
+        uint64_t parsed = total_parsed_count();
         printf("解析 QPS: 均值=%llu msg/s (解析 %llu 条 / %.1f 秒)\n",
                wall > 0 ? (unsigned long long)(parsed / wall) : 0ull,
                (unsigned long long)parsed, wall);
@@ -493,7 +512,7 @@ int main(int argc, char* argv[]) {
         auto t_start_mon = std::chrono::steady_clock::now();
         while (!started || idle_sec < cfg.execution.idle_timeout_sec) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            uint64_t p = parser.message_count();
+            uint64_t p = total_parsed_count();
             if (p != last_parsed) {
                 uint64_t inc = p - last_parsed;
                 last_parsed = p;
@@ -527,8 +546,9 @@ int main(int argc, char* argv[]) {
     stop.store(true, std::memory_order_release);
     receiver->stop();
     recv_th.join();
-    parser.notify();
-    parse_th.join();
+    for (auto& p : parsers) p->notify();   // 唤醒所有解析线程
+    for (auto& t : parse_th) t.join();     // 解析线程全部排空
+    parse_done.store(true, std::memory_order_release);   // 解析完成, 通知 book_worker 可退出
     channel.notify_all();   // 唤醒阻塞在 wait_for_data 的所有 book_worker
     for (auto& t : worker_th) t.join();
     fill_stop.store(true, std::memory_order_release);

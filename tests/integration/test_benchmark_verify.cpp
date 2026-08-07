@@ -118,9 +118,9 @@ int main(int argc, char* argv[]) {
     // ── 管道: 共享 ring + 通道A + 拆包器 + 解析器 + 策略 ──
     // ring/通道容量加大, 减少背压(接收端跟上 benchmark)
     auto ring_buf = std::make_unique<uint8_t[]>(1 << 22);   // 4MB
-    size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
+    size_t ring_id = QueueManager::create(QueueManager::Type::SPMC_BYTE_RING,
                                           ring_buf.get(), 1 << 22);
-    auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
+    auto& shared_ring = QueueManager::get<SPMCByteRing>(ring_id);
 
     auto* ev_slots = new MarketEvent[1 << 20];   // 1M 槽
     size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
@@ -212,7 +212,7 @@ int main(int argc, char* argv[]) {
         while (!stop.load(std::memory_order_acquire)) {
             size_t n = parser.parse_available();
             parsed_total += n;
-            if (!parser.ring().empty()) continue;
+            if (!parser.ring().drained()) continue;
             if (!stop.load()) parser.wait_for_data(200);
         }
         parsed_total += parser.parse_available();  // 清空剩余: 所有成交已进通道 A

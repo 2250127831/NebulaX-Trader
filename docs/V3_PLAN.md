@@ -1,16 +1,15 @@
-# V3 计划：分发器 + 多条 SPSC + retry 桶 + AF_XDP（定稿）
+# V3 计划：分发器 + 多条 SPSC + retry 桶（定稿）
 
 > 日期：2026-08-07 · 分支：V2（V3 从 V2 最终版 4f0c7f6 起）· 前置：V2 全版本完成
 > 与 VERSION_PLAN.md 的关系：V3 是业务线"并行 Pipeline（Dispatcher 分发层）"的最后一环——
 > V2 细化成 V2.1-V2.4（分簿/哈希/多解析器/多在途），Dispatcher 分发层顺延到 V3。
 
-## 0. 目标（三个升级，一次只改一个变量）
+## 0. 目标（两个升级，一次只改一个变量）
 
 1. **解析回退 SPSC + 单解析器**（延迟优先，V2.3 实测驱动）
 2. **分发器 + 多条 SPSC**（parse_th 按 registry 分发，每 worker 只 pop 自己的分片）
-3. **AF_XDP 网络后端**（突破 UDP 栈吞吐：驱动层零拷贝，绕过协议栈，UMEM 直搬）
 
-**归因纪律**：V3 前两项只动队列 + 路由，订单簿/策略/无锁池不动，才能归因"队列改造"的收益；AF_XDP 是独立的网络后端（新增 `AF_XDPReceiver`，业务代码不改，走 `IMarketDataReceiver` 抽象）。
+**归因纪律**：V3 只动队列 + 路由，订单簿/策略/无锁池不动，才能归因"队列改造"的收益。网络后端（AF_XDP/DPDK）属独立抽象层，移到 V4 专门做接口 + 正确性检验（见 §8）。
 
 ## 1. 背景与实测依据
 
@@ -60,7 +59,7 @@ worker0 ←── spsc0    worker1 ←── spsc1    ...    worker3 ←── s
 
 - SPMCByteRing（多解析器版）→ SPSCByteRing + 单解析器，解析循环大幅简化（无 claim_lock/claim/commit/空洞/保序屏障）。
 - **分发**：解析出事件后 `owner = registry.lookup(ev.locate)` → `push(spsc[owner], ev)`，满则 `retry_bucket[owner].push(ev)` + 唤醒 retry。
-- SPMC 多解析器代码保留（git 历史保存，面向 AF_XDP 后高吞吐场景——AF_XDP 突破 UDP 栈封顶后，SPMC 多解析器的并行能力才能用上）。
+- SPMC 多解析器代码保留（git 历史保存，面向 V4 网络后端突破 UDP 栈封顶后的高吞吐场景——届时 SPMC 多解析器的并行能力才能用上）。
 
 ### 3.4 修改：BookRegistry 分发侧
 
@@ -118,17 +117,31 @@ fill/主线程 = P9 低频共享
 4. BookRegistry 生产者侧路由(双键均衡复用) → 验证: 负载分布实测
 5. worker 简化(无 skip) → 验证: 压测 sent==parsed, 事件 seq 连续
 6. 配置 + 绑核 → 验证: 压测 + LensX + perf(与 V1/V2 同颗粒度归档)
-7. AF_XDPReceiver(零拷贝网络后端) → 验证: 用户自备真实设备, 对比 io_uring 延迟/吞吐
 ```
 
-## 8. AF_XDP 网络后端（V3 实现内容）
+### 7.1 落地记录（2026-08-09）
 
-- **目标**：突破 UDP 栈吞吐（临界 ~5.0M msg/s 被 io_uring 单线程焊死）。AF_XDP 驱动层零拷贝，绕过协议栈，UMEM 直搬 → 高吞吐 + 低延迟双收益。
-- **实现**：新增 `AF_XDPReceiver`（基于 AF_XDP 的零拷贝网络后端，`IMarketDataReceiver` 的第二个实现），业务代码一行不改。**在模拟行情源下对比 io_uring 与 AF_XDP 的延迟/吞吐差异**。
-- **依赖硬件**：AF_XDP 零拷贝需网卡驱动支持 + 真实网卡（驱动层零拷贝，本地回环无驱动层、无法体现收益）。**测试环境由用户自备**（两台设备网线直连）。
-- **与 SPMC 多解析器的关系**：AF_XDP 解除 UDP 栈封顶后，SPMC 多解析器的高吞吐并行能力才用得上（本地回环阶段 SPSC 单解析器是延迟最优，V2.3 实测）。
+**实现形态**：`SPSCEventRing`（定长 MarketEvent 单写单读）+ `RetryBucket`（SPSCEventRing + active 标志）+ `Dispatcher`（locate→owner + 双键均衡 + 桶卸载）+ `retry` 线程（E17）+ worker 只 pop 自己的 SPSC。
 
-**排除项**：DPDK（网卡不支持）；L2 真实行情（V5，后续阶段，走 IMarketDataReceiver 抽象，业务代码不改）。
+**设计修正——负载均衡主键切换（cared_count → registered_count）**：
+- V3 把分发从消费者侧移到生产者侧（解析器查表分发）后，**沿用 V2 的 cared_count 主键导致启动期负载失衡**：cared_count（worker 已处理事件数）是消费者侧计数，worker 处理到才涨，启动阶段全 0 → argmin 恒选 worker0，新 locate 全归它。
+- **修正**：主键改用 registered_count（已注册 locate 数）——解析器实时可见、无滞后，新 locate 轮流分散。cared_count 保留作 main 汇总统计。
+- 这是生产者侧分发 vs 消费者侧 skip 判定（V2）的架构差异：V2 用 cared 成立（worker 自己处理自己涨），V3 生产者侧分发必须用生产者可见的 registered。
+- 实测修正后负载均衡：注册 137/137/137/136，处理 3543/2403/3685/3301（4 worker 均衡）。
+
+## 8. 网络后端（移出 V3，归 V4 做接口 + 正确性）
+
+> **2026-08-09 决策**：AF_XDP/DPDK 网络后端**从 V3 移出，归 V4**。V3 专注队列层（分发器 + retry 桶），网络后端是独立抽象层（`IMarketDataReceiver` 的新实现），性质不同，混入 V3 会污染"队列改造"的归因。V4 专门做**接口实现 + 正确性检验**。
+
+**V4 目标**：`IMarketDataReceiver` 抽象完整（io_uring + AF_XDP + DPDK 三个后端），业务代码一行不改。**应用层正确性本地可测，性能留待真实硬件**。
+
+- **AF_XDPReceiver**：libbpf 统一 API。本地用 **SKB 模式**（lo 已验证能收帧，帧结构 = [以太网14][IP][UDP][载荷]）验证接口正确性；性能（DRV_MODE 驱动零拷贝）需支持 XDP 的网卡。
+- **DPDKReceiver**：rte_ethdev 统一 API。本地用 **vdev 虚拟 PMD**（net_tap / net_af_packet，不绑物理网卡）验证应用层 rx_burst 逻辑；性能需 DPDK 兼容网卡。
+- **关键认知**：换网卡/PMD 不改应用代码，只改配置参数（接口名 / --pci）。框架抽象 API 是通用技能，硬件差异通过参数体现。
+- **当前硬件约束**：本机 r8169 网卡**不支持 XDP 驱动模式**（实测 DRV_MODE 失败），DPDK 无对应 PMD。V4 只做抽象层 + 虚拟验证，真实性能等硬件升级。
+- **与 SPMC 多解析器的关系**：网络后端突破 UDP 栈封顶后，SPMC 多解析器的并行能力才用得上（V2.3 保留代码）。
+
+**排除项**：L2 真实行情（V5，后续阶段，走 IMarketDataReceiver 抽象，业务代码不改）。
 
 ## 9. 与 V2 的关系
 

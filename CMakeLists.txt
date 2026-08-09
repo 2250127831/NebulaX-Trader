@@ -35,7 +35,9 @@ add_library(core
     core/types.h
     core/config.h
     core/config_loader.cpp
+    core/dispatch/dispatcher.h
     core/queue/spsc_byte_ring.h
+    core/queue/spsc_event_ring.h
     core/queue/spmc_byte_ring.h
     core/queue/spmc_ring.h
     core/queue/spmc_event_queue.h
@@ -144,6 +146,27 @@ add_executable(ut_spsc
 )
 target_link_libraries(ut_spsc PRIVATE core)
 add_test(NAME ut_spsc COMMAND ut_spsc)
+
+# SPSCEventRing(V3 分发器下游): 单生产者单消费者定长槽事件环形队列
+add_executable(ut_spsc_event_ring
+    tests/unit/test_spsc_event_ring.cpp
+)
+target_link_libraries(ut_spsc_event_ring PRIVATE core)
+add_test(NAME ut_spsc_event_ring COMMAND ut_spsc_event_ring)
+
+# Dispatcher(V3 分发器): 按 locate 分发 + retry 桶 + 保序
+add_executable(ut_dispatcher
+    tests/unit/test_dispatcher.cpp
+)
+target_link_libraries(ut_dispatcher PRIVATE core)
+add_test(NAME ut_dispatcher COMMAND ut_dispatcher)
+
+# 并发 retry 端到端: 小 SPSC 强制满 → retry 桶 → 推回 → 消费, 验证零丢保序
+add_executable(ut_retry_flow
+    tests/unit/test_retry_flow.cpp
+)
+target_link_libraries(ut_retry_flow PRIVATE core)
+add_test(NAME ut_retry_flow COMMAND ut_retry_flow)
 
 add_executable(ut_spmc
     tests/unit/test_spmc.cpp

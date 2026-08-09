@@ -61,9 +61,10 @@ python3 - <<'PYEOF'
 import csv
 SEG = {
     (0,1):'recv->unpack', (2,3):'alloc->push_ring', (3,4):'push_ring->parse',
-    (4,5):'parse->push_spmc', (5,6):'push_spmc->pop', (6,7):'pop->process',
-    (2,6):'alloc->pop', (2,7):'alloc->process(total)',
-    (8,9):'arb', (10,11):'order',
+    (4,5):'parse->dispatch', (5,8):'dispatch->pop', (8,9):'pop->process',
+    (2,8):'alloc->pop', (2,9):'alloc->process(total)',
+    (5,6):'dispatch->retry_in', (6,7):'retry_in->retry_out', (7,8):'retry_out->pop',
+    (6,8):'retry->pop', (10,11):'arb', (12,13):'order',
 }
 groups = {}
 for r in csv.DictReader(open('/tmp/trader_lensx.csv')):

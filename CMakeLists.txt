@@ -154,6 +154,20 @@ add_executable(ut_spsc_event_ring
 target_link_libraries(ut_spsc_event_ring PRIVATE core)
 add_test(NAME ut_spsc_event_ring COMMAND ut_spsc_event_ring)
 
+# Dispatcher(V3 分发器): 按 locate 分发 + retry 桶 + 保序
+add_executable(ut_dispatcher
+    tests/unit/test_dispatcher.cpp
+)
+target_link_libraries(ut_dispatcher PRIVATE core)
+add_test(NAME ut_dispatcher COMMAND ut_dispatcher)
+
+# 并发 retry 端到端: 小 SPSC 强制满 → retry 桶 → 推回 → 消费, 验证零丢保序
+add_executable(ut_retry_flow
+    tests/unit/test_retry_flow.cpp
+)
+target_link_libraries(ut_retry_flow PRIVATE core)
+add_test(NAME ut_retry_flow COMMAND ut_retry_flow)
+
 add_executable(ut_spmc
     tests/unit/test_spmc.cpp
 )

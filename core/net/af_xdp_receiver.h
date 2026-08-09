@@ -2,6 +2,10 @@
 
 #include "i_market_data_receiver.h"
 
+// AF_XDP 后端需 libbpf(xsk.h + 链接)。无 libbpf 的环境(CI/无特权 runner)不编译本后端,
+// 但 io_uring(默认)不受影响。配置 backend=af_xdp 而无 libbpf 时 make_receiver 返回 nullptr。
+#ifdef HAVE_AF_XDP
+
 #include <bpf/xsk.h>
 
 #include <atomic>
@@ -70,3 +74,17 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> blocking_{true};
 };
+
+#else   // !HAVE_AF_XDP: 无 libbpf, 空实现占位(编译期不实例化)
+#include <cstdint>
+#include <string>
+class AF_XDPReceiver : public IMarketDataReceiver {
+public:
+    AF_XDPReceiver(const std::string&, uint16_t, uint32_t = 0) {}
+    bool start() override { return false; }
+    void stop() override {}
+    void set_blocking(bool) override {}
+    ssize_t recv(uint8_t*, size_t) override { return 0; }
+    int fd() const override { return -1; }
+};
+#endif  // HAVE_AF_XDP

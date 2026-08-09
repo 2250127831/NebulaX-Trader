@@ -18,7 +18,8 @@ else()
 endif()
 
 # libbpf（V4 AF_XDP 后端；xsk 绑定 + 默认 XDP 程序重定向）
-pkg_check_modules(LIBBPF REQUIRED libbpf)
+# 可选: CI/无特权 runner 不装也能构建(io_uring 默认后端), 有 libbpf 才编译 AF_XDP。
+pkg_check_modules(LIBBPF QUIET libbpf)
 
 # DPDK（V4 DPDK 后端；net_tap/net_af_packet vdev 软件 PMD，可选）
 pkg_check_modules(LIBDPDK QUIET libdpdk)
@@ -62,23 +63,31 @@ add_library(core
     core/net/io_uring_receiver.cpp
     core/net/io_uring_sender.h
     core/net/io_uring_sender.cpp
-    core/net/af_xdp_receiver.h
-    core/net/af_xdp_receiver.cpp
     core/net/frame_util.h
     core/ipc/flow_control.h
 )
 
+# V4 网络后端: libbpf(AF_XDP) / DPDK 可选, 找到才编译对应 receiver。
+# CI/无特权 runner 只编译 io_uring(默认后端), 不装 libbpf/dpdk 也能过。
+if(LIBBPF_FOUND)
+    target_sources(core PRIVATE core/net/af_xdp_receiver.h core/net/af_xdp_receiver.cpp)
+    target_compile_definitions(core PUBLIC HAVE_AF_XDP=1)
+endif()
 if(LIBDPDK_FOUND)
     target_sources(core PRIVATE core/net/dpdk_receiver.h core/net/dpdk_receiver.cpp)
+    target_compile_definitions(core PUBLIC HAVE_DPDK=1)
 endif()
 
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(core PUBLIC yaml-cpp ${URING_LIBS} ${LIBBPF_LIBRARIES})
-target_include_directories(core PUBLIC ${LIBURING_INCLUDE_DIRS} ${LIBBPF_INCLUDE_DIRS})
+target_link_libraries(core PUBLIC yaml-cpp ${URING_LIBS})
+target_include_directories(core PUBLIC ${LIBURING_INCLUDE_DIRS})
+if(LIBBPF_FOUND)
+    target_link_libraries(core PUBLIC ${LIBBPF_LIBRARIES})
+    target_include_directories(core PUBLIC ${LIBBPF_INCLUDE_DIRS})
+endif()
 if(LIBDPDK_FOUND)
     target_link_libraries(core PUBLIC ${LIBDPDK_LIBRARIES})
     target_include_directories(core PUBLIC ${LIBDPDK_INCLUDE_DIRS})
-    target_compile_definitions(core PUBLIC HAVE_DPDK=1)
 endif()
 
 # ── 行情模块 ──
@@ -296,15 +305,18 @@ set_tests_properties(ut_benchmark_verify PROPERTIES LABELS "ci-skip" TIMEOUT 120
 #   → 剥帧头 → 拆包 → 解析 → 零丢失 + seq 连续
 # 需要 root(建 veth/绑 xsk/DPDK 运行) + 内核 XDP/veth 支持 → 标 ci-skip。
 # 非 root 运行时测试自身 SKIP(返回 0), CI 全排除。
-add_executable(ut_af_xdp_verify
-    tests/integration/test_af_xdp_verify.cpp
-)
-target_link_libraries(ut_af_xdp_verify PRIVATE core market)
-add_test(NAME ut_af_xdp_verify
-    COMMAND ut_af_xdp_verify
-        ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_chain_sample.bin
-        $<TARGET_FILE:trader_benchmark>)
-set_tests_properties(ut_af_xdp_verify PROPERTIES LABELS "ci-skip" TIMEOUT 120)
+# AF_XDP 测试需 libbpf(HAVE_AF_XDP), DPDK 测试需 libdpdk(HAVE_DPDK) —— 缺依赖不注册。
+if(LIBBPF_FOUND)
+    add_executable(ut_af_xdp_verify
+        tests/integration/test_af_xdp_verify.cpp
+    )
+    target_link_libraries(ut_af_xdp_verify PRIVATE core market)
+    add_test(NAME ut_af_xdp_verify
+        COMMAND ut_af_xdp_verify
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_chain_sample.bin
+            $<TARGET_FILE:trader_benchmark>)
+    set_tests_properties(ut_af_xdp_verify PROPERTIES LABELS "ci-skip" TIMEOUT 120)
+endif()
 
 if(LIBDPDK_FOUND)
     add_executable(ut_dpdk_verify

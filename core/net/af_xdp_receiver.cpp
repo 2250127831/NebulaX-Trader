@@ -1,5 +1,7 @@
 #include "af_xdp_receiver.h"
 
+#ifdef HAVE_AF_XDP
+
 #include "core/net/frame_util.h"
 
 #include <cerrno>
@@ -143,3 +145,5 @@ ssize_t AF_XDPReceiver::recv(uint8_t* buf, size_t len)
         return 0;   // 非阻塞模式：无帧立即返回 0
     }
 }
+
+#endif  // HAVE_AF_XDP

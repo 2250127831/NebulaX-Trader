@@ -226,6 +226,7 @@ struct BookWorker {
 // 三后端 recv() 语义统一(返回纯 UDP 载荷, AF_XDP/DPDK 内部已剥帧头)，
 // 业务/解析逻辑不感知后端差异。
 static std::unique_ptr<IMarketDataReceiver> make_receiver(const MarketConfig& m) {
+#ifdef HAVE_AF_XDP
     if (m.backend == "af_xdp") {
         if (m.ifname.empty()) {
             printf("af_xdp 后端需配置 market.ifname(绑定接口)\n");
@@ -233,6 +234,7 @@ static std::unique_ptr<IMarketDataReceiver> make_receiver(const MarketConfig& m)
         }
         return std::make_unique<AF_XDPReceiver>(m.ifname, m.port);
     }
+#endif
 #ifdef HAVE_DPDK
     if (m.backend == "dpdk") {
         if (m.vdev.empty()) {
@@ -246,6 +248,11 @@ static std::unique_ptr<IMarketDataReceiver> make_receiver(const MarketConfig& m)
         return std::make_unique<DPDKReceiver>(m.vdev, m.port, args);
     }
 #endif
+    if (m.backend != "io_uring") {
+        // 配置了未编译的后端(如无 libbpf 时配 af_xdp): 明确报错而非静默回退
+        printf("后端 %s 未编译(需 libbpf 或 DPDK 开发包), 回退 io_uring\n", m.backend.c_str());
+        return nullptr;
+    }
     return std::make_unique<IoUringReceiver>(m.port);   // 默认 io_uring
 }
 

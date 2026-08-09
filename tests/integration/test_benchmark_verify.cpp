@@ -8,9 +8,11 @@
 //   - 限速: sent/received 包数(新限速: 发前等 received 追上)
 
 #include "core/ipc/flow_control.h"
+#include "core/dispatch/dispatcher.h"
 #include "core/queue/queue_manager.h"
 #include "core/queue/spmc_event_queue.h"
 #include "core/queue/spsc_byte_ring.h"
+#include "core/queue/spsc_event_ring.h"
 #include "core/net/i_market_data_receiver.h"
 #include "core/net/io_uring_receiver.h"
 #include "core/net/io_uring_sender.h"
@@ -118,17 +120,23 @@ int main(int argc, char* argv[]) {
     // ── 管道: 共享 ring + 通道A + 拆包器 + 解析器 + 策略 ──
     // ring/通道容量加大, 减少背压(接收端跟上 benchmark)
     auto ring_buf = std::make_unique<uint8_t[]>(1 << 22);   // 4MB
-    size_t ring_id = QueueManager::create(QueueManager::Type::SPMC_BYTE_RING,
+    size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
                                           ring_buf.get(), 1 << 22);
-    auto& shared_ring = QueueManager::get<SPMCByteRing>(ring_id);
+    auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
+    // V3 分发器: 1 worker(所有 locate 归 worker 0) → 单条 SPSC。单消费线程分流。
     auto* ev_slots = new MarketEvent[1 << 20];   // 1M 槽
-    size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                          ev_slots, 1 << 20, 2);
-    auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
+    SPSCEventRing spsc(ev_slots, 1 << 20);
+    auto* retry_slots = new MarketEvent[1 << 20];
+    RetryBucket retry(retry_slots, 1 << 20);
+    SPSCEventRing* spsc_arr[1] = {&spsc};
+    RetryBucket* retry_arr[1] = {&retry};
+    Dispatcher dispatcher(spsc_arr, retry_arr, 1);
+    std::atomic<uint64_t> cared[1]{0};
+    std::atomic<uint64_t> registered[1]{0};
 
     MoldUdpUnpacker unpacker(shared_ring);
-    ByteRingParser parser(shared_ring, channel);
+    ByteRingParser parser(shared_ring, dispatcher, cared, registered);
 
     VolumeBreakoutStrategy vbs;
     PriceBreakoutStrategy pbs;
@@ -238,64 +246,25 @@ int main(int argc, char* argv[]) {
         while (!stop.load(std::memory_order_acquire)) {
             size_t n = parser.parse_available();
             parsed_total += n;
-            if (!parser.ring().drained()) continue;
+            if (!parser.ring().empty()) continue;
             if (!stop.load()) parser.wait_for_data(200);
         }
         parsed_total += parser.parse_available();  // 清空剩余: 所有成交已进通道 A
         parse_done.store(true, std::memory_order_release);
     });
 
-    // ── 策略线程: 从通道 A 收成交, 喂 3 策略 + K线 ──
-    // 交易侧: 信号翻转时经执行引擎真发送(风控→OMS→模拟交易所→回报)
-    std::thread strategy_th([&]() {
-        MarketEvent ev;
-        OrderSide last_order_side = OrderSide::NONE;   // 已下单方向(同向不重下)
-        // 退出条件: 解析已完成(parse_done) 且 通道空(pending==0)
-        while (!parse_done.load(std::memory_order_acquire) || channel.pending(0) > 0) {
-            if (channel.pop(0, ev)) {
-                if (ev.type != MarketEvent::Type::TRADE &&
-                    ev.type != MarketEvent::Type::EXECUTE) continue;   // skip 委托
-                vbs.on_event(ev); pbs.on_event(ev); tms.on_event(ev);
-                kagg.on_trade(ev);      // 成交 → K线聚合
-                ++trade_count;
-                uint64_t l = last_seq.load();
-                // seq_id 是全局消息序号, 成交之间隔了委托, 只要求递增不要求连续
-                if (l != 0 && ev.seq_id <= l)
-                    seq_contiguous.store(false, std::memory_order_relaxed);
-                last_seq.store(ev.seq_id, std::memory_order_relaxed);
-
-                // 回放中实时决策: 主从组合(主=量突定方向, 从=OFI/OBI 定强度)
-                // 从策略(通道B)稍后追上; 一旦有强度, 决策生效 → 下单
-                combiner.set_primary(vbs.signal());
-                combiner.add_slave(ofi.signal());
-                combiner.add_slave(obi.signal());
-                Signal decision = combiner.combine();
-                combiner.clear_slaves();
-                if (decision.side != OrderSide::NONE && decision.strength > 0) {
-                    if (decision.side != last_order_side) {   // 方向变化才下(避免重复)
-                        uint64_t oid = ex.submit_signal(decision, 1);
-                        if (oid != 0)   // 实际下单才记录方向(强度弱 qty=0 时不下)
-                            last_order_side = decision.side;
-                    }
-                } else {
-                    last_order_side = OrderSide::NONE;   // 无信号 → 复位(可重新下单)
-                }
-            } else if (!parse_done.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            } else {
-                break;   // parse_done 且通道A空 → 退出
-            }
-        }
-        kagg.flush();   // 回放结束: 强制推出最后一根 K线, 让主策略看到完整数据
-    });
-
-    // ── 通道 B 消费线程: 委托事件 → 订单簿重建 → OBI + OFI 策略 ──
+    // ── 消费线程(V3): 从分发器单 SPSC 顺序消费, 按 type 分流 ──
+    //   每个事件先喂订单簿(obc.on_event), 成交事件额外喂 3 策略 + K线 + 下单。
+    //   交易侧: 信号翻转时经执行引擎真发送(风控→OMS→模拟交易所→回报)
     std::atomic<bool> book_ready{false};
     std::atomic<size_t> book_events{0};
-    std::thread book_th([&]() {
+    std::thread consume_th([&]() {
         MarketEvent ev;
-        while (!parse_done.load(std::memory_order_acquire) || channel.pending(1) > 0) {
-            if (channel.pop(1, ev)) {
+        OrderSide last_order_side = OrderSide::NONE;   // 已下单方向(同向不重下)
+        // 退出条件: 解析已完成(parse_done) 且 SPSC 空(pending==0)
+        while (!parse_done.load(std::memory_order_acquire) || spsc.pending() > 0) {
+            if (spsc.pop(ev)) {
+                // ── 全部事件 → 订单簿重建 + OFI/OBI 策略 ──
                 obc.on_event(ev);   // 事件 → 订单簿(成交更新挂单 + 委托重建盘口)
                 ++book_events;
                 const OrderBook* book = obc.book(ev.locate);
@@ -326,12 +295,41 @@ int main(int argc, char* argv[]) {
                     obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
                                 book->best_ask(), book->best_ask_volume(), ev.timestamp);
                 }
+
+                // ── 成交事件 → 3 策略 + K线 + 下单 ──
+                if (ev.type != MarketEvent::Type::TRADE &&
+                    ev.type != MarketEvent::Type::EXECUTE) continue;   // 委托到此为止
+                vbs.on_event(ev); pbs.on_event(ev); tms.on_event(ev);
+                kagg.on_trade(ev);      // 成交 → K线聚合
+                ++trade_count;
+                uint64_t l = last_seq.load();
+                // seq_id 是全局消息序号, 成交之间隔了委托, 只要求递增不要求连续
+                if (l != 0 && ev.seq_id <= l)
+                    seq_contiguous.store(false, std::memory_order_relaxed);
+                last_seq.store(ev.seq_id, std::memory_order_relaxed);
+
+                // 回放中实时决策: 主从组合(主=量突定方向, 从=OFI/OBI 定强度)
+                combiner.set_primary(vbs.signal());
+                combiner.add_slave(ofi.signal());
+                combiner.add_slave(obi.signal());
+                Signal decision = combiner.combine();
+                combiner.clear_slaves();
+                if (decision.side != OrderSide::NONE && decision.strength > 0) {
+                    if (decision.side != last_order_side) {   // 方向变化才下(避免重复)
+                        uint64_t oid = ex.submit_signal(decision, 1);
+                        if (oid != 0)   // 实际下单才记录方向(强度弱 qty=0 时不下)
+                            last_order_side = decision.side;
+                    }
+                } else {
+                    last_order_side = OrderSide::NONE;   // 无信号 → 复位(可重新下单)
+                }
             } else if (!parse_done.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             } else {
-                break;   // parse_done 且通道空 → 退出
+                break;   // parse_done 且 SPSC 空 → 退出
             }
         }
+        kagg.flush();   // 回放结束: 强制推出最后一根 K线, 让主策略看到完整数据
         book_ready.store(true, std::memory_order_release);
     });
 
@@ -409,13 +407,9 @@ int main(int argc, char* argv[]) {
     parser.notify();
     parse_th.join();
 
-    // 策略线程: 消费到通道 A 空
+    // 消费线程: 从分发器 SPSC 消费到空(订单簿重建 + 策略 + 下单全在单线程分流)
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    strategy_th.join();
-
-    // 通道 B 消费线程: 委托事件 → 订单簿重建 → OBI 策略
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    book_th.join();
+    consume_th.join();
     CHECK(book_ready.load());
     CHECK(book_events.load() > 0);
 
@@ -473,6 +467,7 @@ int main(int argc, char* argv[]) {
     CHECK(n_pending == 0);
 
     delete[] ev_slots;
+    delete[] retry_slots;
     receiver->stop();
     if (g_failures == 0) {
         printf("\n端到端验证 PASS ✓\n");

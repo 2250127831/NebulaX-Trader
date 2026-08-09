@@ -35,7 +35,9 @@ add_library(core
     core/types.h
     core/config.h
     core/config_loader.cpp
+    core/dispatch/dispatcher.h
     core/queue/spsc_byte_ring.h
+    core/queue/spsc_event_ring.h
     core/queue/spmc_byte_ring.h
     core/queue/spmc_ring.h
     core/queue/spmc_event_queue.h
@@ -144,6 +146,13 @@ add_executable(ut_spsc
 )
 target_link_libraries(ut_spsc PRIVATE core)
 add_test(NAME ut_spsc COMMAND ut_spsc)
+
+# SPSCEventRing(V3 分发器下游): 单生产者单消费者定长槽事件环形队列
+add_executable(ut_spsc_event_ring
+    tests/unit/test_spsc_event_ring.cpp
+)
+target_link_libraries(ut_spsc_event_ring PRIVATE core)
+add_test(NAME ut_spsc_event_ring COMMAND ut_spsc_event_ring)
 
 add_executable(ut_spmc
     tests/unit/test_spmc.cpp

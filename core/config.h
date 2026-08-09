@@ -12,7 +12,6 @@ struct MarketConfig {
     uint32_t    uring_entries = 256;
     size_t      ring_bytes = 1 << 22;   // 字节 ring 容量（接收→解析）
     size_t      chan_slots = 1 << 20;   // 通道 A/B 槽位
-    size_t      parse_workers = 2;      // 多解析器线程数(V2.3)
 };
 
 // ── 订单簿消费者配置（通道B）──

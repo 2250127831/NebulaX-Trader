@@ -24,7 +24,9 @@
 #include <immintrin.h>   // _mm_pause（高频消费者忙轮询暂停）
 #include "core/queue/queue_manager.h"
 #include "core/queue/spmc_event_queue.h"
+#include "core/dispatch/dispatcher.h"
 #include "core/queue/spsc_byte_ring.h"
+#include "core/queue/spsc_event_ring.h"
 #include "execution/execution_engine.h"
 #include "market/book/order_book_consumer.h"
 #include "market/pipeline/byte_ring_parser.h"
@@ -71,7 +73,8 @@ static void pin_cpu(int cpu) {
 //                  进程抢占, 实际只一半算力, 真实速率下 E 核够用且独占更优)
 //   fill/主线程    共享 P 核 9(低频, 不占 E 核, P 核空闲)
 static const int kPinRecv    = 5;   // io_uring 收包(高吞吐, 大核)
-static const int kPinParseE0 = 16;  // 解析器小核起点(E 16-19, nparsers 个)
+static const int kPinParseE0 = 16;  // 解析器小核 E16(V3 单解析器, 无 SMT 真独占)
+static const int kPinRetryE  = 17;  // retry 线程小核 E17(处理下游满, 常驻)
 static const int kPinIdle    = 9;   // 低频共享核(fill + 主线程, P 核空闲, 不占 E 核)
 
 static void usage(const char* prog) {
@@ -94,47 +97,6 @@ struct SignalSlot {
     alignas(64) std::atomic<uint64_t> seq{0};   // 成交 seq(贯穿线索)
 };
 
-// ── 全局注册表: locate → owner worker ──
-// locate 是 ITCH 16-bit(0-65535) → 固定数组索引(比哈希还快)。registry 即关心判定,
-// 不需要 care_list: 每 worker pop 到事件查 owner, 不是自己就 skip。
-// 动态均衡: 新 locate 首次出现时由"先遇到它的 worker"代为注册到当前 cared_count 最小者
-// (最清闲), 之后固定 → 保序(一个 locate 只归一个 worker)。
-struct BookRegistry {
-    static constexpr uint32_t kNone = UINT32_MAX;
-    std::atomic<uint32_t> owner_[65536];   // locate → owner worker id
-
-    BookRegistry() {
-        for (auto& a : owner_) a.store(kNone, std::memory_order_relaxed);
-    }
-
-    uint32_t lookup_or_register(uint32_t locate, uint32_t n,
-                                const std::atomic<uint64_t>* cared,
-                                std::atomic<uint64_t>* registered) {
-        uint32_t cur = owner_[locate].load(std::memory_order_acquire);
-        if (cur != kNone) return cur;
-        // 未注册: 选 (cared_count, registered_count) 字典序最小的 worker。
-        //   cared_count    = 处理事件数(主键, 运行期让新 locate 去最清闲者)
-        //   registered_count = 已注册给它的 locate 数(次键, 破启动期全 0 平局)
-        // 双键从 0 开始遍历: 启动期 cared 全 0, registered 先注册的涨 → 严格轮流
-        // 分散(即使同一 worker 先遇到所有新 locate 也均匀), 避免"平局归自己"的
-        // 竞速正反馈(先调度者连续抢注册 → 单一 straggler 拖垮 SPMC)。
-        uint32_t target = 0;
-        uint64_t tc = cared[0].load(std::memory_order_relaxed);
-        uint64_t tr = registered[0].load(std::memory_order_relaxed);
-        for (uint32_t i = 1; i < n; ++i) {
-            uint64_t c = cared[i].load(std::memory_order_relaxed);
-            uint64_t r = registered[i].load(std::memory_order_relaxed);
-            if (c < tc || (c == tc && r < tr)) { target = i; tc = c; tr = r; }
-        }
-        uint32_t expected = kNone;
-        if (owner_[locate].compare_exchange_strong(expected, target,
-                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            registered[target].fetch_add(1, std::memory_order_relaxed);
-            return target;
-        }
-        return expected;   // 别人注册了(先到先得)
-    }
-};
 
 // 下单节奏(V1.5 定稿): 方向翻转 → 必下; 方向不变 → 强度相对上次下单跳变 ≥ 阈值才再下。
 static constexpr int64_t kStrengthStep = 500;   // 千分比定点(500 = 5% 满强度)
@@ -302,33 +264,52 @@ int main(int argc, char* argv[]) {
     }
 
     // ── 双通道 + 共享 ring ──
-    // V2.3: 字节 ring 从 SPSC 换 SPMC(单生产 recv_th + 多消费者 N 个解析器)。
+    // V3: 字节 ring 回退 SPSC(单生产 recv_th + 单消费者 单解析器)。
+    // SPMC 多解析器版(V2.3)保留在 git 历史, 面向 AF_XDP 后高吞吐场景。
     auto ring_buf = std::make_unique<uint8_t[]>(cfg.market.ring_bytes);
-    size_t ring_id = QueueManager::create(QueueManager::Type::SPMC_BYTE_RING,
+    size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
                                           ring_buf.get(), cfg.market.ring_bytes);
-    auto& shared_ring = QueueManager::get<SPMCByteRing>(ring_id);
+    auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
 
-    // 单通道: 全部事件(成交+委托)进同一队列, SPMC 广播(N 个 book_worker 分簿并行)。
+    // ── V3 分发器下游: N 条 SPSC(每 worker 一条) + N 个 retry 桶(每 SPSC 独立容量) ──
+    // 单解析器按 registry 分发到 spsc[owner], 满进 retry 桶; worker 只 pop 自己的 spsc。
     // 同一序列 + 一个 locate 只归一个 worker → 订单簿时序正确(成交不先于对应委托)。
     const size_t nworkers = std::max<size_t>(1, cfg.order_book.workers);
-    auto* chan_slots = new MarketEvent[cfg.market.chan_slots];
-    size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
-                                          chan_slots, cfg.market.chan_slots, nworkers);
-    auto& channel = QueueManager::get<SPMCEventQueue<16>>(chan_id);
+    const size_t per_chan = cfg.market.chan_slots / nworkers;   // 每条 SPSC 容量
+    std::vector<std::unique_ptr<MarketEvent[]>> chan_bufs;      // 持有槽位数组
+    std::vector<std::unique_ptr<SPSCEventRing>> spscs;
+    spscs.reserve(nworkers);
+    for (size_t i = 0; i < nworkers; ++i) {
+        auto buf = std::make_unique<MarketEvent[]>(per_chan);
+        spscs.emplace_back(std::make_unique<SPSCEventRing>(buf.get(), per_chan));
+        chan_bufs.push_back(std::move(buf));   // 保证槽位存活(队列不拥有)
+    }
+    // retry 桶: 每 SPSC 一个, 独立容量(小容量即可, 桶满才阻塞解析器)。
+    std::vector<std::unique_ptr<MarketEvent[]>> retry_bufs;
+    std::vector<std::unique_ptr<RetryBucket>> retry_buckets;
+    retry_buckets.reserve(nworkers);
+    for (size_t i = 0; i < nworkers; ++i) {
+        auto buf = std::make_unique<MarketEvent[]>(per_chan);
+        retry_buckets.emplace_back(std::make_unique<RetryBucket>(buf.get(), per_chan));
+        retry_bufs.push_back(std::move(buf));
+    }
+    // SPSCEventRing 数组(Dispatcher 需要连续指针): 从 vector 收集 raw 指针。
+    std::vector<SPSCEventRing*> spsc_ptrs;
+    for (auto& q : spscs) spsc_ptrs.push_back(q.get());
+    std::vector<RetryBucket*> retry_ptrs;
+    for (auto& b : retry_buckets) retry_ptrs.push_back(b.get());
+    Dispatcher dispatcher(spsc_ptrs.data(), retry_ptrs.data(), nworkers);
+
+    // 双键负载均衡计数: cared(处理事件数, 主键) + registered(注册 locate 数, 次键)。
+    std::vector<std::atomic<uint64_t>> cared_counts(nworkers);
+    std::vector<std::atomic<uint64_t>> registered_counts(nworkers);
 
     MoldUdpUnpacker unpacker(shared_ring);
-    // V2.3: N 个解析器, 每个一个 ByteRingParser(共享 ring + channel)。
-    // 含引用成员不可移动/拷贝 → unique_ptr 规避 vector 重分配。
-    const size_t nparsers = std::max<size_t>(1, cfg.market.parse_workers);
-    std::vector<std::unique_ptr<ByteRingParser>> parsers;
-    parsers.reserve(nparsers);
-    for (size_t i = 0; i < nparsers; ++i)
-        parsers.emplace_back(std::make_unique<ByteRingParser>(shared_ring, channel));
-    // 解析总数 = 各解析器 message_count 之和(每解析器独立 ItchParser)
+    // V3: 单解析器(SPSC 单消费者) + 分发器(解析出事件按 locate 分发)。
+    auto parser = std::make_unique<ByteRingParser>(shared_ring, dispatcher,
+                                                   cared_counts.data(), registered_counts.data());
     auto total_parsed_count = [&]() -> uint64_t {
-        uint64_t total = 0;
-        for (auto& p : parsers) total += p->message_count();
-        return total;
+        return parser->message_count();
     };
 
     // ── 分簿并行: 共享无锁挂单池/索引 + N 个 book_worker ──
@@ -341,9 +322,6 @@ int main(int argc, char* argv[]) {
     bws.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i)
         bws.emplace_back(std::make_unique<BookWorker>(shared_pool, shared_index));
-    std::vector<std::atomic<uint64_t>> cared_counts(nworkers);     // 每 worker 处理事件数(均衡主键)
-    std::vector<std::atomic<uint64_t>> registered_counts(nworkers); // 每 worker 注册 locate 数(均衡次键)
-    BookRegistry registry;
 
     // ── 交易侧：风控 + OMS + 执行引擎 ──
     OrderManager om;
@@ -380,7 +358,7 @@ int main(int argc, char* argv[]) {
             if (n > 0) {
                 if (fc) fc->received.fetch_add(1, std::memory_order_release);
                 unpacker.feed(buf, (size_t)n);
-                for (auto& p : parsers) p->notify();   // 唤醒所有可能阻塞的解析线程
+                parser->notify();   // 唤醒可能阻塞的解析线程(单解析器)
             } else break;
         }
     });
@@ -389,66 +367,54 @@ int main(int argc, char* argv[]) {
     // parse_th/book_th 共用(kSpinMax ~ 几十µs)。
     constexpr int kSpinMax = 2000;
 
-    // ── N 个解析线程(V2.3): 从 SPMCByteRing 并行抢消息、并行解析、保序提交 ──
+    // ── 单解析线程(V3): 从 SPSCByteRing 读(单消费者) → 解析 → push 事件 SPMC ──
     // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。
-    // 退出: stop/done 且 ring 全部 drain(commit_==tail_, 所有消息已提交)。
-    std::vector<std::thread> parse_th;
-    parse_th.reserve(nparsers);
-    for (size_t i = 0; i < nparsers; ++i) {
-        parse_th.emplace_back([&, i]() {
-            // 绑核: 全部解析器占小核 16 起(各占一个)。
-            // 解析器是协作流水线(抢头串行/提交保序), 快的大核解析器会被小核
-            // 解析器拉到同速——大核优势被拉平, 不如全部小核独占。
-            pin_cpu(kPinParseE0 + i);
-            auto& p = *parsers[i];
-            int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
-            while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
-                p.parse_available();
-                if (!p.ring().drained()) { spin_left = kSpinMax; continue; }
-                if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
-                spin_left = kSpinMax;
-                p.wait_for_data(200);   // 持续空: 阻塞等 recv_th notify
-            }
-            p.parse_available();   // 排空剩余
-        });
-    }
+    // 退出: stop/done 且 ring 全空(head==tail, 所有消息已读)。
+    std::thread parse_th([&]() {
+        pin_cpu(kPinParseE0);   // 单解析器占小核 16(无 SMT 真独占)
+        auto& p = *parser;
+        int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
+        while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
+            p.parse_available();
+            if (!p.ring().empty()) { spin_left = kSpinMax; continue; }
+            if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
+            spin_left = kSpinMax;
+            p.wait_for_data(200);   // 持续空: 阻塞等 recv_th notify
+        }
+        p.parse_available();   // 排空剩余
+    });
 
-    // ── 分簿 book_worker 线程: 广播 + skip, 每 worker 只处理归属自己的 locate ──
+    // ── 分簿 book_worker 线程: 每 worker 只 pop 自己的 SPSC(V3 分发器) ──
+    // 分发器已按 locate 把事件推到 spsc[owner], worker 无 skip、无 registry 查表。
     for (size_t i = 0; i < nworkers; ++i)
         bws[i]->init(&ex, &rm, &cfg, &trade_count, &book_events);
     std::vector<std::thread> worker_th;
     worker_th.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i) {
         worker_th.emplace_back([&, i]() {
-            // 绑核: 每个 worker 独立 P 核(单事件重是固有边界, 尽量给足算力)。
-            // 7/11/13/15 独立物理核(奇数, 避开 SMT 兄弟被系统占用)。
-            static const int kWorkerE[4] = {20, 21, 22, 23};   // E 核无 SMT 真独占
+            // 绑核: worker 占 E 20-23(小核无 SMT 真独占, 与 V2 最终版一致)。
+            static const int kWorkerE[4] = {20, 21, 22, 23};
             if (i < 4) pin_cpu(kWorkerE[i]);
             MarketEvent ev;
-            // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋(_mm_pause)顶住
-            // 唤醒延迟; 持续空(自旋耗尽)才 wait_for_data 阻塞(省CPU)。
-            int spin_left = 0;   // 剩余自旋次数(每空一轮减一, 耗完才阻塞)
-            while (!parse_done.load(std::memory_order_acquire) || channel.pending(i) > 0) {
-                if (channel.pending(i) == 0) {
+            auto& my_ring = *spscs[i];   // 自己的 SPSC, 单消费者
+            // 排空 + 混合退避: 有数据连续 pop 到空(保吞吐); 短暂空自旋顶住唤醒延迟;
+            // 持续空才 wait_for_data 阻塞(省CPU)。
+            int spin_left = 0;
+            while (!parse_done.load(std::memory_order_acquire) || my_ring.pending() > 0) {
+                if (my_ring.pending() == 0) {
                     if (!parse_done.load(std::memory_order_acquire)) {
-                        if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
+                        if (spin_left > 0) { --spin_left; _mm_pause(); continue; }
                         spin_left = kSpinMax;
-                        channel.wait_for_data(i);   // 持续空: 广播唤醒, 自己的 fd 无限阻塞
+                        my_ring.set_blocked();         // 登记阻塞(push 会唤醒)
+                        my_ring.wait_for_data(1000);   // 阻塞等分发器/retry 推
+                        my_ring.set_active();
                         continue;
                     }
                     break;
                 }
-                spin_left = kSpinMax;   // 有数据: 重置自旋预算
-                while (channel.pop(i, ev)) {
-                    // 关心判定: 查注册表(首次出现注册给最清闲/平局归自己), 非本簿 → skip。
-                    // skip 也推进 pop 进度(广播 + skip 模型), 不处理不打探针。
-                    uint32_t owner = registry.lookup_or_register(
-                        static_cast<uint32_t>(ev.locate),
-                        static_cast<uint32_t>(nworkers), cared_counts.data(),
-                        registered_counts.data());
-                    if (owner != i) continue;   // 非本簿: skip
-                    // [LensX 消息级] 排队终点: 消息被归属 worker 从 SPMC 取走(process 前)。
-                    // push_spmc→pop 段 = 生产者到 owner 取走(排队等待, 长尾主段)。
+                spin_left = kSpinMax;
+                while (my_ring.pop(ev)) {
+                    // [LensX 消息级] 排队终点: 消息被归属 worker 从 SPSC 取走(process 前)。
                     if (ev.seq_id % lensx::kSample == 0) lensx::mark_pop(ev.seq_id);
                     cared_counts[i].fetch_add(1, std::memory_order_relaxed);
                     bws[i]->process(ev);        // 重建簿 → OFI/OBI 信号 → 独立仲裁
@@ -456,6 +422,45 @@ int main(int argc, char* argv[]) {
             }
         });
     }
+
+    // ── retry 线程(V3): 常驻, 处理下游 SPSC 满(解析器卸载到 retry 桶的事件) ──
+    // 阻塞 poll N 个桶的 fd → 唤醒 → 遍历有数据的桶, 推能推的到 spsc[i] →
+    // 桶清空才清 active(保序: 期间解析器只能进桶)。全清空再阻塞。
+    std::thread retry_th([&]() {
+        pin_cpu(kPinRetryE);   // retry 占 E17(小核)
+        std::vector<struct pollfd> pfds(nworkers);
+        for (size_t i = 0; i < nworkers; ++i) {
+            pfds[i].fd = retry_buckets[i]->bucket.wake_fd();
+            pfds[i].events = POLLIN;
+            pfds[i].revents = 0;
+        }
+        MarketEvent ev;
+        // 全空判定: 所有桶 pending==0。
+        auto all_empty = [&]() {
+            for (size_t i = 0; i < nworkers; ++i)
+                if (retry_buckets[i]->bucket.pending() > 0) return false;
+            return true;
+        };
+        while (!parse_done.load(std::memory_order_acquire) || !all_empty()) {
+            // 任一桶非空 → 处理; 全空 → 阻塞等解析器唤醒。
+            if (all_empty()) {
+                if (parse_done.load(std::memory_order_acquire)) break;
+                poll(pfds.data(), nworkers, 1000);   // 阻塞等任一桶唤醒
+                continue;
+            }
+            // 遍历桶: 先 peek 头, 能推 spsc 才 pop(防取出发推不回的乱序)。
+            for (size_t i = 0; i < nworkers; ++i) {
+                auto& rq = *retry_buckets[i];
+                while (rq.bucket.peek(ev)) {
+                    if (!spscs[i]->push(ev)) break;   // spsc 满, 推不进, 头留在桶下轮
+                    rq.bucket.pop(ev);                // 推成功才取走(peek→pop 原子一致)
+                }
+                // 桶清空才清 active(保序前提: 解析器期间只能进桶)。
+                if (rq.bucket.pending() == 0)
+                    rq.active.store(false, std::memory_order_release);
+            }
+        }
+    });
 
     // ── 回报线程：收 FILL → OMS/Risk ──
     std::atomic<bool> fill_stop{false};
@@ -547,10 +552,12 @@ int main(int argc, char* argv[]) {
     stop.store(true, std::memory_order_release);
     receiver->stop();
     recv_th.join();
-    for (auto& p : parsers) p->notify();   // 唤醒所有解析线程
-    for (auto& t : parse_th) t.join();     // 解析线程全部排空
-    parse_done.store(true, std::memory_order_release);   // 解析完成, 通知 book_worker 可退出
-    channel.notify_all();   // 唤醒阻塞在 wait_for_data 的所有 book_worker
+    parser->notify();     // 唤醒解析线程
+    parse_th.join();      // 解析线程排空
+    parse_done.store(true, std::memory_order_release);   // 解析完成, 通知 worker/retry 可退出
+    for (auto& b : retry_buckets) b->bucket.wake();   // 唤醒阻塞在 poll 的 retry 线程
+    retry_th.join();   // retry 先把桶里积压推完(否则 worker 消费不完整)
+    for (auto& q : spscs) q->wake();          // 唤醒阻塞在 wait_for_data 的 worker
     for (auto& t : worker_th) t.join();
     fill_stop.store(true, std::memory_order_release);
     fill_rcv->stop();
@@ -564,8 +571,9 @@ int main(int argc, char* argv[]) {
     printf("成交事件:   %zu\n", trade_count.load());
     printf("事件处理:   %zu  (book_workers=%zu)\n", book_events.load(), nworkers);
     for (size_t i = 0; i < nworkers; ++i)
-        printf("  worker%zu: 处理=%llu  OFI=%lld信号=%d  OBI信号=%d\n",
+        printf("  worker%zu: 处理=%llu 注册=%llu  OFI=%lld信号=%d  OBI信号=%d\n",
                i, (unsigned long long)cared_counts[i].load(),
+               (unsigned long long)registered_counts[i].load(),
                (long long)bws[i]->ofi.ofi(), (int)bws[i]->ofi.signal().side,
                (int)bws[i]->obi.signal().side);
     printf("订单:       %zu  成交=%zu 风控拒=%zu\n",
@@ -577,7 +585,6 @@ int main(int argc, char* argv[]) {
         printf(" w%zu=%llu", i, (unsigned long long)rm.position(bws[i]->ofi.signal().locate));
     printf("  已实现盈亏=%lld 分\n", (long long)rm.realized_pnl());
 
-    delete[] chan_slots;
     if (fc) munmap(fc, sizeof(FlowControl));
     return 0;
 }

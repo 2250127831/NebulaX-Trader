@@ -18,9 +18,6 @@ market:
   # 通道 A/B 槽位数
   chan_slots: 1048576
 
-  # 多解析器线程数（V2.3: 单 parse_th → N 个解析器并行）
-  parse_workers: 2
-
 order_book:
   # 是否启用订单簿重建（通道B）+ OBI/OFI 策略
   enabled: true

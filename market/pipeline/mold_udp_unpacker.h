@@ -28,7 +28,7 @@
 //   MoldUdpUnpacker<RingCap> unpacker;
 //   unpacker.feed(packet_data, packet_len);   // 收包后调用，推入 ring
 //   unpacker.ring()                            // 下游 ByteRingParser 消费
-// Ring 泛型: 接受 SPSCByteRing 或 SPMCByteRing(都提供 push)。V2.3 主链路用 SPMC。
+// Ring 泛型: 接受 SPSCByteRing 或 SPMCByteRing(都提供 push)。V3 主链路用 SPSC 单解析器。
 template <typename ByteRing>
 class MoldUdpUnpacker {
 public:

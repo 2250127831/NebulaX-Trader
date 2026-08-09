@@ -26,8 +26,8 @@
 class QueueManager {
 public:
     enum class Type {
-        SPSC_BYTE_RING,     // 字节流单消费者（发送方向等）
-        SPMC_BYTE_RING,     // 字节流多消费者（第1级：收包→解析, V2.3）
+        SPSC_BYTE_RING,     // 字节流单消费者（第1级：收包→解析, V3 主链路）
+        SPMC_BYTE_RING,     // 字节流多消费者（V2.3 多解析器, 保留面向 AF_XDP 高吞吐）
         SPMC_EVENT_QUEUE,   // 定长槽位多消费者（第2级：通道A/B）
     };
 

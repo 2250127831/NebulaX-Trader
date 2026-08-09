@@ -17,8 +17,13 @@
 
 #include "core/config.h"
 #include "core/ipc/flow_control.h"
+#include "core/net/i_market_data_receiver.h"
 #include "core/net/io_uring_receiver.h"
 #include "core/net/io_uring_sender.h"
+#include "core/net/af_xdp_receiver.h"
+#ifdef HAVE_DPDK
+#include "core/net/dpdk_receiver.h"
+#endif
 #include "core/prof/lensx_probe.h"
 
 #include <immintrin.h>   // _mm_pause（高频消费者忙轮询暂停）
@@ -217,6 +222,33 @@ struct BookWorker {
     }
 };
 
+// ── 网络后端工厂：按配置实例化 IMarketDataReceiver ──
+// 三后端 recv() 语义统一(返回纯 UDP 载荷, AF_XDP/DPDK 内部已剥帧头)，
+// 业务/解析逻辑不感知后端差异。
+static std::unique_ptr<IMarketDataReceiver> make_receiver(const MarketConfig& m) {
+    if (m.backend == "af_xdp") {
+        if (m.ifname.empty()) {
+            printf("af_xdp 后端需配置 market.ifname(绑定接口)\n");
+            return nullptr;
+        }
+        return std::make_unique<AF_XDPReceiver>(m.ifname, m.port);
+    }
+#ifdef HAVE_DPDK
+    if (m.backend == "dpdk") {
+        if (m.vdev.empty()) {
+            printf("dpdk 后端需配置 market.vdev(vdev 规格)\n");
+            return nullptr;
+        }
+        // eal_args 未配时给默认(纯软件 vdev: 免 PCI/大页)
+        auto args = m.eal_args;
+        if (args.empty())
+            args = {"-l", "0", "--no-pci", "--no-huge", "-m", "128"};
+        return std::make_unique<DPDKReceiver>(m.vdev, m.port, args);
+    }
+#endif
+    return std::make_unique<IoUringReceiver>(m.port);   // 默认 io_uring
+}
+
 int main(int argc, char* argv[]) {
     pin_cpu(kPinIdle);   // 主线程低频(配置/汇总), 与 fill 共享 P 核 9
     // ── 解析参数 + 加载配置 ──
@@ -236,16 +268,17 @@ int main(int argc, char* argv[]) {
     }
 
     printf("NebulaX-Trader v0.1.0\n");
-    printf("  行情端口: %u  模拟交易所收单: %u  回报: %u  主策略: %s\n",
-           cfg.market.port, cfg.execution.order_port, cfg.execution.order_ret_port,
-           cfg.strategy.primary.c_str());
+    printf("  网络后端: %s  行情端口: %u  模拟交易所收单: %u  回报: %u  主策略: %s\n",
+           cfg.market.backend.c_str(), cfg.market.port, cfg.execution.order_port,
+           cfg.execution.order_ret_port, cfg.strategy.primary.c_str());
 
     // ── 清理共享内存残留（避免复用旧计数器）──
     if (!no_shm) shm_unlink(FLOW_SHM_PATH);
 
-    // ── 行情接收端 ──
-    auto receiver = std::make_unique<IoUringReceiver>(cfg.market.port);
-    if (!receiver->start()) { printf("接收端启动失败\n"); return 1; }
+    // ── 行情接收端(按 backend 配置实例化 io_uring / af_xdp / dpdk)──
+    auto receiver = make_receiver(cfg.market);
+    if (!receiver) return 1;
+    if (!receiver->start()) { printf("接收端启动失败 (backend=%s)\n", cfg.market.backend.c_str()); return 1; }
 
     // ── 共享内存 FlowControl（--no-shm 时不挂，压测脚本模式无握手）──
     FlowControl* fc = nullptr;
@@ -353,18 +386,33 @@ int main(int argc, char* argv[]) {
     std::atomic<size_t> trade_count{0};
     std::atomic<size_t> book_events{0};
 
-    // ── 接收线程(V2.4 多在途 recv): 预提交多 SQE 内核并行收包, recv_batch 逐包 reap ──
+    // ── 接收线程: 按后端走最优收包路径 ──
+    //   io_uring: 多在途 recv_batch(V2.4, 预提交多 SQE 内核并行收包)
+    //   AF_XDP/DPDK: 单包 recv()(receiver 内部已剥帧头, 返回纯载荷, 语义统一)
+    //   三后端都返回 MoldUDP64 载荷 → 拆包/解析/分发逻辑完全相同
     std::thread recv_th([&]() {
         pin_cpu(kPinRecv);   // 绑独立 P 核, 避免被调度器挪走
-        receiver->begin_batch();   // 预提交在途 recv SQE(内核并行收包)
+        auto* uring = dynamic_cast<IoUringReceiver*>(receiver.get());
         uint8_t buf[65536];
-        while (!stop.load(std::memory_order_acquire)) {
-            ssize_t n = receiver->recv_batch(buf, sizeof(buf));
-            if (n > 0) {
-                if (fc) fc->received.fetch_add(1, std::memory_order_release);
-                unpacker.feed(buf, (size_t)n);
-                parser->notify();   // 唤醒可能阻塞的解析线程(单解析器)
-            } else break;
+        if (uring) {
+            uring->begin_batch();   // 预提交在途 recv SQE(内核并行收包)
+            while (!stop.load(std::memory_order_acquire)) {
+                ssize_t n = uring->recv_batch(buf, sizeof(buf));
+                if (n > 0) {
+                    if (fc) fc->received.fetch_add(1, std::memory_order_release);
+                    unpacker.feed(buf, (size_t)n);
+                    parser->notify();   // 唤醒可能阻塞的解析线程(单解析器)
+                } else break;
+            }
+        } else {
+            while (!stop.load(std::memory_order_acquire)) {
+                ssize_t n = receiver->recv(buf, sizeof(buf));
+                if (n > 0) {
+                    if (fc) fc->received.fetch_add(1, std::memory_order_release);
+                    unpacker.feed(buf, (size_t)n);
+                    parser->notify();
+                } else break;
+            }
         }
     });
 
@@ -373,13 +421,15 @@ int main(int argc, char* argv[]) {
     constexpr int kSpinMax = 2000;
 
     // ── 单解析线程(V3): 从 SPSCByteRing 读(单消费者) → 解析 → push 事件 SPMC ──
-    // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。
-    // 退出: stop/done 且 ring 全空(head==tail, 所有消息已读)。
+    // 退出: stop(主线程置, 已确认所有包收到并喂进 ring)。统一用 stop 而非 done:
+    //   shm 模式 done 只表示 benchmark 发完, 最后一包可能仍在途未 feed 进 ring;
+    //   若用 done 退出, 排空会漏掉 done 后 recv_th 才 feed 的包(丢数据)。
+    //   主线程 done 后等 received==sent 再 stop, 期间解析线程持续消费, 不丢包。
     std::thread parse_th([&]() {
         pin_cpu(kPinParseE0);   // 单解析器占 P 核 7(V1 同款, 算力足)
         auto& p = *parser;
         int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
-        while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
+        while (!stop.load(std::memory_order_acquire)) {
             p.parse_available();
             if (!p.ring().empty()) { spin_left = kSpinMax; continue; }
             if (spin_left > 0) { --spin_left; _mm_pause(); continue; }   // 短自旋顶唤醒延迟
@@ -507,6 +557,12 @@ int main(int argc, char* argv[]) {
         auto t_shm_start = std::chrono::steady_clock::now();
         while (!fc->done.load(std::memory_order_acquire))
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // done = benchmark 发完所有包(限速: 发一包等 received 追上)。但最后一包 sendto 后
+        // 立即置 done, 可能还在内核缓冲/在途未收。等 received 追上 sent 再停止, 否则
+        // receiver->stop() 打断 recv 会丢在途包(正确性: sent == parsed 的根基)。
+        while (fc->received.load(std::memory_order_acquire) <
+               fc->sent.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         auto t_shm_end = std::chrono::steady_clock::now();
         double wall = std::chrono::duration<double>(t_shm_end - t_shm_start).count();
         uint64_t parsed = total_parsed_count();

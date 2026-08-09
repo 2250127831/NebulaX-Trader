@@ -113,6 +113,43 @@ IoUring  AF_XDP  DPDK          (三个后端, 业务代码只依赖抽象)
 - 非目标帧（AF_XDP 8 / DPDK 9，veth/tap 上 IPv6 链路本地残留）由 recv() 内部剥帧跳过，测试层看不到。
 - 全量 ctest 21/21（原有回归 + 2 个 V4 测试 root 实测）全绿。
 
+### 4.1 配置切换 + 主程序（trader）三后端正确性验证
+
+**配置切换入口**：`market.backend`（io_uring / af_xdp / dpdk）+ `market.ifname`（af_xdp 绑定接口）+
+`market.vdev`（dpdk vdev 规格）+ `market.eal_args`（dpdk EAL 参数）。`make_receiver()` 按配置实例化，
+recv_th 按后端分流（io_uring 走多在途 batch，AF_XDP/DPDK 走单包 recv），下游拆包/解析/分发逻辑**三后端共用**。
+
+**配置**：
+```yaml
+# config/default.yaml (默认 io_uring, 真实网卡 UDP)
+market:
+  backend: io_uring
+# config/backend_af_xdp.yaml (本地正确性: veth0 挂 XDP+xsk)
+market:
+  backend: af_xdp
+  ifname: "veth0"
+# config/backend_dpdk.yaml (本地正确性: net_tap0 → 内核 tap dtap0)
+market:
+  backend: dpdk
+  vdev: "net_tap0"
+  eal_args: ["-l", "0", "--no-pci", "--no-huge", "-m", "128", "--file-prefix", "nxtrader"]
+```
+
+**一键验证**：`scripts/v4_backend_verify.sh` 逐后端起 trader(shm 握手) → benchmark(发到对应网络载体)
+→ 对比 `Messages sent` vs 解析总数（正确性 = sent == parsed）。
+
+| 后端 | 网络载体 | benchmark sent | trader parsed | 结果 |
+|---|---|---|---:|---:|---|
+| **io_uring** | 127.0.0.1 UDP socket | 12932 | 12932 | **PASS** |
+| **AF_XDP** | veth0(veth1 发包, 完整 L2 帧) | 12932 | 12932 | **PASS** |
+| **DPDK** | net_tap0(内核 tap dtap0) | 12932 | 12932 | **PASS** |
+
+**主程序停止时序修复（正确性根基）**：原 shm 模式 done 后立即 stop recv + parse_th 以 done 退出，
+最后一包（sendto 后 in-flight 未收）在途丢失 → sent 与 parsed 差 1~3 条。修复：
+1. parse_th 统一以 `stop` 退出（持续解析直到主线程确认收完），不再以 done 退出；
+2. 主线程 done 后先等 `fc->received == fc->sent`（所有已发包被接收）再 stop。
+三后端实测 sent == parsed 零丢失。
+
 ## 5. 结论
 
 1. **IMarketDataReceiver 抽象完整**：io_uring / AF_XDP / DPDK 三后端，业务代码零改动（测试直接复用

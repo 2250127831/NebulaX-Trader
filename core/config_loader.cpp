@@ -13,6 +13,14 @@ Config ConfigLoader::load(const std::string& path) {
         if (n["type"])           cfg.market.type          = n["type"].as<std::string>();
         if (n["host"])           cfg.market.host          = n["host"].as<std::string>();
         if (n["port"])           cfg.market.port          = n["port"].as<uint16_t>();
+        if (n["backend"])        cfg.market.backend       = n["backend"].as<std::string>();
+        if (n["ifname"])         cfg.market.ifname        = n["ifname"].as<std::string>();
+        if (n["vdev"])           cfg.market.vdev          = n["vdev"].as<std::string>();
+        if (n["eal_args"]) {
+            cfg.market.eal_args.clear();
+            for (const auto& a : n["eal_args"])
+                cfg.market.eal_args.push_back(a.as<std::string>());
+        }
         if (n["uring_entries"])  cfg.market.uring_entries = n["uring_entries"].as<uint32_t>();
         if (n["ring_bytes"])     cfg.market.ring_bytes    = n["ring_bytes"].as<size_t>();
         if (n["chan_slots"])     cfg.market.chan_slots    = n["chan_slots"].as<size_t>();

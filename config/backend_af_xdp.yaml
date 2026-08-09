@@ -15,9 +15,9 @@ market:
   #             本地正确性需 veth 对(veth0 挂 XDP+xsk); 真实网卡需支持 XDP DRV_MODE
   #   dpdk    : vdev 软件 PMD(如 net_tap0)/物理 PMD, 收完整 L2 帧后内部剥帧头
   #             本地正确性用 net_tap(vdev 建内核 tap dtap0); 真实网卡需有 DPDK PMD
-  backend: io_uring
+  backend: af_xdp
   # af_xdp: 绑定接口(如 veth0 / enp4s0)
-  ifname: ""
+  ifname: "veth0"
   # dpdk: vdev 规格(如 net_tap0 → 内核 tap dtap0)
   vdev: ""
   # dpdk: EAL 参数(本地 net_tap 需 --no-pci --no-huge; 真实网卡用 --pci <addr>)

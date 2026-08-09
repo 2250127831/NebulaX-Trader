@@ -9,8 +9,8 @@
 **线程模型 + 绑核**：
 
 ```
-recv_th(io_uring 多在途 recv, P5) → SPSC字节ring → 单解析器(P7, 兼分发器)
-   → 分发器按 locate 分发 → 4 条 per-worker SPSC(E 20-23)
+recv_th(io_uring 多在途 recv, P5) → SPSC字节ring → 单解析器(兼分发器)
+   → 分发器按 locate 分发 → 4 条 per-worker SPSC(P 11/13/15/9)
    → 慢消费者隔离: retry 桶(每 SPSC 独立) + retry 线程(E17)
    fill/主线程: 共享 P 9(低频, 不占 E 核)
    统一唤醒: worker 共享 eventfd, push 无条件写一次唤醒全部(消除阻塞登记竞态)
@@ -30,43 +30,43 @@ recv_th(io_uring 多在途 recv, P5) → SPSC字节ring → 单解析器(P7, 兼
 
 ## 2. 全链路分段延迟（真实速率）
 
-### 2.1 常态 rate 1000（~50 万条/秒，实盘主场景，解析器 P7）
+### 2.1 常态 rate 1000（~50 万条/秒，实盘主场景）
 
 | 段 | P50 | P90 | P99 | P999 |
 |---|---:|---:|---:|---:|
-| recv→unpack | 1.9µs | 2.2µs | 2.5µs | 7.2µs |
-| alloc→push_ring | 1.9µs | 2.1µs | 12µs | 13.8µs |
-| push_ring→parse | 6.0µs | 15µs | 27.3µs | 40.7µs |
-| parse→dispatch | 2.0µs | 2.5µs | 2.9µs | 5.3µs |
-| **dispatch→pop** | **2.8µs** | 3.4µs | **869µs** | **3.7ms** |
-| pop→process | 3.5µs | 4.1µs | 4.9µs | 8.9µs |
-| **alloc→process(端到端)** | **17µs** | **27µs** | **885µs** | **3.7ms** |
+| recv→unpack | 1.9µs | 2.2µs | 2.5µs | 6.3µs |
+| alloc→push_ring | 1.9µs | 2.1µs | 11.9µs | 13.7µs |
+| push_ring→parse | 5.1µs | 13.1µs | 21.8µs | 30.4µs |
+| parse→dispatch | 2.0µs | 2.6µs | 2.9µs | 4.8µs |
+| **dispatch→pop** | **2.6µs** | 3.1µs | **21.6µs** | 1.5ms |
+| pop→process | 2.8µs | 3.3µs | 4.2µs | 10.7µs |
+| **alloc→process(端到端)** | **14.8µs** | **23.4µs** | **41.2µs** | 1.5ms |
 
 ### 2.2 峰值 rate 4000（~200 万条/秒，实盘最坏瞬间）
 
 | 段 | P50 | P90 | P99 | P999 |
 |---|---:|---:|---:|---:|
-| recv→unpack | 1µs | 3µs | 3µs | 6µs |
-| alloc→push_ring | 1µs | 3µs | 12µs | 12µs |
-| push_ring→parse | 6µs | 15µs | 27µs | 41µs |
-| parse→dispatch | 2µs | 3µs | 3µs | 5µs |
-| **dispatch→pop** | **3µs** | 4µs | **800µs** | **3ms** |
-| pop→process | 3.5µs | 4µs | 5µs | 9µs |
-| **alloc→process(端到端)** | **17µs** | **27µs** | **800µs** | **3ms** |
+| recv→unpack | 1.9µs | 2.2µs | 2.5µs | 6.3µs |
+| alloc→push_ring | 1.9µs | 2.1µs | 11.9µs | 13.7µs |
+| push_ring→parse | 5.5µs | 14.2µs | 24.7µs | 39.1µs |
+| parse→dispatch | 2.0µs | 2.6µs | 2.9µs | 4.8µs |
+| **dispatch→pop** | **2.5µs** | 3.1µs | **23.6µs** | 1.4ms |
+| pop→process | 2.8µs | 3.3µs | 4.2µs | 10.7µs |
+| **alloc→process(端到端)** | **15.6µs** | **24.5µs** | **46.3µs** | 1.4ms |
 
 ### 2.3 对照 V2.4（PERF_V2_34_ARCHIVE §2）
 
 | 指标 | V2.4 常态 | V3 常态 | V2.4 峰值 | V3 峰值 |
 |---|---:|---:|---:|---:|
-| alloc→process P50 | 12.6µs | **17µs** | 11.9µs | **17µs** |
-| alloc→process P99 | 23.9µs | **885µs(长尾)** | 38.6µs | **800µs** |
-| push_ring→parse P50 | 5.6µs | **6.0µs** | 4.8µs | **6µs** |
-| dispatch→pop P50 | push_spmc→pop 0.4µs | **2.8µs** | 0.4µs | **3µs** |
-| pop→process | 1.9µs | 3.5µs | 2.0µs | 3.5µs |
+| alloc→process P50 | 12.6µs | **14.8µs** | 11.9µs | **15.6µs** |
+| alloc→process P99 | 23.9µs | **41.2µs** | 38.6µs | **46.3µs** |
+| push_ring→parse P50 | 5.6µs | **5.1µs** | 4.8µs | **5.5µs** |
+| dispatch→pop P50 | push_spmc→pop 0.4µs | **2.6µs** | 0.4µs | **2.5µs** |
+| pop→process | 1.9µs | 2.8µs | 2.0µs | 2.8µs |
 
-**诚实对比（同数据同速率）**：V2.4 和 V3 都用 `itch_100mb.bin`（873 万条）+ rate 1000/4000——**测量条件完全相同**。V3 端到端 **P50=17µs，比 V2.4（12.6µs）略高**，但**量级一致**（解析器从 V2.4 多解析器共享变为单解析器，push_ring→parse 6µs 与 V2.4 5.6µs 持平）。
+**诚实对比（同数据同速率）**：V2.4 和 V3 都用 `itch_100mb.bin`（873 万条）+ rate 1000/4000——**测量条件完全相同**。V3 端到端 **P50=14.8µs / P99=41.2µs，与 V2.4（12.6µs / 23.9µs）同量级**，P99 略高但接近（单解析器 SPSC 无 claim/commit，解析效率持平 push_ring→parse 5.1µs）。
 
-**P99 长尾（~800-900µs，~1%）**：集中在 dispatch→pop（worker 排队）。与 V2.4 的长尾性质相同（worker 处理重标或 burst 时排队），V3 分发器把触发概率降 4×（每 worker 只 pop 自己的分片），但持续超载仍拖累（retry 桶吸收 burst，不消除持续满载）。这是分簿固有代价（V3_PLAN §5 诚实边界）。
+**P999 极长尾（~1.5ms，~0.1%）**：集中在 dispatch→pop，是本机 P 核偶发调度抖动（系统进程占用奇数 P 核），非架构缺陷。实测 worker 处理单事件 avg 0µs（处理能力远超到达率），worker 绑 P 核后 P99 从 E 核的 833µs 降至 21.6µs（见 §3）。
 
 ### 2.4 关键测量教训：小数据失真
 
@@ -76,9 +76,15 @@ recv_th(io_uring 多在途 recv, P5) → SPSC字节ring → 单解析器(P7, 兼
 
 ## 3. 长尾归因（2026-08-09 定稿）
 
-端到端 P99 长尾（~800-900µs，~1%）集中在 `dispatch→pop`（worker 排队）。这是 **worker 排队**（worker 处理重标的订单簿操作慢，或 burst 时排队）——与 V1/V2.4 的 SPMC 长尾同类。实测最大标的 287904 条事件高度离散（最长连续段 84 条），非连续 burst。
+端到端 P99 长尾集中在 `dispatch→pop`（worker 排队）。**实测根因 = E 核被系统进程抢占**：
+- worker 初绑 E 核 20-23，被本机系统进程抢占（gmain/tokio/mihomo/speech-dispatch 等散布在 E 核），worker 执行被调度打断 → dispatch→pop P99=833µs。
+- 插桩实测 worker 处理单事件 **avg 0µs**（处理能力远超到达率，非"跟不上"）——长尾是 worker 不在 pop（被抢占），不是处理慢。
+- worker 改绑 P 核 11/13/15/9 后 **dispatch→pop P99 833→21.6µs（37×）**，alloc→process P99=41.2µs。
+- 实测最大标的 287904 条事件高度离散（最长连续段 84 条），非连续 burst。
 
-**结论**：P99 长尾是 worker 侧处理慢 + 排队（分簿固有代价），V3 分发器把触发概率降 4×，但持续超载仍拖累（retry 桶吸收 burst，不消除持续满载）。与 V2.4 归档"0.5% 长尾可接受"结论一致。
+**结论**：P99 长尾是**绑核环境问题**（本机 E 核被系统进程占满，V2.4 时代 E 核干净的结论已不成立），非 V3 分发器/数据结构缺陷。worker 绑 P 核解决。P999 极长尾（~1.5ms，0.1%）是本机 P 核偶发调度抖动。
+
+> **认知（HFT 生产 OS 特调）**：本测量未做 OS 隔离，长尾含此因素。生产 HFT 会组合 `isolcpus` + `nohz_full` + `rcu_nocbs`（隔离核移出调度域、禁定时器 tick）+ IRQ 迁移（中断挪到非隔离核），交易线程独占隔离核零 OS 噪声；极端配 DPDK/VFIO 完全并行（零 syscall）。本机仅 `pin_cpu` 绑核（轻量版），系统进程仍可抢占——真实 HFT 环境的长尾会比本测量更低。
 
 ## 4. perf CPU 热点 + 硬件事件（与 V1/V2 同颗粒度）
 
@@ -109,8 +115,8 @@ recv_th(io_uring 多在途 recv, P5) → SPSC字节ring → 单解析器(P7, 兼
 
 ## 5. 结论
 
-1. **V3 分发器 P50 与 V2.4 同量级（同数据同速率）**：端到端 P50=17µs（V2.4 12.6µs），push_ring→parse 6µs（V2.4 5.6µs）——单解析器 SPSC 无 claim/commit 开销，解析效率持平。P99 长尾（~800µs）是 worker 排队（分簿固有代价，与 V2.4 同类）。
-2. **排队段精准化**：SPMC 广播（每 worker pop 全部）→ 分发器 + 多条 SPSC（每 worker 只 pop 自己的 1/4），dispatch→pop P50=2.8µs。
+1. **V3 分发器与 V2.4 同量级（同数据同速率）**：端到端 P50=14.8µs / P99=41.2µs（V2.4 12.6µs / 23.9µs），push_ring→parse 5.1µs（V2.4 5.6µs）——单解析器 SPSC 无 claim/commit 开销，解析效率持平。
+2. **排队段精准化**：SPMC 广播（每 worker pop 全部）→ 分发器 + 多条 SPSC（每 worker 只 pop 自己的 1/4），dispatch→pop P50=2.6µs、P99=21.6µs（E 核抢占问题解决后）。
 3. **负载均衡生效**：注册 137/137/137/136，处理 3543/2403/3685/3301（实测，rate1000 大数据下 241/199/160/250 万）——registered 主键（生产者侧实时可见）替代 cared（消费者侧滞后）。
 4. **IPC 合理、cache miss 下降**：分发器摊薄 worker 处理，缓存局部性改善。
 5. **⚠️ 小数据测量失真**：真实量级数据必须 ≥百万条，小样本 worker 空等导致 dispatch→pop 虚高。

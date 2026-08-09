@@ -28,7 +28,7 @@ NebulaX-Trader 是一个面向低延迟量化交易场景的高性能交易基�
 项目有两条独立演进线：
 
 **业务架构线**：V1 单线程 → V2 并行 Pipeline → V3 多策略平台 → V5 L2 真实行情
-**网络基础设施线**：V1(io_uring) → V4(AF_XDP) → V6(DPDK)
+**网络基础设施线**：V1(io_uring) → V4(AF_XDP + DPDK) → V6(真实硬件三后端性能对比)
 
 ```
 V1
@@ -43,9 +43,9 @@ V1
   │                 │
   │                 └── 新增协议解析层，业务代码不改
   │
-  ├── V4：AF_XDP 网络后端（新增 AF_XDPReceiver，业务代码不改）
+  ├── V4：网络后端 AF_XDP + DPDK（接口完整 + 本地正确性，业务代码不改）
   │
-  └── V6：DPDK 网络后端（三种 IMarketDataReceiver 后端对比）
+  └── V6：真实硬件三后端性能对比（AF_XDP DRV_MODE / DPDK PMD 需支持网卡）
 ```
 
 ---
@@ -163,23 +163,30 @@ Parser ──► Market State ──► Dispatcher → Strategy → OMS → Exec
 
 ---
 
-# V4 — AF_XDP 网络后端
+# V4 — 网络后端（AF_XDP + DPDK，接口 + 正确性）
 
 ## 目标
 
-新增 `AF_XDPReceiver` 作为 `IMarketDataReceiver` 的第二个实现。
+`IMarketDataReceiver` 抽象完整：io_uring（V1）+ `AF_XDPReceiver` + `DPDKReceiver` 三个后端。
 
 Parser、Dispatcher、Strategy 等所有业务代码**一行不改**。
 
+**AF_XDP/DPDK 收到【完整 L2 帧】**（[以太头14][IPv4 20][UDP 8][载荷]，与真实网卡收包一致，
+**含 IP 头之前的 MAC 头**；DPDK 只是 PMD 换成软件模拟 vdev）。
+**recv() 语义统一**：receiver 内部自动剥帧头，返回纯 UDP 载荷 —— 解析器不感知帧头。
+
 ## 主要内容
 
-- 实现 `AF_XDPReceiver`（基于 AF_XDP 的零拷贝网络后端）；
-- 在模拟行情源下对比 io_uring 和 AF_XDP 的延迟差异。
+- 实现 `AF_XDPReceiver`（libbpf xsk，XDP_SKB 模式，veth 验证）；
+- 实现 `DPDKReceiver`（rte_ethdev + net_tap vdev 软件 PMD，条件编译）；
+- 正确性测试：benchmark 真实 UDP 发包 → 后端收完整帧 → recv() 剥头返回纯载荷 → 拆包 → 解析，
+  **零丢失（parsed == 文件非R消息数）+ seq 连续**；
+- 关键发现：lo 无 MAC 头，AF_XDP 收不到帧 → 测试载体用 veth；AF_XDP UMEM 单帧上限一页(4KB)。
 
 ## 相比 V3 的提升
 
-- 进一步降低网络路径延迟；
-- 验证接收层抽象的有效性。
+- 网络后端独立抽象层落地（接口完整 + 本地正确性可测），业务代码不改；
+- 性能验证留待真实硬件（见 V6）。
 
 ---
 
@@ -203,16 +210,16 @@ Parser、Dispatcher、Strategy 等所有业务代码**一行不改**。
 
 ---
 
-# V6 — DPDK 网络后端
+# V6 — 三后端真实硬件性能对比
 
 ## 目标
 
-引入 DPDK，`IMarketDataReceiver` 家族完整，做三种后端的横向 Benchmark。
+三后端（io_uring / AF_XDP / DPDK）的**真实硬件横向 Benchmark**。V4 已交付全部后端接口 + 本地
+正确性（veth / net_tap 虚拟模式），性能验证需支持 XDP 驱动模式 / DPDK PMD 的网卡。
 
 ## 主要内容
 
-- 新增 `DPDKReceiver`（基于 DPDK 的用户态网卡驱动）；
-- 完整后端家族：
+- 三后端家族（V4 已完整）：
 
 ```
 IMarketDataReceiver
@@ -220,8 +227,11 @@ IMarketDataReceiver
   ┌─────┼──────┐
   │     │      │
 io_uring AF_XDP DPDK
-（V1） （V4） （V6）
+（V1） （V4） （V4）
 ```
+
+- 在支持 XDP_DRV_MODE（零拷贝）的网卡上对比 AF_XDP vs io_uring；
+- 在支持 DPDK PMD 的网卡上对比 DPDK vs 前两者。
 
 ## 对比测试
 

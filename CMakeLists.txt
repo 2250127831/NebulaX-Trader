@@ -17,6 +17,12 @@ else()
     set(URING_LIBS ${LIBURING_LIBRARIES})
 endif()
 
+# libbpf（V4 AF_XDP 后端；xsk 绑定 + 默认 XDP 程序重定向）
+pkg_check_modules(LIBBPF REQUIRED libbpf)
+
+# DPDK（V4 DPDK 后端；net_tap/net_af_packet vdev 软件 PMD，可选）
+pkg_check_modules(LIBDPDK QUIET libdpdk)
+
 # ── 编译选项 ──
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic -march=native -mtune=native)
@@ -56,12 +62,24 @@ add_library(core
     core/net/io_uring_receiver.cpp
     core/net/io_uring_sender.h
     core/net/io_uring_sender.cpp
+    core/net/af_xdp_receiver.h
+    core/net/af_xdp_receiver.cpp
+    core/net/frame_util.h
     core/ipc/flow_control.h
 )
 
+if(LIBDPDK_FOUND)
+    target_sources(core PRIVATE core/net/dpdk_receiver.h core/net/dpdk_receiver.cpp)
+endif()
+
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(core PUBLIC yaml-cpp ${URING_LIBS})
-target_include_directories(core PUBLIC ${LIBURING_INCLUDE_DIRS})
+target_link_libraries(core PUBLIC yaml-cpp ${URING_LIBS} ${LIBBPF_LIBRARIES})
+target_include_directories(core PUBLIC ${LIBURING_INCLUDE_DIRS} ${LIBBPF_INCLUDE_DIRS})
+if(LIBDPDK_FOUND)
+    target_link_libraries(core PUBLIC ${LIBDPDK_LIBRARIES})
+    target_include_directories(core PUBLIC ${LIBDPDK_INCLUDE_DIRS})
+    target_compile_definitions(core PUBLIC HAVE_DPDK=1)
+endif()
 
 # ── 行情模块 ──
 add_library(market
@@ -272,3 +290,30 @@ add_test(NAME ut_benchmark_verify
 # (CI GitHub runner 上卡死无输出)。标 ci-skip → CI 用 -LE ci-skip 排除, 本地全跑。
 # 超时保护: 即便 CI 误跑也在 120s 超时失败暴露, 不无限挂。
 set_tests_properties(ut_benchmark_verify PROPERTIES LABELS "ci-skip" TIMEOUT 120)
+
+# ── V4 网络后端正确性测试（AF_XDP / DPDK）──
+# 端到端: benchmark 真实 UDP 发包 → AF_XDP(veth)/DPDK(net_tap) 收完整 L2 帧
+#   → 剥帧头 → 拆包 → 解析 → 零丢失 + seq 连续
+# 需要 root(建 veth/绑 xsk/DPDK 运行) + 内核 XDP/veth 支持 → 标 ci-skip。
+# 非 root 运行时测试自身 SKIP(返回 0), CI 全排除。
+add_executable(ut_af_xdp_verify
+    tests/integration/test_af_xdp_verify.cpp
+)
+target_link_libraries(ut_af_xdp_verify PRIVATE core market)
+add_test(NAME ut_af_xdp_verify
+    COMMAND ut_af_xdp_verify
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_chain_sample.bin
+        $<TARGET_FILE:trader_benchmark>)
+set_tests_properties(ut_af_xdp_verify PROPERTIES LABELS "ci-skip" TIMEOUT 120)
+
+if(LIBDPDK_FOUND)
+    add_executable(ut_dpdk_verify
+        tests/integration/test_dpdk_verify.cpp
+    )
+    target_link_libraries(ut_dpdk_verify PRIVATE core market)
+    add_test(NAME ut_dpdk_verify
+        COMMAND ut_dpdk_verify
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_chain_sample.bin
+            $<TARGET_FILE:trader_benchmark>)
+    set_tests_properties(ut_dpdk_verify PROPERTIES LABELS "ci-skip" TIMEOUT 120)
+endif()

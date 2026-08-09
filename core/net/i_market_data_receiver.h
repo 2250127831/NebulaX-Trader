@@ -8,6 +8,11 @@
 // 所有网络后端（io_uring / AF_XDP / DPDK）实现此接口。
 // Parser、Dispatcher、Strategy 等业务代码只依赖此接口，不依赖具体后端。
 //
+// recv() 语义统一：三个后端都返回【纯 UDP 载荷】(MoldUDP64 包)。
+//   - io_uring（UDP socket）：内核剥离以太/IP/UDP 头，天然是载荷。
+//   - AF_XDP / DPDK：收到【完整 L2 帧】(与真实网卡一致, 含 IP 头之前的 MAC 头)，
+//     recv() 内部自动剥帧头（extract_udp_payload），非目标帧跳过 —— 解析器不感知帧头。
+//
 // 三种使用模式（线程/事件循环由使用方组织，接口只提供收发能力）：
 //   1. 阻塞单线程循环（V1）   : recv() 阻塞直到收到数据
 //   2. 非阻塞轮询             : set_blocking(false) 后 recv() 无数据立即返回 0

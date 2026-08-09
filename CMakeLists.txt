@@ -245,3 +245,7 @@ add_test(NAME ut_benchmark_verify
         ${CMAKE_CURRENT_SOURCE_DIR}/test_data/itch_chain_sample.bin
         8080
         $<TARGET_FILE:trader_benchmark>)
+# 端到端集成测试: fork benchmark + loopback UDP + io_uring, 对无权限 runner 敏感
+# (CI GitHub runner 上卡死无输出)。标 ci-skip → CI 用 -LE ci-skip 排除, 本地全跑。
+# 超时保护: 即便 CI 误跑也在 120s 超时失败暴露, 不无限挂。
+set_tests_properties(ut_benchmark_verify PROPERTIES LABELS "ci-skip" TIMEOUT 120)

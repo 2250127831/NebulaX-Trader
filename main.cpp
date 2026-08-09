@@ -73,7 +73,7 @@ static void pin_cpu(int cpu) {
 //                  进程抢占, 实际只一半算力, 真实速率下 E 核够用且独占更优)
 //   fill/主线程    共享 P 核 9(低频, 不占 E 核, P 核空闲)
 static const int kPinRecv    = 5;   // io_uring 收包(高吞吐, 大核)
-static const int kPinParseE0 = 16;  // 解析器小核 E16(V3 单解析器, 无 SMT 真独占)
+static const int kPinParseE0 = 7;   // 解析器 P 核 7(V1 同款; E16 实测 push_ring→parse 50ms, P7 6.4µs)
 static const int kPinRetryE  = 17;  // retry 线程小核 E17(处理下游满, 常驻)
 static const int kPinIdle    = 9;   // 低频共享核(fill + 主线程, P 核空闲, 不占 E 核)
 
@@ -276,21 +276,26 @@ int main(int argc, char* argv[]) {
     // 同一序列 + 一个 locate 只归一个 worker → 订单簿时序正确(成交不先于对应委托)。
     const size_t nworkers = std::max<size_t>(1, cfg.order_book.workers);
     const size_t per_chan = cfg.market.chan_slots / nworkers;   // 每条 SPSC 容量
+    // 统一唤醒: 所有 worker 共享一个 eventfd, push 无条件写一次唤醒全部阻塞 worker。
+    // 消除每队列独立 fd + blocked_ 登记的时序竞态。
+    const int kWorkerWakeFd = eventfd(0, EFD_NONBLOCK);
     std::vector<std::unique_ptr<MarketEvent[]>> chan_bufs;      // 持有槽位数组
     std::vector<std::unique_ptr<SPSCEventRing>> spscs;
     spscs.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i) {
         auto buf = std::make_unique<MarketEvent[]>(per_chan);
-        spscs.emplace_back(std::make_unique<SPSCEventRing>(buf.get(), per_chan));
+        spscs.emplace_back(std::make_unique<SPSCEventRing>(buf.get(), per_chan, kWorkerWakeFd));
         chan_bufs.push_back(std::move(buf));   // 保证槽位存活(队列不拥有)
     }
     // retry 桶: 每 SPSC 一个, 独立容量(小容量即可, 桶满才阻塞解析器)。
+    // retry 桶共享一个唤醒 fd(retry 线程 poll 它, 与 worker 唤醒分开)。
+    const int kRetryWakeFd = eventfd(0, EFD_NONBLOCK);
     std::vector<std::unique_ptr<MarketEvent[]>> retry_bufs;
     std::vector<std::unique_ptr<RetryBucket>> retry_buckets;
     retry_buckets.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i) {
         auto buf = std::make_unique<MarketEvent[]>(per_chan);
-        retry_buckets.emplace_back(std::make_unique<RetryBucket>(buf.get(), per_chan));
+        retry_buckets.emplace_back(std::make_unique<RetryBucket>(buf.get(), per_chan, kRetryWakeFd));
         retry_bufs.push_back(std::move(buf));
     }
     // SPSCEventRing 数组(Dispatcher 需要连续指针): 从 vector 收集 raw 指针。
@@ -371,7 +376,7 @@ int main(int argc, char* argv[]) {
     // 回放结束 = shm 模式(done) / no-shm 模式(stop，由主线程定时置)。
     // 退出: stop/done 且 ring 全空(head==tail, 所有消息已读)。
     std::thread parse_th([&]() {
-        pin_cpu(kPinParseE0);   // 单解析器占小核 16(无 SMT 真独占)
+        pin_cpu(kPinParseE0);   // 单解析器占 P 核 7(V1 同款, 算力足)
         auto& p = *parser;
         int spin_left = 0;   // 混合退避: 短暂空自旋顶住唤醒延迟, 持续空才阻塞
         while ((fc && !fc->done.load(std::memory_order_acquire)) || (!fc && !stop.load())) {
@@ -454,6 +459,8 @@ int main(int argc, char* argv[]) {
                 while (rq.bucket.peek(ev)) {
                     if (!spscs[i]->push(ev)) break;   // spsc 满, 推不进, 头留在桶下轮
                     rq.bucket.pop(ev);                // 推成功才取走(peek→pop 原子一致)
+                    // [LensX 消息级] retry 推回 spsc(retry_in→retry_out 段终点, 抽样)。
+                    if (ev.seq_id % lensx::kSample == 0) lensx::mark_retry_out(ev.seq_id);
                 }
                 // 桶清空才清 active(保序前提: 解析器期间只能进桶)。
                 if (rq.bucket.pending() == 0)

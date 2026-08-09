@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/market_event.h"
+#include "core/prof/lensx_probe.h"
 #include "core/queue/spsc_event_ring.h"
 
 #include <atomic>
@@ -75,14 +76,18 @@ public:
                   std::atomic<uint64_t>* registered) {
         uint32_t owner = lookup_or_register(static_cast<uint32_t>(ev.locate),
                                             cared, registered);
+        // [LensX 消息级] 分发起点(parse_done→dispatch 段终点, 抽样)。
+        if (ev.seq_id % lensx::kSample == 0) lensx::mark_dispatch(ev.seq_id);
         RetryBucket* rq = retry_[owner];
         if (rq->active.load(std::memory_order_acquire)) {
             // 桶有积压: 必须进桶保序(worker 还没消费完之前的, 直接 push 会乱序)。
+            if (ev.seq_id % lensx::kSample == 0) lensx::mark_retry_in(ev.seq_id);
             while (!rq->bucket.push(ev)) _mm_pause();   // 桶满阻塞, 只卡该桶
             return;
         }
         if (spsc_[owner]->push(ev)) return;             // 直接推成功
         // 满 → 进桶 + 激活: 后续同 SPSC 事件必须进桶保序
+        if (ev.seq_id % lensx::kSample == 0) lensx::mark_retry_in(ev.seq_id);
         while (!rq->bucket.push(ev)) _mm_pause();
         rq->active.store(true, std::memory_order_release);
     }

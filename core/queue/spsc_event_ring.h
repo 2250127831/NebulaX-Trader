@@ -20,19 +20,17 @@
 // 语义:
 //   push(ev): 满返回 false(调用方决定重试/卸载到 retry)。成功写槽 + release tail。
 //   pop(ev):  空返回 false(worker 循环混合退避)。成功读槽 + release head。
-//   唤醒: 每队列 1 个 eventfd + blocked 标志。消费者阻塞前登记 blocked=true,
-//         push 只写阻塞者的 fd(单消费者, 有阻塞才写, 无阻塞零 syscall)。
+//   唤醒: **统一唤醒**——所有 worker 共享同一个 eventfd(外部传入), push 无条件写一次,
+//         唤醒所有阻塞 worker。无 blocked_ 登记竞态(不需要登记, 写即唤醒)。
+//         wait_for_data 先 drain 残留计数再 poll, 只等新唤醒(不 busy-loop)。
 //
 // 存储空间由用户传入(堆/共享内存), 队列不拥有。capacity 必须 2 的幂。
+// wake_fd 由调用方创建并共享(所有 SPSC 用同一个), 队列不拥有不关闭。
 class SPSCEventRing {
 public:
-    SPSCEventRing(MarketEvent* slots, size_t capacity)
-        : slots_(slots), capacity_(capacity), mask_(capacity - 1) {
-        wake_fd_ = eventfd(0, EFD_NONBLOCK);
-    }
-    ~SPSCEventRing() {
-        if (wake_fd_ >= 0) close(wake_fd_);
-    }
+    SPSCEventRing(MarketEvent* slots, size_t capacity, int shared_wake_fd)
+        : slots_(slots), capacity_(capacity), mask_(capacity - 1), wake_fd_(shared_wake_fd) {}
+    ~SPSCEventRing() = default;   // 不拥有 wake_fd, 不 close(调用方共享)
     SPSCEventRing(const SPSCEventRing&) = delete;
     SPSCEventRing& operator=(const SPSCEventRing&) = delete;
 
@@ -44,15 +42,17 @@ public:
 
     // ── producer(解析器) ──
     // 满返回 false。单写者无竞争, tail 单调。
+    // 唤醒: 每次 push 都写 fd(无条件)。设计决策——不管 worker 是否阻塞都 wake,
+    //   消除 blocked_ 登记时序竞态(worker 阻塞瞬间 push 可能漏写 fd → poll 等超时)。
+    //   worker 活跃时写 fd 是残留计数, wait_for_data 先 drain 掉(poll 只等新唤醒),
+    //   不会 busy-loop。代价: 每 push 一次 write syscall(解析器侧, ~200万/s)。
     bool push(const MarketEvent& ev) {
         size_t tail = tail_.load(std::memory_order_relaxed);
         if (tail - head_.load(std::memory_order_acquire) >= capacity_) return false;  // 满
         slots_[tail & mask_] = ev;
         tail_.store(tail + 1, std::memory_order_release);
-        if (blocked_.load(std::memory_order_acquire)) {   // 有消费者阻塞才写 fd
-            uint64_t one = 1;
-            ssize_t r = write(wake_fd_, &one, sizeof(one)); (void)r;
-        }
+        uint64_t one = 1;
+        ssize_t r = write(wake_fd_, &one, sizeof(one)); (void)r;   // 无条件唤醒
         return true;
     }
 
@@ -93,11 +93,14 @@ public:
     }
 
     // 阻塞等数据。返回 true=有唤醒(可能有数据), false=超时。
+    // 无条件 wake 下 fd 可能有残留计数(worker 活跃时 push 写的), 先 drain 到 EAGAIN,
+    // 再 poll 只等"新的"唤醒——否则残留计数让 poll 立即返回 → busy-loop 烧 E 核。
     bool wait_for_data(int timeout_ms = 1000) {
+        uint64_t ev;
+        while (read(wake_fd_, &ev, sizeof(ev)) > 0) {}   // drain 残留计数(EAGAIN 停)
         struct pollfd pfd = {wake_fd_, POLLIN, 0};
         int ret = poll(&pfd, 1, timeout_ms);
         if (ret > 0) {
-            uint64_t ev;
             ssize_t r = read(wake_fd_, &ev, sizeof(ev)); (void)r;   // 消费唤醒计数
             return true;
         }
@@ -119,7 +122,8 @@ private:
 //   active: 该 SPSC 是否有积压(桶非空)。active=true 时解析器必须进桶保序,
 //           禁止直接 push spsc(可能乱序)。retry 清空桶后才置 false。
 struct RetryBucket {
-    explicit RetryBucket(MarketEvent* slots, size_t capacity) : bucket(slots, capacity) {}
+    explicit RetryBucket(MarketEvent* slots, size_t capacity, int shared_wake_fd)
+        : bucket(slots, capacity, shared_wake_fd) {}
     SPSCEventRing bucket;
     std::atomic<bool> active{false};
 };

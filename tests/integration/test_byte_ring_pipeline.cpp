@@ -7,6 +7,7 @@
 #include "core/queue/queue_manager.h"
 #include "core/queue/spsc_byte_ring.h"
 #include "core/queue/spsc_event_ring.h"
+#include <sys/eventfd.h>
 #include "market/pipeline/byte_ring_parser.h"
 #include "market/pipeline/mold_udp_unpacker.h"
 
@@ -120,9 +121,11 @@ int main(int argc, char* argv[]) {
     // V3 分发器: 1 worker(所有 locate 归 worker 0) → 单条 SPSC。策略线程从中消费。
     // 单 worker → 全部事件进 spsc[0], 验证"分发 + 消费 + 保序"链路。
     auto* ev_slots = new MarketEvent[1 << 16];
-    SPSCEventRing spsc(ev_slots, 1 << 16);
+    int wake_fd = eventfd(0, EFD_NONBLOCK);   // 统一唤醒共享 fd
+    SPSCEventRing spsc(ev_slots, 1 << 16, wake_fd);
     auto* retry_slots = new MarketEvent[1 << 16];
-    RetryBucket retry(retry_slots, 1 << 16);
+    int retry_fd = eventfd(0, EFD_NONBLOCK);
+    RetryBucket retry(retry_slots, 1 << 16, retry_fd);
     SPSCEventRing* spsc_arr[1] = {&spsc};
     RetryBucket* retry_arr[1] = {&retry};
     Dispatcher dispatcher(spsc_arr, retry_arr, 1);
@@ -187,7 +190,9 @@ int main(int argc, char* argv[]) {
     // 线程已 join, 队列不再访问 buffer; 静态析构发生在 main 返回后, 不触及此处。
     delete[] ring_buf;
     delete[] ev_slots;
+    close(wake_fd);
     delete[] retry_slots;
+    close(retry_fd);
 
     if (g_failures == 0) {
         printf("\nMoldUDP64 拆包管道集成测试 PASS ✓\n");

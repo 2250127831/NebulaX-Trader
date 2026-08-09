@@ -13,6 +13,7 @@
 #include "core/queue/spmc_event_queue.h"
 #include "core/queue/spsc_byte_ring.h"
 #include "core/queue/spsc_event_ring.h"
+#include <sys/eventfd.h>
 #include "core/net/i_market_data_receiver.h"
 #include "core/net/io_uring_receiver.h"
 #include "core/net/io_uring_sender.h"
@@ -126,9 +127,11 @@ int main(int argc, char* argv[]) {
 
     // V3 分发器: 1 worker(所有 locate 归 worker 0) → 单条 SPSC。单消费线程分流。
     auto* ev_slots = new MarketEvent[1 << 20];   // 1M 槽
-    SPSCEventRing spsc(ev_slots, 1 << 20);
+    int wake_fd = eventfd(0, EFD_NONBLOCK);   // 统一唤醒共享 fd
+    SPSCEventRing spsc(ev_slots, 1 << 20, wake_fd);
     auto* retry_slots = new MarketEvent[1 << 20];
-    RetryBucket retry(retry_slots, 1 << 20);
+    int retry_fd = eventfd(0, EFD_NONBLOCK);
+    RetryBucket retry(retry_slots, 1 << 20, retry_fd);
     SPSCEventRing* spsc_arr[1] = {&spsc};
     RetryBucket* retry_arr[1] = {&retry};
     Dispatcher dispatcher(spsc_arr, retry_arr, 1);
@@ -467,7 +470,9 @@ int main(int argc, char* argv[]) {
     CHECK(n_pending == 0);
 
     delete[] ev_slots;
+    close(wake_fd);
     delete[] retry_slots;
+    close(retry_fd);
     receiver->stop();
     if (g_failures == 0) {
         printf("\n端到端验证 PASS ✓\n");

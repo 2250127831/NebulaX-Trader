@@ -75,11 +75,15 @@ public:
     // 解析线程：阻塞等数据。poll(wake_fd) 直到被唤醒（或 timeout_ms 超时）。
     // 返回 true 表示有唤醒（可能有数据），false 表示超时。
     // 唤醒后应调 parse_available() 消费。
+    // 先 drain 残留计数(recv_th 每包 notify, 解析器活跃时写的是残留), 再 poll 只等
+    // "新"唤醒(recv_th 写完数据后的 notify)——否则残留让 poll 立即返回 → 假唤醒空转,
+    // 解析器反复 poll 到超时(累积 50ms 延迟)。
     bool wait_for_data(int timeout_ms = 1000) {
+        uint64_t ev;
+        while (read(wake_fd_, &ev, sizeof(ev)) > 0) {}   // drain 残留(EAGAIN 停)
         struct pollfd pfd = {wake_fd_, POLLIN, 0};
         int ret = poll(&pfd, 1, timeout_ms);
         if (ret > 0) {
-            uint64_t ev;
             ssize_t r = read(wake_fd_, &ev, sizeof(ev)); (void)r;  // 消费唤醒计数（EFD_NONBLOCK）
             return true;
         }

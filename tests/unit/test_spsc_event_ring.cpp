@@ -5,6 +5,7 @@
 //   - 单生产者线程推 N 事件 / 单消费者线程收 N 事件，零丢失零乱序
 //   - 唤醒（消费者阻塞 poll，生产者 push 唤醒）
 #include "core/queue/spsc_event_ring.h"
+#include <sys/eventfd.h>
 
 #include <atomic>
 #include <chrono>
@@ -30,9 +31,11 @@ static MarketEvent make_ev(uint64_t seq, MarketEvent::Type type) {
 }
 
 int main() {
+    int wake_fd = eventfd(0, EFD_NONBLOCK);   // 统一唤醒共享 fd
+
     // ── 基本 push/pop + 保序 ──
     MarketEvent* slots = new MarketEvent[4];
-    SPSCEventRing q(slots, 4);
+    SPSCEventRing q(slots, 4, wake_fd);
 
     CHECK(q.push(make_ev(1, MarketEvent::Type::ADD)));
     CHECK(q.push(make_ev(2, MarketEvent::Type::TRADE)));
@@ -45,7 +48,7 @@ int main() {
 
     // ── 满边界 ──
     MarketEvent* slots2 = new MarketEvent[4];
-    SPSCEventRing q2(slots2, 4);
+    SPSCEventRing q2(slots2, 4, wake_fd);
     CHECK(q2.push(make_ev(1, MarketEvent::Type::ADD)));
     CHECK(q2.push(make_ev(2, MarketEvent::Type::ADD)));
     CHECK(q2.push(make_ev(3, MarketEvent::Type::ADD)));
@@ -56,7 +59,7 @@ int main() {
 
     // ── 跨回绕: 写满一圈 + 读空 + 再写, 序正确 ──
     MarketEvent* slots3 = new MarketEvent[4];
-    SPSCEventRing q3(slots3, 4);
+    SPSCEventRing q3(slots3, 4, wake_fd);
     for (int i = 0; i < 4; ++i) CHECK(q3.push(make_ev(i + 1, MarketEvent::Type::ADD)));
     for (int i = 0; i < 4; ++i) { CHECK(q3.pop(ev) && ev.seq_id == (uint64_t)(i + 1)); }
     for (int i = 4; i < 8; ++i) CHECK(q3.push(make_ev(i + 1, MarketEvent::Type::ADD)));  // 回绕写
@@ -65,7 +68,7 @@ int main() {
     // ── 单生产者 / 单消费者线程并发: N 事件零丢失零乱序 ──
     constexpr int N = 100000;
     MarketEvent* slots4 = new MarketEvent[1 << 16];
-    SPSCEventRing q4(slots4, 1 << 16);
+    SPSCEventRing q4(slots4, 1 << 16, wake_fd);
     std::atomic<bool> start{false};
     std::atomic<bool> done{false};
     std::thread producer([&] {
@@ -95,7 +98,7 @@ int main() {
 
     // ── 唤醒: 消费者阻塞 poll, 生产者 push 唤醒 ──
     MarketEvent* slots5 = new MarketEvent[4];
-    SPSCEventRing q5(slots5, 4);
+    SPSCEventRing q5(slots5, 4, wake_fd);
     std::atomic<bool> woke{false};
     std::thread blocker([&] {
         q5.set_blocked();
@@ -111,6 +114,7 @@ int main() {
     delete[] slots3;
     delete[] slots4;
     delete[] slots5;
+    close(wake_fd);
 
     if (g_failures == 0) {
         printf("SPSCEventRing 单测 PASS ✓\n");

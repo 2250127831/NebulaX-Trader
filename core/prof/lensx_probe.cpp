@@ -30,7 +30,13 @@ LENSX_NOINLINE void mark_push_ring(uint64_t key) {
 LENSX_NOINLINE void mark_parse_done(uint64_t key) {
     if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
 }
-LENSX_NOINLINE void mark_push_spmc(uint64_t key) {
+LENSX_NOINLINE void mark_dispatch(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
+LENSX_NOINLINE void mark_retry_in(uint64_t key) {
+    if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
+}
+LENSX_NOINLINE void mark_retry_out(uint64_t key) {
     if (key % kSample == 0) { volatile uint64_t x = key; (void)x; }
 }
 

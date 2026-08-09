@@ -91,6 +91,62 @@ int main() {
     CHECK(empty_book.best_ask() == -1);
     CHECK(empty_book.empty());
 
+    // ── 同价两单（哈希表同 key 覆盖关键场景）──
+    OrderPool hpool(16);
+    OrderMap  hindex(16);
+    OrderBook hbook(hpool, hindex);
+    CHECK(hbook.add(10, OrderSide::BUY,  1000, 100, 1) != UINT32_MAX);
+    CHECK(hbook.add(11, OrderSide::BUY,  1000, 200, 2) != UINT32_MAX);   // 同价第二单
+    CHECK(hbook.best_bid() == 1000);
+    CHECK(hbook.best_bid_volume() == 300);   // 同档量累计
+    CHECK(hbook.bid_levels() == 1);          // 同价仍是一档
+    // 摘一单 → 档内剩一单, 量减
+    CHECK(hbook.remove(10));
+    CHECK(hbook.best_bid() == 1000);
+    CHECK(hbook.best_bid_volume() == 200);
+    CHECK(hbook.bid_levels() == 1);
+    // 摘第二单 → 档空
+    CHECK(hbook.remove(11));
+    CHECK(hbook.best_bid() == -1);           // 空簿
+    CHECK(hbook.bid_levels() == 0);
+    CHECK(hbook.empty());
+
+    // ── 档空后同价重建（tombstone 复用 + lvl 重置关键场景）──
+    CHECK(hbook.add(12, OrderSide::BUY, 1000, 500, 3) != UINT32_MAX);    // 同价重建
+    CHECK(hbook.best_bid() == 1000);
+    CHECK(hbook.best_bid_volume() == 500);   // 必须是新量, 不能残留旧 0
+    CHECK(hbook.bid_levels() == 1);
+
+    // ── best 档被删时降级重扫（买边删最高价）──
+    OrderPool bpool(16);
+    OrderMap  bindex(16);
+    OrderBook bbook(bpool, bindex);
+    CHECK(bbook.add(20, OrderSide::BUY,  980, 100, 1) != UINT32_MAX);
+    CHECK(bbook.add(21, OrderSide::BUY, 1010, 200, 2) != UINT32_MAX);    // 1010 是 best
+    CHECK(bbook.add(22, OrderSide::BUY,  995, 300, 3) != UINT32_MAX);
+    CHECK(bbook.best_bid() == 1010);
+    CHECK(bbook.remove(21));                 // 删 best 1010
+    CHECK(bbook.best_bid() == 995);          // 降级重扫 → 次高价
+    CHECK(bbook.best_bid_volume() == 300);
+    CHECK(bbook.bid_levels() == 2);
+
+    // ── 扩容（超初始 1024 槽触发 grow, 验证 rehash 正确 + 引用有效）──
+    OrderPool gpool(1 << 20);
+    OrderMap  gindex(1 << 20);
+    OrderBook gbook(gpool, gindex);
+    for (int i = 0; i < 2000; ++i)   // 2000 档 > 1024 → 触发 grow
+        CHECK(gbook.add(100 + i, OrderSide::BUY, 100000 - i * 100, 10, i) != UINT32_MAX);
+    CHECK(gbook.bid_levels() == 2000);       // 全部档都在
+    CHECK(gbook.best_bid() == 100000);       // 最高价(第一个插入)
+    CHECK(gbook.best_bid_volume() == 10);
+    // 随机删一档 + 查档量
+    CHECK(gbook.remove(100 + 500));
+    CHECK(gbook.bid_levels() == 1999);
+    CHECK(gbook.bid_volume_at(100000 - 500 * 100) == 0);   // 被删档量 0
+    // 删 best 后降级重扫
+    CHECK(gbook.remove(100));
+    CHECK(gbook.best_bid() == 100000 - 100); // 次高价
+
     if (g_failures == 0) {
         printf("\n高性能订单簿单测 PASS ✓ (池用量=%zu)\n", book.pool_usage());
         return 0;

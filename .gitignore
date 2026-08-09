@@ -1,6 +1,7 @@
 # Build
 build/
 build_asan/
+build_tsan/
 cmake-build-*/
 
 # CodeGraph 索引

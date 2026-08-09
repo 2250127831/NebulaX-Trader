@@ -1,5 +1,5 @@
 // 端到端验证测试：benchmark 发送 MoldUDP64 + 接收端完整链路
-//   recv → 拆包加seq → 字节ring → ByteRingParser → 通道A → 4策略 + K线
+//   recv → 拆包加seq → 字节ring → ByteRingParser → 通道A → 3策略 + K线
 //
 // 验证:
 //   - benchmark 完整发送(子进程 exit 0)
@@ -23,7 +23,6 @@
 #include "strategy/combo/signal_combiner.h"
 #include "strategy/tick/price_breakout_strategy.h"
 #include "strategy/tick/tick_momentum_strategy.h"
-#include "strategy/tick/trade_direction_strategy.h"
 #include "strategy/tick/volume_breakout_strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
 #include "strategy/tick/order_flow_imbalance_strategy.h"
@@ -119,9 +118,9 @@ int main(int argc, char* argv[]) {
     // ── 管道: 共享 ring + 通道A + 拆包器 + 解析器 + 策略 ──
     // ring/通道容量加大, 减少背压(接收端跟上 benchmark)
     auto ring_buf = std::make_unique<uint8_t[]>(1 << 22);   // 4MB
-    size_t ring_id = QueueManager::create(QueueManager::Type::SPSC_BYTE_RING,
+    size_t ring_id = QueueManager::create(QueueManager::Type::SPMC_BYTE_RING,
                                           ring_buf.get(), 1 << 22);
-    auto& shared_ring = QueueManager::get<SPSCByteRing>(ring_id);
+    auto& shared_ring = QueueManager::get<SPMCByteRing>(ring_id);
 
     auto* ev_slots = new MarketEvent[1 << 20];   // 1M 槽
     size_t chan_id = QueueManager::create(QueueManager::Type::SPMC_EVENT_QUEUE,
@@ -133,7 +132,6 @@ int main(int argc, char* argv[]) {
 
     VolumeBreakoutStrategy vbs;
     PriceBreakoutStrategy pbs;
-    TradeDirectionStrategy tds;
     TickMomentumStrategy tms;
     KLineAggregator kagg(0, 10);   // 按数量: 每 10 笔成交一根 K线(与时间无关, 回放小数据也成形)
     TrendStrategy trend;            // 低频主策略候选(趋势, 需长周期均线)
@@ -178,8 +176,34 @@ int main(int argc, char* argv[]) {
     struct State { std::atomic<bool> armed{false}; };
     State st;
 
-    // ── 接收线程: recv → unpacker → fc->received++ ──
+    // ── 接收线程(V2.4 多在途 recv): io_uring 走 recv_batch, 其他后端走单包 recv ──
     std::thread recv_th([&]() {
+        auto* uring = dynamic_cast<IoUringReceiver*>(receiver.get());
+        if (uring) {
+            uring->begin_batch();   // 预提交在途 recv SQE(不阻塞, 才可先置 armed)
+            st.armed.store(true, std::memory_order_release);
+            uint8_t buf[65536];
+            static bool dumped = false;
+            std::atomic<size_t>& rc = recv_count;
+            while (!stop.load(std::memory_order_acquire)) {
+                ssize_t n = uring->recv_batch(buf, sizeof(buf));
+                if (n <= 0) break;
+                ++rc;
+                if (!dumped) {
+                    FILE* df = fopen("/tmp/pkt_dump.txt", "w");
+                    fprintf(df, "recv n=%zd\n", n);
+                    for (int i = 0; i < (n < 32 ? n : 32); ++i) fprintf(df, "%02x ", buf[i]);
+                    fprintf(df, "\n");
+                    fclose(df);
+                    dumped = true;
+                }
+                fc->received.fetch_add(1, std::memory_order_release);  // 先确认收到包
+                size_t unpacked = unpacker.feed(buf, (size_t)n);
+                unpacked_total += unpacked;
+            }
+            return;
+        }
+        // 非 io_uring 后端: 原单包阻塞循环
         receiver->set_blocking(false);
         uint8_t pre[65536];
         receiver->recv(pre, sizeof(pre));
@@ -214,14 +238,14 @@ int main(int argc, char* argv[]) {
         while (!stop.load(std::memory_order_acquire)) {
             size_t n = parser.parse_available();
             parsed_total += n;
-            if (!parser.ring().empty()) continue;
+            if (!parser.ring().drained()) continue;
             if (!stop.load()) parser.wait_for_data(200);
         }
         parsed_total += parser.parse_available();  // 清空剩余: 所有成交已进通道 A
         parse_done.store(true, std::memory_order_release);
     });
 
-    // ── 策略线程: 从通道 A 收成交, 喂 4 策略 + K线 ──
+    // ── 策略线程: 从通道 A 收成交, 喂 3 策略 + K线 ──
     // 交易侧: 信号翻转时经执行引擎真发送(风控→OMS→模拟交易所→回报)
     std::thread strategy_th([&]() {
         MarketEvent ev;
@@ -231,7 +255,7 @@ int main(int argc, char* argv[]) {
             if (channel.pop(0, ev)) {
                 if (ev.type != MarketEvent::Type::TRADE &&
                     ev.type != MarketEvent::Type::EXECUTE) continue;   // skip 委托
-                vbs.on_event(ev); pbs.on_event(ev); tds.on_event(ev); tms.on_event(ev);
+                vbs.on_event(ev); pbs.on_event(ev); tms.on_event(ev);
                 kagg.on_trade(ev);      // 成交 → K线聚合
                 ++trade_count;
                 uint64_t l = last_seq.load();
@@ -412,9 +436,9 @@ int main(int argc, char* argv[]) {
     printf("解析消息数: %zu\n", parsed_total.load());
     printf("成交事件数: %zu\n", trade_count.load());
     printf("seq 连续:   %s\n", seq_contiguous.load() ? "yes" : "NO");
-    printf("策略信号:   成交量突破=%d 价格突破=%d 成交方向=%d 动量=%d OBI盘口=%d OFI订单流=%d (0=BUY 1=SELL 2=NONE)\n",
+    printf("策略信号:   成交量突破=%d 价格突破=%d 动量=%d OBI盘口=%d OFI订单流=%d (0=BUY 1=SELL 2=NONE)\n",
            (int)vbs.signal().side, (int)pbs.signal().side,
-           (int)tds.signal().side, (int)tms.signal().side,
+           (int)tms.signal().side,
            (int)obi.signal().side, (int)ofi.signal().side);
     combiner.set_primary(vbs.signal());
     combiner.add_slave(ofi.signal());

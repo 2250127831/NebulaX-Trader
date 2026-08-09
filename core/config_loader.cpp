@@ -16,12 +16,14 @@ Config ConfigLoader::load(const std::string& path) {
         if (n["uring_entries"])  cfg.market.uring_entries = n["uring_entries"].as<uint32_t>();
         if (n["ring_bytes"])     cfg.market.ring_bytes    = n["ring_bytes"].as<size_t>();
         if (n["chan_slots"])     cfg.market.chan_slots    = n["chan_slots"].as<size_t>();
+        if (n["parse_workers"])  cfg.market.parse_workers = n["parse_workers"].as<size_t>();
     }
 
     // order_book
     if (auto n = root["order_book"]) {
         if (n["enabled"])     cfg.order_book.enabled    = n["enabled"].as<bool>();
         if (n["pool_slots"])  cfg.order_book.pool_slots = n["pool_slots"].as<size_t>();
+        if (n["workers"])     cfg.order_book.workers    = n["workers"].as<size_t>();
     }
 
     // strategy

@@ -229,8 +229,9 @@ private:
     alignas(64) std::atomic<size_t> tail_{0};
     alignas(64) std::atomic<size_t> heads_[MAX_CONSUMERS]{};  // 全局发布进度(消费者 flush)
     LocalState locals_[MAX_CONSUMERS];      // 本地攒批(每消费者独立 cache line)
-    size_t cached_min_head_ = 0;            // 生产者私有缓存: 最近一次扫描的 min_consumed()
-                                            // (仅 push 读写, 无并发, 不需原子)。滞后→假满→多扫一次。
+    // 生产者私有缓存: 最近一次扫描的 min_consumed()。thread_local → 每个解析器线程
+    // 一份, 多生产者(V2.3 N 个解析器都 push)下无跨线程竞争。滞后 → 假满 → 多扫一次。
+    static thread_local size_t cached_min_head_;
     size_t num_consumers_ = 1;
     MarketEvent* slots_ = nullptr;   // 用户传入的槽位数组（队列不拥有）
     size_t capacity_ = 0;            // 容量（运行时）
@@ -238,3 +239,7 @@ private:
     int    wake_fds_[MAX_CONSUMERS]; // 每消费者独立 eventfd(广播唤醒, 避免唤醒竞争)
     std::atomic<uint32_t> blocked_{0};  // 阻塞消费者掩码(bit=消费者id): push 只写阻塞者的 fd
 };
+
+// thread_local 静态成员定义(每个解析器线程一份)
+template <size_t C>
+thread_local size_t SPMCEventQueue<C>::cached_min_head_ = 0;

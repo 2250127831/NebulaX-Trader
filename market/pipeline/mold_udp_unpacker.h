@@ -28,15 +28,17 @@
 //   MoldUdpUnpacker<RingCap> unpacker;
 //   unpacker.feed(packet_data, packet_len);   // 收包后调用，推入 ring
 //   unpacker.ring()                            // 下游 ByteRingParser 消费
+// Ring 泛型: 接受 SPSCByteRing 或 SPMCByteRing(都提供 push)。V2.3 主链路用 SPMC。
+template <typename ByteRing>
 class MoldUdpUnpacker {
 public:
-    using Ring = SPSCByteRing;
+    using Ring = ByteRing;
 
     static constexpr size_t kHeaderLen = 20;      // MoldUDP64 头
     static constexpr size_t kMsgHeader = 4;       // 加序号后: [seq 2][len 2]
 
     // 构造传入共享 ring 引用（由 QueueManager 持有，unpacker 写、bp 读）。
-    explicit MoldUdpUnpacker(SPSCByteRing& ring) : ring_(ring) {}
+    explicit MoldUdpUnpacker(ByteRing& ring) : ring_(ring) {}
 
     // 处理 MoldUDP64 包流（一个或多个连续包）。返回成功拆出的消息数。
     // 每个包: [20 字节头][消息1][消息2]...；处理完一个包的 count 条后，

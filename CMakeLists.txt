@@ -36,6 +36,7 @@ add_library(core
     core/config.h
     core/config_loader.cpp
     core/queue/spsc_byte_ring.h
+    core/queue/spmc_byte_ring.h
     core/queue/spmc_ring.h
     core/queue/spmc_event_queue.h
     core/queue/queue_manager.h
@@ -87,7 +88,6 @@ add_library(strategy
     strategy/kline/kline_consumer.h
     strategy/tick/volume_breakout_strategy.h
     strategy/tick/price_breakout_strategy.h
-    strategy/tick/trade_direction_strategy.h
     strategy/tick/tick_momentum_strategy.h
     strategy/tick/order_book_imbalance_strategy.h
     strategy/tick/order_flow_imbalance_strategy.h
@@ -174,6 +174,13 @@ add_executable(ut_order_book
 )
 target_link_libraries(ut_order_book PRIVATE core market)
 add_test(NAME ut_order_book COMMAND ut_order_book)
+
+# OrderMap/OrderPool 并发压力测试(分簿语义: 每线程操作自己的 key 集 + 跨线程同桶冲突)
+add_executable(ut_concurrent_order_map
+    tests/unit/test_concurrent_order_map.cpp
+)
+target_link_libraries(ut_concurrent_order_map PRIVATE core)
+add_test(NAME ut_concurrent_order_map COMMAND ut_concurrent_order_map)
 
 add_executable(ut_ofi
     tests/unit/test_ofi.cpp

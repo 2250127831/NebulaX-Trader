@@ -1,0 +1,30 @@
+# 两探针测量(V2.3): 只 attach push_ring + parse_done, eBPF 干扰最小
+#   push_ring→parse_done = 入 ring → 解析完成 (含排队等抢头 + 纯解析)
+# matchers(key 配对) + reports(输出段) 必须有, 否则 LensX 不聚合
+target:
+  process: trader
+
+output:
+  csv: /tmp/trader_lensx.csv
+
+probes:
+  - name: push_ring
+    type: uprobe
+    symbol: lensx::mark_push_ring
+    stage: 0
+    key: arg1
+  - name: parse_done
+    type: uprobe
+    symbol: lensx::mark_parse_done
+    stage: 1
+    key: arg1
+
+matchers:
+  - id: push_ring_to_parse
+    stages: [0, 1]
+    mode: key
+
+reports:
+  - name: push_ring_to_parse
+    from: 0
+    to: 1

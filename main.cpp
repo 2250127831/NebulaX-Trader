@@ -397,8 +397,10 @@ int main(int argc, char* argv[]) {
     worker_th.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i) {
         worker_th.emplace_back([&, i]() {
-            // 绑核: worker 占 E 20-23(小核无 SMT 真独占, 与 V2 最终版一致)。
-            static const int kWorkerE[4] = {20, 21, 22, 23};
+            // 绑核: worker 占 P 核 11/13/15/9(奇数避开 SMT 兄弟被系统占用)。
+            // 实测 E 核 20-23 被系统进程抢占(gmain/tokio/mihomo 等), dispatch→pop
+            // P99 833µs → P 核 22.6µs(37x)。E 核"无 SMT 真独占"在本机不成立。
+            static const int kWorkerE[4] = {11, 13, 15, 9};
             if (i < 4) pin_cpu(kWorkerE[i]);
             MarketEvent ev;
             auto& my_ring = *spscs[i];   // 自己的 SPSC, 单消费者

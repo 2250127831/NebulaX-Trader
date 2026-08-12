@@ -27,16 +27,18 @@
 //   跨线程(encode 在 worker 锁内 / decode 在 fill_th) → 内部互斥锁保护。
 class OuchOrderCodec : public IOrderCodec {
 public:
-    static constexpr size_t kOrderMsgLen  = 49;   // 'O' Enter Order
-    static constexpr size_t kAckMsgLen    = 31;   // 'A' Accepted
-    static constexpr size_t kExecMsgLen   = 34;   // 'E' Executed
-    static constexpr size_t kCancelMsgLen = 30;   // 'C' Canceled
-    static constexpr size_t kRejectMsgLen = 28;   // 'J' Rejected
+    static constexpr size_t kOrderMsgLen    = 49;   // 'O' Enter Order
+    static constexpr size_t kAckMsgLen      = 31;   // 'A' Accepted
+    static constexpr size_t kExecMsgLen     = 34;   // 'E' Executed
+    static constexpr size_t kCancelMsgLen   = 30;   // 'C' Canceled(回报)
+    static constexpr size_t kRejectMsgLen   = 28;   // 'J' Rejected(回报)
+    static constexpr size_t kCancelReqLen   = 19;   // 'X' Cancel Order(请求)
     static constexpr uint8_t kMsgOrder  = 'O';
     static constexpr uint8_t kMsgAck    = 'A';
     static constexpr uint8_t kMsgExec   = 'E';
     static constexpr uint8_t kMsgCancel = 'C';
     static constexpr uint8_t kMsgReject = 'J';
+    static constexpr uint8_t kMsgCancelReq = 'X';
 
     size_t order_msg_len() const override { return kOrderMsgLen; }
     size_t fill_msg_len() const override { return kExecMsgLen; }   // 最小回报帧(用于缓冲)
@@ -190,6 +192,20 @@ public:
         buf[15] = 'B';
         buf[27] = checksum(buf, kRejectMsgLen - 1);
         out_len = kRejectMsgLen;
+        return true;
+    }
+
+    // 'X' Cancel Order Request(19B): 撤单请求。token + shares=0(撤全部)。
+    bool encode_cancel_request(uint64_t order_id, uint8_t* buf, size_t cap,
+                               size_t& out_len) const override {
+        if (!buf || cap < kCancelReqLen) return false;
+        std::memset(buf, ' ', kCancelReqLen);
+        buf[0] = kMsgCancelReq;
+        std::string token = token_for(order_id);
+        std::memcpy(buf + 1, token.data(), 14);
+        be32(buf + 15, 0);   // shares=0 → 撤全部剩余
+        buf[18] = checksum(buf, kCancelReqLen - 1);
+        out_len = kCancelReqLen;
         return true;
     }
 

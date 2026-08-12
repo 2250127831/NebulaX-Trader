@@ -82,25 +82,27 @@ public:
                 // 发送成功：保持 PENDING，等交易所成交回报
             } else {
                 // 无 sender：进程内模拟成交(单测/无网络模式)
-                order_manager_.on_fill(id, qty);
-                risk_manager_.on_fill(order);
+                // 模拟交易所立即 accept + 全额成交
+                order_manager_.on_accept(id);                       // PENDING → SUBMITTED
+                order_manager_.on_fill(id, qty, order.price);       // → FILLED
+                risk_manager_.on_fill(order, qty);
             }
         }
         return id;
     }
 
     // 成交回报：交易所确认成交，驱动 OMS 状态 + 风控持仓/盈亏。
-    // V1 模拟交易所按订单价全额成交，成交价恒等于订单价，故忽略 fill_price。
-    void on_order_fill(uint64_t order_id, uint64_t filled_qty, int64_t /*fill_price*/) {
+    // 成交回报(OUCH 'E'): 驱动 OMS 状态机(含均价/剩余) + 风控持仓。
+    void on_order_fill(uint64_t order_id, uint64_t filled_qty, int64_t fill_price) {
         std::lock_guard<std::mutex> lk(mtx_);
         const Order* o = order_manager_.order(order_id);
         if (!o) return;
-        order_manager_.on_fill(order_id, filled_qty);
-        risk_manager_.on_fill(*o);
+        order_manager_.on_fill(order_id, filled_qty, fill_price);
+        risk_manager_.on_fill(*o, filled_qty);
     }
 
     // 订单回报分发(OUCH 'A'/'E'/'C'/'J'): 按 type 驱动 OMS 状态机 + 风控。
-    // 替代直接 on_order_fill, 让回报线程只调这一个入口。
+    // 回报线程只调这一个入口。
     void on_order_report(const Fill& f) {
         std::lock_guard<std::mutex> lk(mtx_);
         const Order* o = order_manager_.order(f.order_id);
@@ -110,7 +112,7 @@ public:
                 order_manager_.on_accept(f.order_id);
                 break;
             case OuchOrderCodec::kMsgExec:   // 'E' Executed: 成交(可多次, 累积到 FILLED)
-                order_manager_.on_fill(f.order_id, f.filled_qty);
+                order_manager_.on_fill(f.order_id, f.filled_qty, f.fill_price);
                 risk_manager_.on_fill(*o, f.filled_qty);   // 用本次成交量(支持半成交)
                 break;
             case OuchOrderCodec::kMsgCancel: // 'C' Canceled: 撤单
@@ -121,6 +123,19 @@ public:
                 break;
             default: break;
         }
+    }
+
+    // 撤单: 委托簿标记 PENDING_CANCEL + 经 codec 'X' 发到交易所。返回 true 已发送。
+    bool cancel_order(uint64_t order_id) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!sender_ || !codec_) return false;
+        if (!order_manager_.request_cancel(order_id)) return false;   // 非法状态不可撤
+        uint8_t buf[64];
+        size_t out_len = 0;
+        if (!codec_->encode_cancel_request(order_id, buf, sizeof(buf), out_len))
+            return false;
+        ssize_t r = sender_->send(buf, out_len);
+        return r == (ssize_t)out_len;
     }
 
 private:

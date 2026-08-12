@@ -273,6 +273,14 @@ add_executable(ut_ouch_semantics
 target_link_libraries(ut_ouch_semantics PRIVATE core oms risk execution)
 add_test(NAME ut_ouch_semantics COMMAND ut_ouch_semantics)
 
+# 委托簿(V5): 自有订单完整生命周期状态机 + symbol/strategy 索引查询 + 撤单链路
+# (注意: 与市场订单簿 test_order_book.cpp 不同概念, 这是自有订单跟踪)
+add_executable(ut_order_book_own
+    tests/unit/test_order_book_own.cpp
+)
+target_link_libraries(ut_order_book_own PRIVATE core oms)
+add_test(NAME ut_order_book_own COMMAND ut_order_book_own)
+
 # SPMC 多消费者广播: 多个策略从通道 A 消费同一批成交
 add_executable(ut_spmc_strategies
     tests/integration/test_spmc_strategies.cpp

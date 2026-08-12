@@ -156,6 +156,8 @@ int main() {
         CHECK(codec.decode_fill(cmsg, clen, fc));
         ex.on_order_report(fa);   // A → SUBMITTED
         CHECK(om.status(oid4) == OrderStatus::SUBMITTED);
+        CHECK(om.request_cancel(oid4));   // 已发 'X' 撤单请求 → PENDING_CANCEL
+        CHECK(om.status(oid4) == OrderStatus::PENDING_CANCEL);
         ex.on_order_report(fc);   // C → CANCELLED
         CHECK(om.status(oid4) == OrderStatus::CANCELLED);
     }

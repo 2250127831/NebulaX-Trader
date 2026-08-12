@@ -45,4 +45,8 @@ public:
                              uint8_t* buf, size_t cap, size_t& out_len) const = 0;
     // 成交回报反序列化。校验 magic 与长度。成功填 out(Fill 含 type/order_id/qty/price)。
     virtual bool decode_fill(const uint8_t* buf, size_t len, Fill& out) const = 0;
+
+    // 撤单请求序列化(交易系统 → 交易所)。成功写 out_len 字节, 返回 true。
+    virtual bool encode_cancel_request(uint64_t order_id, uint8_t* buf, size_t cap,
+                                       size_t& out_len) const = 0;
 };

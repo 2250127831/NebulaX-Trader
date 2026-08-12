@@ -72,4 +72,15 @@ public:
         out.type = kMsgFill;                     // 'F'
         return true;
     }
+
+    // 自定义协议撤单请求: 'C' + order_id(8B 大端)。
+    bool encode_cancel_request(uint64_t order_id, uint8_t* buf, size_t cap,
+                               size_t& out_len) const override {
+        if (!buf || cap < 9) return false;
+        buf[0] = 'C';
+        uint64_t v = htobe64(order_id);
+        memcpy(buf + 1, &v, 8);
+        out_len = 9;
+        return true;
+    }
 };

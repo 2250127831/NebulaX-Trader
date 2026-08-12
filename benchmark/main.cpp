@@ -115,31 +115,48 @@ static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
         // 连接建立: 同一 fd 全双工读订单/写回报, 直到停止或对端关闭
         uint8_t buf[256];
         while (!stop.load(std::memory_order_acquire)) {
-            // 读完整 'O'(定长 49B, 流分帧)
-            size_t got = 0;
-            while (got < OuchOrderCodec::kOrderMsgLen) {
-                ssize_t n = recv(csock, buf + got, OuchOrderCodec::kOrderMsgLen - got, 0);
-                if (n <= 0) break;   // 对端关闭/超时
+            // 读首字节 type → 按定长分帧('O' 49 / 'X' 19)
+            ssize_t first = recv(csock, buf, 1, 0);
+            if (first <= 0) break;   // 连接断/超时
+            size_t mlen = 0;
+            if (buf[0] == OuchOrderCodec::kMsgOrder) mlen = OuchOrderCodec::kOrderMsgLen;
+            else if (buf[0] == OuchOrderCodec::kMsgCancelReq) mlen = OuchOrderCodec::kCancelReqLen;
+            else { close(csock); break; }   // 未知消息类型, 断开
+            size_t got = 1;   // 已读 1 字节 type
+            while (got < mlen) {
+                ssize_t n = recv(csock, buf + got, mlen - got, 0);
+                if (n <= 0) { close(csock); goto conn_done; }
                 got += static_cast<size_t>(n);
             }
-            if (got < OuchOrderCodec::kOrderMsgLen) break;   // 连接断/停止
 
-            Order o{};
-            if (!codec.decode_order(buf, got, o)) continue;
-            ++orders_received;
-
-            // OUCH 回执: 先 'A' Accepted 再 'E' Executed(全额成交, 按订单价)
-            uint8_t ack[OuchOrderCodec::kAckMsgLen];
-            size_t ack_len = 0;
-            uint8_t exec[OuchOrderCodec::kExecMsgLen];
-            size_t exec_len = 0;
-            if (!codec.encode_ack(o, ack, sizeof(ack), ack_len)) continue;
-            if (!codec.encode_exec(o.order_id, o.quantity, o.price, exec, sizeof(exec), exec_len))
-                continue;
-            ssize_t w1 = send(csock, ack, ack_len, MSG_NOSIGNAL);
-            ssize_t w2 = send(csock, exec, exec_len, MSG_NOSIGNAL);
-            (void)w1; (void)w2;
+            if (buf[0] == OuchOrderCodec::kMsgOrder) {
+                // 新订单: decode → 'A' Accepted + 'E' Executed(全额成交)
+                Order o{};
+                if (!codec.decode_order(buf, got, o)) continue;
+                ++orders_received;
+                uint8_t ack[OuchOrderCodec::kAckMsgLen];
+                size_t ack_len = 0;
+                uint8_t exec[OuchOrderCodec::kExecMsgLen];
+                size_t exec_len = 0;
+                if (!codec.encode_ack(o, ack, sizeof(ack), ack_len)) continue;
+                if (!codec.encode_exec(o.order_id, o.quantity, o.price, exec, sizeof(exec), exec_len))
+                    continue;
+                ssize_t w1 = send(csock, ack, ack_len, MSG_NOSIGNAL);
+                ssize_t w2 = send(csock, exec, exec_len, MSG_NOSIGNAL);
+                (void)w1; (void)w2;
+            } else {
+                // 'X' 撤单: token → order_id, 回 'C' Canceled(撤全部剩余)
+                char token[15];
+                std::memcpy(token, buf + 1, 14); token[14] = '\0';
+                uint64_t oid = strtoull(token, nullptr, 10);
+                uint8_t cmsg[OuchOrderCodec::kCancelMsgLen];
+                size_t clen = 0;
+                if (!codec.encode_cancel(oid, 0, cmsg, sizeof(cmsg), clen)) continue;
+                ssize_t w = send(csock, cmsg, clen, MSG_NOSIGNAL);
+                (void)w;
+            }
         }
+conn_done:
         close(csock);
     }
     close(lsock);

@@ -1,6 +1,7 @@
 #include "io_uring_sender.h"
 
 #include <cerrno>
+#include <cstring>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -15,7 +16,10 @@ bool IoUringSender::start()
 {
     if (running_) return true;
 
-    fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+    // V5: TCP(SOCK_STREAM), 同一连接全双工(订单发 + 回报收)。
+    // connect 做 3 次握手。调用方须先确保对端(模拟交易所/撮合引擎)已 listen,
+    // 否则 connect 立即失败返回 false(测试/生产都在对端就绪后才 start)。
+    fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (fd_ < 0) return false;
 
     sockaddr_in addr{};
@@ -47,6 +51,25 @@ bool IoUringSender::start()
     }
     uring_ok_ = true;
 
+    // 接收侧 ring(回报读, 与发送 ring 分离, 同一 fd 共存)
+    if (!recv_poller_.init()) {
+        io_uring_unregister_buffers(&uring_);
+        io_uring_queue_exit(&uring_);
+        uring_ok_ = false;
+        close(fd_);
+        fd_ = -1;
+        return false;
+    }
+    recv_buf_idx_ = recv_poller_.alloc_buffer();
+    if (recv_buf_idx_ == UINT32_MAX) {
+        io_uring_unregister_buffers(&uring_);
+        io_uring_queue_exit(&uring_);
+        uring_ok_ = false;
+        close(fd_);
+        fd_ = -1;
+        return false;
+    }
+
     running_ = true;
     return true;
 }
@@ -56,8 +79,13 @@ void IoUringSender::stop()
     if (!running_) return;
     running_ = false;
 
+    // 在途 recv 由 50ms timeout 唤醒后检查 running_ 返回 0
+    if (recv_buf_idx_ != UINT32_MAX) {
+        recv_poller_.free_buffer(recv_buf_idx_);
+        recv_buf_idx_ = UINT32_MAX;
+    }
     if (fd_ >= 0) {
-        close(fd_);
+        close(fd_);   // 打断阻塞 recv + 未决 send
         fd_ = -1;
     }
     if (uring_ok_) {
@@ -65,6 +93,7 @@ void IoUringSender::stop()
         io_uring_queue_exit(&uring_);
         uring_ok_ = false;
     }
+    // recv_poller_ 析构时自动清理其 ring
 }
 
 void IoUringSender::set_blocking(bool blocking)
@@ -147,4 +176,63 @@ ssize_t IoUringSender::send_zc_all(size_t len)
         }
     }
     return static_cast<ssize_t>(len);
+}
+
+// V5 TCP 全双工: 从同一连接读回报(复制 IoUringReceiver::recv 阻塞模式)。
+ssize_t IoUringSender::recv(uint8_t* buf, size_t len)
+{
+    if (!running_ || len == 0) return 0;
+
+    // ── 非阻塞模式：提交后 peek，无完成立即返回 0 ──
+    if (!blocking_.load()) {
+        if (!recv_pending_) {
+            if (!recv_poller_.submit_recv_now(fd_, recv_buf_idx_)) return -1;
+            recv_pending_ = true;
+        }
+        if (!recv_poller_.has_cqe()) return 0;
+        int result = 0;
+        recv_poller_.process_cqes([&result](int, int res) { result = res; });
+        recv_pending_ = false;
+        if (result >= 0) {
+            size_t n = std::min<size_t>(static_cast<size_t>(result), len);
+            std::memcpy(buf, recv_poller_.buffer_ptr(recv_buf_idx_), n);
+            return static_cast<ssize_t>(n);
+        }
+        if (result == -EAGAIN) return 0;
+        errno = -result;
+        return -1;
+    }
+
+    // ── 阻塞模式：提交后等待，stop() 可打断 ──
+    if (!recv_pending_) {
+        if (!recv_poller_.submit_recv(fd_, recv_buf_idx_)) return -1;
+        recv_pending_ = true;
+    }
+    for (;;) {
+        int ret = recv_poller_.submit_and_wait_timeout(50);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        int result = 0;
+        bool got = false;
+        recv_poller_.process_cqes([&got, &result](int, int res) {
+            got = true;
+            result = res;
+        });
+        if (!got) {             // 等到的只有 timeout CQE
+            if (!running_) return 0;   // stop() 打断
+            continue;
+        }
+        recv_pending_ = false;
+        if (result >= 0) {
+            size_t n = std::min<size_t>(static_cast<size_t>(result), len);
+            std::memcpy(buf, recv_poller_.buffer_ptr(recv_buf_idx_), n);
+            return static_cast<ssize_t>(n);
+        }
+        if (!running_) return 0;        // stop() 已调用
+        if (result == -EAGAIN) continue;
+        errno = -result;
+        return -1;
+    }
 }

@@ -38,7 +38,7 @@
 #include "market/pipeline/mold_udp_unpacker.h"
 #include "oms/order_manager.h"
 #include "oms/i_order_codec.h"
-#include "oms/custom_order_codec.h"
+#include "oms/ouch_order_codec.h"
 #include "risk/risk_manager.h"
 #include "strategy/base/strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
@@ -378,20 +378,16 @@ int main(int argc, char* argv[]) {
     ex.set_base_qty(cfg.execution.base_qty);
 
     // V5 协议解耦: 订单字节经 IOrderCodec 编解码, 业务逻辑不碰协议字节。
-    // 换协议(自定义 'O'/'F' → OUCH 4.2)只换 codec 实现。
-    CustomOrderCodec order_codec;
+    // 默认 OUCH 4.2(实盘协议化); CustomOrderCodec 保留作回退/对照。
+    OuchOrderCodec order_codec;
     ex.set_codec(&order_codec);
 
-    // 订单发送端（→ 模拟交易所）
+    // 订单发送端(TCP 全双工: 订单发 + 回报收共用一连接) → 模拟交易所
     auto order_send_ring = std::make_unique<uint8_t[]>(1 << 20);
     auto order_sender = std::make_unique<IoUringSender>(
         "127.0.0.1", cfg.execution.order_port, order_send_ring.get(), 1 << 20);
     if (!order_sender->start()) { printf("订单发送端启动失败\n"); return 1; }
     ex.set_sender(order_sender.get());
-
-    // 成交回报接收端（← 模拟交易所）
-    auto fill_rcv = std::make_unique<IoUringReceiver>(cfg.execution.order_ret_port);
-    if (!fill_rcv->start()) { printf("回报接收端启动失败\n"); return 1; }
 
     // ── 线程同步标志 ──
     std::atomic<bool> stop{false};
@@ -534,22 +530,37 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // ── 回报线程：收 FILL → OMS/Risk ──
+    // ── 回报线程：从订单连接的同一 TCP 读回报(全双工) → OMS/Risk ──
+    // TCP 是字节流无消息边界: 累积缓冲, 按 OUCH 消息类型定长分帧, 解析完整消息再处理。
     std::atomic<bool> fill_stop{false};
     std::thread fill_th([&]() {
         pin_cpu(kPinIdle);   // 低频回报, 与主线程共享 P 核 9(不占热核)
-        fill_rcv->set_blocking(false);
+        order_sender->set_blocking(false);
         uint8_t pre[2048];
-        fill_rcv->recv(pre, sizeof(pre));
-        fill_rcv->set_blocking(true);
+        order_sender->recv(pre, sizeof(pre));   // 排空残留
+        order_sender->set_blocking(true);
         uint8_t buf[2048];
+        std::vector<uint8_t> stream;   // TCP 字节流累积缓冲
+        stream.reserve(4096);
         while (!fill_stop.load(std::memory_order_acquire)) {
-            ssize_t n = fill_rcv->recv(buf, sizeof(buf));
+            ssize_t n = order_sender->recv(buf, sizeof(buf));
             if (n > 0) {
-                uint64_t oid = 0, qty = 0;
-                int64_t price = 0;
-                if (order_codec.decode_fill(buf, (size_t)n, oid, qty, price))
-                    ex.on_order_fill(oid, qty, price);
+                stream.insert(stream.end(), buf, buf + n);
+                // 按 OUCH 定长分帧: 首字节定消息类型 → 定长
+                for (;;) {
+                    if (stream.empty()) break;
+                    size_t mlen = 0;
+                    if (stream[0] == OuchOrderCodec::kMsgAck) mlen = OuchOrderCodec::kAckMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgExec) mlen = OuchOrderCodec::kExecMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgCancel) mlen = OuchOrderCodec::kCancelMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgReject) mlen = OuchOrderCodec::kRejectMsgLen;
+                    else { stream.erase(stream.begin()); continue; }   // 未知字节, 丢弃
+                    if (stream.size() < mlen) break;   // 消息未完整, 等更多数据
+                    Fill f;
+                    if (order_codec.decode_fill(stream.data(), mlen, f))
+                        ex.on_order_report(f);   // 按 type 分发(A 接受/E 成交/C 撤/J 拒)
+                    stream.erase(stream.begin(), stream.begin() + mlen);   // 消费完整消息
+                }
             } else break;
         }
     });
@@ -638,9 +649,8 @@ int main(int argc, char* argv[]) {
     for (auto& q : spscs) q->wake();          // 唤醒阻塞在 wait_for_data 的 worker
     for (auto& t : worker_th) t.join();
     fill_stop.store(true, std::memory_order_release);
-    fill_rcv->stop();
+    order_sender->stop();   // 打断 fill_th 的阻塞 recv(TCP 全双工, 同一连接)
     fill_th.join();
-    order_sender->stop();
 
     if (fc) fc->ready.store(false, std::memory_order_release);
 

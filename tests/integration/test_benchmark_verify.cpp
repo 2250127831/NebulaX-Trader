@@ -32,12 +32,14 @@
 #include "execution/execution_engine.h"
 #include "oms/order_manager.h"
 #include "oms/i_order_codec.h"
-#include "oms/custom_order_codec.h"
+#include "oms/ouch_order_codec.h"
 #include "risk/risk_manager.h"
 
 // 模拟交易所端口：订单发到 benchmark(order-port)，成交回报回到本端(order_ret_port)
-static constexpr uint16_t ORDER_PORT     = 9090;
-static constexpr uint16_t ORDER_RET_PORT = 9091;
+// 用空闲端口(9090/9091 被本机 mihomo 代理占用; 9095 被 nebulaX 撮合引擎占用)。
+// 端口冲突会导致 benchmark 模拟交易所 bind/listen 静默失败 → 订单链路断。
+static constexpr uint16_t ORDER_PORT     = 9096;
+static constexpr uint16_t ORDER_RET_PORT = 9097;
 
 #include <atomic>
 #include <cstdio>
@@ -164,22 +166,16 @@ int main(int argc, char* argv[]) {
     ExecutionEngine ex(om, rm);
     ex.set_base_qty(100);
 
-    // V5 协议解耦: codec 与 benchmark 模拟交易所一致(默认自定义 'O'/'F' 协议)
-    CustomOrderCodec order_codec;
+    // V5 协议: OUCH + TCP 全双工, codec 与 benchmark 模拟交易所一致
+    OuchOrderCodec order_codec;
     ex.set_codec(&order_codec);
 
-    // 订单发送端(io_uring 零拷贝) → benchmark 模拟交易所
+    // 订单发送端(TCP 全双工: 订单发 + 回报收共用一连接) → benchmark 模拟交易所
+    // 注意: start() 在 fork benchmark(模拟交易所 listen)之后才调用——TCP connect
+    // 必须等对端 listen, 否则 connect 立即失败。见下方 fork 后的 start。
     auto order_send_ring = std::make_unique<uint8_t[]>(1 << 20);
     auto order_sender = std::make_unique<IoUringSender>(
         "127.0.0.1", ORDER_PORT, order_send_ring.get(), 1 << 20);
-    CHECK(order_sender->start());
-    if (!order_sender->start()) return 1;
-    ex.set_sender(order_sender.get());
-
-    // 成交回报接收端(io_uring) ← benchmark 模拟交易所
-    auto fill_rcv = std::make_unique<IoUringReceiver>(ORDER_RET_PORT);
-    CHECK(fill_rcv->start());
-    if (!fill_rcv->start()) return 1;
 
     std::atomic<bool> seq_contiguous{true};
     std::atomic<uint64_t> last_seq{0};
@@ -341,28 +337,6 @@ int main(int argc, char* argv[]) {
         book_ready.store(true, std::memory_order_release);
     });
 
-    // ── 成交回报线程: 收模拟交易所 FILL → 驱动 OMS/Risk ──
-    std::atomic<bool> fill_stop{false};
-    std::atomic<size_t> fill_count{0};
-    std::thread fill_th([&]() {
-        uint8_t pre[2048];
-        fill_rcv->set_blocking(false);
-        fill_rcv->recv(pre, sizeof(pre));
-        fill_rcv->set_blocking(true);
-        uint8_t buf[2048];
-        while (!fill_stop.load(std::memory_order_acquire)) {
-            ssize_t n = fill_rcv->recv(buf, sizeof(buf));
-            if (n > 0) {
-                uint64_t oid = 0, qty = 0;
-                int64_t price = 0;
-                if (order_codec.decode_fill(buf, (size_t)n, oid, qty, price)) {
-                    ex.on_order_fill(oid, qty, price);
-                    ++fill_count;
-                }
-            } else break;
-        }
-    });
-
     // 等接收就绪 → fork benchmark
     while (!st.armed.load(std::memory_order_acquire)) sched_yield();
     fc->ready.store(true, std::memory_order_release);
@@ -384,6 +358,54 @@ int main(int argc, char* argv[]) {
               (char*)nullptr);
         _exit(127);
     }
+
+    // TCP connect 须等模拟交易所 listen(fork 已起)。连不上重试几秒(交易所线程稍后就绪)。
+    bool connected = false;
+    for (int attempt = 0; attempt < 50 && !connected; ++attempt) {
+        if (order_sender->start()) { connected = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!connected) {
+        printf("FAIL: order_sender TCP connect 失败(模拟交易所未就绪?)\n");
+        return 1;
+    }
+    ex.set_sender(order_sender.get());
+
+    // ── 成交回报线程: 从订单连接同一 TCP 读回报 → 驱动 OMS/Risk ──
+    // TCP 字节流无消息边界: 累积缓冲 + OUCH 定长分帧。
+    std::atomic<bool> fill_stop{false};
+    std::atomic<size_t> fill_count{0};
+    std::thread fill_th([&]() {
+        order_sender->set_blocking(false);
+        uint8_t pre[2048];
+        order_sender->recv(pre, sizeof(pre));
+        order_sender->set_blocking(true);
+        uint8_t buf[2048];
+        std::vector<uint8_t> stream;
+        stream.reserve(4096);
+        while (!fill_stop.load(std::memory_order_acquire)) {
+            ssize_t n = order_sender->recv(buf, sizeof(buf));
+            if (n > 0) {
+                stream.insert(stream.end(), buf, buf + n);
+                for (;;) {
+                    if (stream.empty()) break;
+                    size_t mlen = 0;
+                    if (stream[0] == OuchOrderCodec::kMsgAck) mlen = OuchOrderCodec::kAckMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgExec) mlen = OuchOrderCodec::kExecMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgCancel) mlen = OuchOrderCodec::kCancelMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgReject) mlen = OuchOrderCodec::kRejectMsgLen;
+                    else { stream.erase(stream.begin()); continue; }
+                    if (stream.size() < mlen) break;
+                    Fill f;
+                    if (order_codec.decode_fill(stream.data(), mlen, f)) {
+                        ex.on_order_report(f);   // 按 type 分发(A/E/C/J)
+                        if (f.type == OuchOrderCodec::kMsgExec) ++fill_count;
+                    }
+                    stream.erase(stream.begin(), stream.begin() + mlen);
+                }
+            } else break;
+        }
+    });
 
     // 等 benchmark 子进程完成(新限速: 发前等 received, 接收端跟上则全速)
     int wstatus = 0;
@@ -424,9 +446,8 @@ int main(int argc, char* argv[]) {
     // 成交回报: 等最后一批 FILL 到达 → 停回报线程 → 停发送端
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     fill_stop.store(true, std::memory_order_release);
-    fill_rcv->stop();
+    order_sender->stop();   // 打断 fill_th 的阻塞 recv(TCP 全双工, 同一连接)
     fill_th.join();
-    order_sender->stop();
 
     fc->ready.store(false, std::memory_order_release);
 

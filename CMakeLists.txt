@@ -131,6 +131,7 @@ add_library(oms
     oms/order_manager.h
     oms/i_order_codec.h
     oms/custom_order_codec.h
+    oms/ouch_order_codec.h
 )
 
 target_link_libraries(oms PUBLIC core)
@@ -257,6 +258,20 @@ add_executable(ut_order_codec
 )
 target_link_libraries(ut_order_codec PRIVATE core oms)
 add_test(NAME ut_order_codec COMMAND ut_order_codec)
+
+# OUCH 4.2 codec(V5 实盘协议化): token↔order_id 映射 + 'O'/'A'/'E' 编解码
+add_executable(ut_ouch_codec
+    tests/unit/test_ouch_codec.cpp
+)
+target_link_libraries(ut_ouch_codec PRIVATE core oms)
+add_test(NAME ut_ouch_codec COMMAND ut_ouch_codec)
+
+# OUCH 回报语义枚举(V5): A/E/C/J 各类型驱动 OMS 状态机(半成交/撤单/拒单/非法流转)
+add_executable(ut_ouch_semantics
+    tests/unit/test_ouch_semantics.cpp
+)
+target_link_libraries(ut_ouch_semantics PRIVATE core oms risk execution)
+add_test(NAME ut_ouch_semantics COMMAND ut_ouch_semantics)
 
 # SPMC 多消费者广播: 多个策略从通道 A 消费同一批成交
 add_executable(ut_spmc_strategies

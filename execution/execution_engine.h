@@ -3,6 +3,7 @@
 #include "strategy/base/signal.h"
 #include "oms/order_manager.h"
 #include "oms/i_order_codec.h"
+#include "oms/ouch_order_codec.h"
 #include "risk/risk_manager.h"
 #include "core/net/i_market_data_sender.h"
 
@@ -96,6 +97,30 @@ public:
         if (!o) return;
         order_manager_.on_fill(order_id, filled_qty);
         risk_manager_.on_fill(*o);
+    }
+
+    // 订单回报分发(OUCH 'A'/'E'/'C'/'J'): 按 type 驱动 OMS 状态机 + 风控。
+    // 替代直接 on_order_fill, 让回报线程只调这一个入口。
+    void on_order_report(const Fill& f) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const Order* o = order_manager_.order(f.order_id);
+        if (!o) return;
+        switch (f.type) {
+            case OuchOrderCodec::kMsgAck:    // 'A' Accepted: 订单进入活态
+                order_manager_.on_accept(f.order_id);
+                break;
+            case OuchOrderCodec::kMsgExec:   // 'E' Executed: 成交(可多次, 累积到 FILLED)
+                order_manager_.on_fill(f.order_id, f.filled_qty);
+                risk_manager_.on_fill(*o, f.filled_qty);   // 用本次成交量(支持半成交)
+                break;
+            case OuchOrderCodec::kMsgCancel: // 'C' Canceled: 撤单
+                order_manager_.on_cancel(f.order_id);
+                break;
+            case OuchOrderCodec::kMsgReject: // 'J' Rejected: 拒单
+                order_manager_.on_reject(f.order_id);
+                break;
+            default: break;
+        }
     }
 
 private:

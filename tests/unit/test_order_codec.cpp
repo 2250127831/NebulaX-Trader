@@ -69,14 +69,14 @@ int main() {
     CHECK(iface->encode_fill(999, 200, 10000, fill, sizeof(fill), flen));
     CHECK(flen == 25);
     CHECK(fill[0] == 'F');
-    uint64_t oid = 0, qty = 0;
-    int64_t price = 0;
-    CHECK(iface->decode_fill(fill, flen, oid, qty, price));
-    CHECK(oid == 999 && qty == 200 && price == 10000);
+    Fill out;
+    CHECK(iface->decode_fill(fill, flen, out));
+    CHECK(out.type == 'F');
+    CHECK(out.order_id == 999 && out.filled_qty == 200 && out.fill_price == 10000);
 
     // ── 4. 解码校验: 越界 / 错误 magic ──
     CHECK(!iface->decode_order(buf, 41, r));                 // 长度不足
-    CHECK(!iface->decode_fill(fill, 24, oid, qty, price));   // 长度不足
+    CHECK(!iface->decode_fill(fill, 24, out));               // 长度不足
     uint8_t bad[42];
     memcpy(bad, buf, 42);
     bad[0] = 'X';                                            // 错误 magic
@@ -84,7 +84,7 @@ int main() {
     uint8_t badfill[25];
     memcpy(badfill, fill, 25);
     badfill[0] = 'Y';
-    CHECK(!iface->decode_fill(badfill, 25, oid, qty, price));
+    CHECK(!iface->decode_fill(badfill, 25, out));
 
     // ── 5. 编码校验: 容量不足 / 空指针 ──
     size_t small_len = 0;

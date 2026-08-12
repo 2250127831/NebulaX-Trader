@@ -40,6 +40,13 @@ public:
     //   -1  : 错误（errno 说明原因）
     virtual ssize_t send(const uint8_t* buf, size_t len) = 0;
 
+    // 从同一连接接收数据(TCP 全双工: 订单发 + 回报收共用一连接)。
+    // 与 IMarketDataReceiver::recv 语义一致:
+    //   >0 : 收到的字节数(<= len)
+    //    0 : 阻塞模式=通道已停止/关闭; 非阻塞=当前无数据
+    //   -1 : 错误(errno 说明原因)
+    virtual ssize_t recv(uint8_t* buf, size_t len) = 0;
+
     // 发送通道的文件描述符，供 epoll 监听可写事件。
     //   io_uring → ring fd；DPDK → -1。
     virtual int fd() const = 0;

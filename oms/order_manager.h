@@ -20,6 +20,15 @@ public:
         return order.order_id;
     }
 
+    // 订单被交易所接受(OUCH 'A' Accepted): PENDING → SUBMITTED。
+    // 已拒绝/已撤不可再 accept(非法流转, 拒收)。
+    void on_accept(uint64_t order_id) {
+        auto it = orders_.find(order_id);
+        if (it == orders_.end()) return;
+        if (it->second.status == OrderStatus::PENDING)
+            it->second.status = OrderStatus::SUBMITTED;
+    }
+
     // 成交回报：累计已成交数量，按是否全部成交切换状态。
     void on_fill(uint64_t order_id, uint64_t filled_qty) {
         auto it = orders_.find(order_id);

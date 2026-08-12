@@ -63,14 +63,13 @@ public:
         return true;
     }
 
-    bool decode_fill(const uint8_t* buf, size_t len,
-                     uint64_t& order_id, uint64_t& filled_qty,
-                     int64_t& fill_price) const override {
+    bool decode_fill(const uint8_t* buf, size_t len, Fill& out) const override {
         if (len < kFillMsgLen || buf[0] != kMsgFill) return false;
         uint64_t v;
-        memcpy(&v, buf + 1, 8);  order_id   = be64toh(v);
-        memcpy(&v, buf + 9, 8);  filled_qty = be64toh(v);
-        memcpy(&v, buf + 17, 8); fill_price = (int64_t)be64toh(v);
+        memcpy(&v, buf + 1, 8);  out.order_id   = be64toh(v);
+        memcpy(&v, buf + 9, 8);  out.filled_qty = be64toh(v);
+        memcpy(&v, buf + 17, 8); out.fill_price = (int64_t)be64toh(v);
+        out.type = kMsgFill;                     // 'F'
         return true;
     }
 };

@@ -53,23 +53,26 @@ public:
         return false;  // NONE 不产生订单
     }
 
-    // 成交回报：更新持仓(加权成本)与已实现盈亏。
+    // 成交回报：更新持仓(加权成本)与已实现盈亏(默认整单成交, 用 order.quantity)。
+    void on_fill(const Order& order) { on_fill(order, order.quantity); }
+
+    // 成交回报(带实际成交量): 支持半成交(OUCH 多次 'E' 累积)。
     //   BUY  → 增持仓，重算加权平均成本
     //   SELL → 减持仓，按(卖出价 - 平均成本)×数量 结算盈亏
     // 单写者(ExecutionEngine 锁串行化 on_fill)，qty_ 原子 store 供 position() 读。
-    void on_fill(const Order& order) {
+    void on_fill(const Order& order, uint64_t filled_qty) {
         uint32_t loc = locate_idx(order.symbol_id);
         if (order.side == OrderSide::BUY) {
             int64_t old_avg = avg_cost_[loc];
             uint64_t old_qty = qty_[loc].load(std::memory_order_relaxed);
             int64_t total = old_avg * (int64_t)old_qty
-                          + order.price * (int64_t)order.quantity;
-            uint64_t new_qty = old_qty + order.quantity;
+                          + order.price * (int64_t)filled_qty;
+            uint64_t new_qty = old_qty + filled_qty;
             qty_[loc].store(new_qty, std::memory_order_relaxed);
             avg_cost_[loc] = new_qty ? total / (int64_t)new_qty : 0;
         } else if (order.side == OrderSide::SELL) {
             uint64_t old_qty = qty_[loc].load(std::memory_order_relaxed);
-            uint64_t qty = order.quantity < old_qty ? order.quantity : old_qty;
+            uint64_t qty = filled_qty < old_qty ? filled_qty : old_qty;
             realized_pnl_.fetch_add((order.price - avg_cost_[loc]) * (int64_t)qty,
                                     std::memory_order_relaxed);
             uint64_t new_qty = old_qty - qty;

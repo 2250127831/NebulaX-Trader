@@ -1,6 +1,5 @@
 #include "core/ipc/flow_control.h"
-#include "oms/custom_order_codec.h"
-#include "oms/i_order_codec.h"
+#include "oms/ouch_order_codec.h"
 
 #include <atomic>
 #include <cstdio>
@@ -73,57 +72,78 @@ static void usage() {
            "                     Throttle by --rate, no recv feedback.\n");
 }
 
-// ── 模拟交易所线程 ──
-// 理想状态：收到订单立即全额成交，回报发回交易系统的成交回报端口。
-// 回报端口来源: 有共享内存→读 fc->order_ret_port; 无共享内存(--no-shm)→参数 ret_port。
-// V5 协议解耦: 订单字节经 IOrderCodec 编解码, 与 trader 用同一 codec 保证协议一致。
+// ── 模拟交易所线程(V5: TCP 全双工 + OUCH) ──
+// TCP server: listen/accept trader 连接, 同一 fd 全双工。
+//   读 49B 'O'(定长流分帧) → decode → 回 'A' Accepted → 回 'E' Executed(全额成交)。
+// OUCH 语义: 模拟交易所对每个有效订单回 A + E(trader 侧只有 E 驱动 OMS 成交)。
 static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
-                             const IOrderCodec& codec,
+                             const OuchOrderCodec& codec,
                              std::atomic<bool>& stop,
                              std::atomic<uint64_t>& orders_received) {
-    int osock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (osock < 0) return;
+    int lsock = socket(AF_INET, SOCK_STREAM, 0);
+    if (lsock < 0) { perror("sim_exchange socket"); return; }
+    int opt = 1;
+    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in oaddr{};
     oaddr.sin_family = AF_INET;
     oaddr.sin_port   = htons(static_cast<uint16_t>(order_port));
     oaddr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(osock, reinterpret_cast<sockaddr*>(&oaddr), sizeof(oaddr)) < 0) {
-        close(osock);
+    if (bind(lsock, reinterpret_cast<sockaddr*>(&oaddr), sizeof(oaddr)) < 0) {
+        fprintf(stderr, "模拟交易所 bind %u 失败: %s (端口被占用?)\n",
+                order_port, strerror(errno));
+        close(lsock);
         return;
     }
-    // 200ms recv 超时，让 stop 能及时退出
-    struct timeval tv{0, 200000};
-    setsockopt(osock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    uint8_t buf[256];
-    while (!stop.load(std::memory_order_acquire)) {
-        sockaddr_in from{};
-        socklen_t flen = sizeof(from);
-        ssize_t n = recvfrom(osock, buf, sizeof(buf), 0,
-                             reinterpret_cast<sockaddr*>(&from), &flen);
-        if (n < 0) continue;   // 超时(无订单)
-
-        Order o{};
-        if (!codec.decode_order(buf, static_cast<size_t>(n), o)) continue;
-        ++orders_received;
-
-        // 理想状态：全额成交，按订单价回报
-        uint8_t fill[256];
-        size_t fill_len = 0;
-        if (!codec.encode_fill(o.order_id, o.quantity, o.price, fill, sizeof(fill), fill_len))
-            continue;
-
-        uint64_t rp = (fc != nullptr)
-            ? fc->order_ret_port.load(std::memory_order_acquire) : ret_port;
-        if (rp == 0) continue;
-        sockaddr_in ret{};
-        ret.sin_family = AF_INET;
-        ret.sin_port   = htons(static_cast<uint16_t>(rp));
-        inet_pton(AF_INET, "127.0.0.1", &ret.sin_addr);
-        sendto(osock, fill, fill_len, 0,
-               reinterpret_cast<sockaddr*>(&ret), sizeof(ret));
+    if (listen(lsock, 4) < 0) {
+        fprintf(stderr, "模拟交易所 listen %u 失败: %s\n", order_port, strerror(errno));
+        close(lsock);
+        return;
     }
-    close(osock);
+
+    while (!stop.load(std::memory_order_acquire)) {
+        // accept(带 200ms 超时, 让 stop 能及时退出)
+        int csock;
+        {
+            struct timeval tv{0, 200000};
+            setsockopt(lsock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            sockaddr_in from{};
+            socklen_t flen = sizeof(from);
+            csock = accept(lsock, reinterpret_cast<sockaddr*>(&from), &flen);
+        }
+        if (csock < 0) continue;   // 超时/无连接
+
+        // 连接建立: 同一 fd 全双工读订单/写回报, 直到停止或对端关闭
+        uint8_t buf[256];
+        while (!stop.load(std::memory_order_acquire)) {
+            // 读完整 'O'(定长 49B, 流分帧)
+            size_t got = 0;
+            while (got < OuchOrderCodec::kOrderMsgLen) {
+                ssize_t n = recv(csock, buf + got, OuchOrderCodec::kOrderMsgLen - got, 0);
+                if (n <= 0) break;   // 对端关闭/超时
+                got += static_cast<size_t>(n);
+            }
+            if (got < OuchOrderCodec::kOrderMsgLen) break;   // 连接断/停止
+
+            Order o{};
+            if (!codec.decode_order(buf, got, o)) continue;
+            ++orders_received;
+
+            // OUCH 回执: 先 'A' Accepted 再 'E' Executed(全额成交, 按订单价)
+            uint8_t ack[OuchOrderCodec::kAckMsgLen];
+            size_t ack_len = 0;
+            uint8_t exec[OuchOrderCodec::kExecMsgLen];
+            size_t exec_len = 0;
+            if (!codec.encode_ack(o, ack, sizeof(ack), ack_len)) continue;
+            if (!codec.encode_exec(o.order_id, o.quantity, o.price, exec, sizeof(exec), exec_len))
+                continue;
+            ssize_t w1 = send(csock, ack, ack_len, MSG_NOSIGNAL);
+            ssize_t w2 = send(csock, exec, exec_len, MSG_NOSIGNAL);
+            (void)w1; (void)w2;
+        }
+        close(csock);
+    }
+    close(lsock);
+    (void)fc; (void)ret_port;   // OUCH 全双工不再需要独立回报端口
 }
 
 int main(int argc, char* argv[]) {
@@ -174,7 +194,7 @@ int main(int argc, char* argv[]) {
 
     // ── 模拟交易所线程：收订单、立即回全额成交 ──
     // V5 协议解耦: codec 与 trader 侧一致(默认自定义 'O'/'F' 协议)。
-    CustomOrderCodec order_codec;
+    OuchOrderCodec order_codec;   // 与 trader 侧一致(OUCH 4.2)
     std::atomic<bool> order_stop{false};
     std::atomic<uint64_t> orders_received{0};
     std::thread sim_exchange(run_sim_exchange, cfg.order_port, fc,

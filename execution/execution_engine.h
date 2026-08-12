@@ -99,6 +99,7 @@ public:
         if (!o) return;
         order_manager_.on_fill(order_id, filled_qty, fill_price);
         risk_manager_.on_fill(*o, filled_qty);
+        flatten_on_drawdown();   // 成交后评估: 回撤破第二档则平仓
     }
 
     // 订单回报分发(OUCH 'A'/'E'/'C'/'J'): 按 type 驱动 OMS 状态机 + 风控。
@@ -114,6 +115,7 @@ public:
             case OuchOrderCodec::kMsgExec:   // 'E' Executed: 成交(可多次, 累积到 FILLED)
                 order_manager_.on_fill(f.order_id, f.filled_qty, f.fill_price);
                 risk_manager_.on_fill(*o, f.filled_qty);   // 用本次成交量(支持半成交)
+                flatten_on_drawdown();   // 成交后评估: 回撤破第二档则平仓
                 break;
             case OuchOrderCodec::kMsgCancel: // 'C' Canceled: 撤单
                 order_manager_.on_cancel(f.order_id);
@@ -138,11 +140,37 @@ public:
         return r == (ssize_t)out_len;
     }
 
+    // 回撤平仓触发(V5): 回撤破第二档 → 撤全部活态订单。成交后评估调用。
+    // 防重复: flatten_issued_ 标志, 触发一次后不再重复撤。
+    void flatten_on_drawdown() {
+        if (flatten_issued_) return;
+        if (!risk_manager_.drawdown_flatten()) return;   // 未破第二档
+        flatten_issued_ = true;
+        // 遍历全部活态订单撤单(无 sender 时 request_cancel 仍标记 PENDING_CANCEL)
+        order_manager_.iterate([&](uint64_t id, const OrderManager::Entry& e) {
+            if (e.status == OrderStatus::SUBMITTED ||
+                e.status == OrderStatus::PARTIAL_FILL) {
+                if (sender_ && codec_) {
+                    uint8_t buf[64];
+                    size_t out_len = 0;
+                    if (codec_->encode_cancel_request(id, buf, sizeof(buf), out_len)) {
+                        ssize_t r = sender_->send(buf, out_len);
+                        if (r == (ssize_t)out_len)
+                            order_manager_.request_cancel(id);   // 发送成功才标记在途
+                    }
+                } else {
+                    order_manager_.request_cancel(id);   // 无 sender: 直接标记(单测)
+                }
+            }
+        });
+    }
+
 private:
     OrderManager& order_manager_;
     RiskManager&  risk_manager_;
     IMarketDataSender* sender_ = nullptr;
     IOrderCodec* codec_ = nullptr;   // 协议编解码(内部 Order ↔ 协议字节)
     uint64_t base_qty_ = 100;   // 满强度基准下单量(股)
+    bool flatten_issued_ = false;   // 回撤平仓是否已触发(防重复)
     std::mutex mtx_;
 };

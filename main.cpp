@@ -182,6 +182,9 @@ struct BookWorker {
         obc.on_event(ev);
         book_events->fetch_add(1, std::memory_order_relaxed);
         const OrderBook* book = obc.book(ev.locate);
+        // V5 盯市: 盘口有效时喂中间价给风控(回撤按盯市净值计算)
+        if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
+            rm->mark(ev.locate, (book->best_bid() + book->best_ask()) / 2);
         // 方向：A/U 自带 side；D/X/E 查簿
         OrderSide side = OrderSide::NONE;
         if (ev.type == MarketEvent::Type::ADD ||
@@ -374,6 +377,10 @@ int main(int argc, char* argv[]) {
     RiskManager rm;
     rm.set_max_position(cfg.risk.max_position);
     rm.set_max_daily_loss(cfg.risk.max_daily_loss);
+    // V5 盯市回撤风控: 初始资金 + 两档回撤阈值
+    rm.set_initial_equity(cfg.risk.initial_equity);
+    rm.set_max_drawdown_pause(cfg.risk.max_drawdown_pause);
+    rm.set_max_drawdown_flatten(cfg.risk.max_drawdown_flatten);
     ExecutionEngine ex(om, rm);
     ex.set_base_qty(cfg.execution.base_qty);
 
@@ -672,6 +679,12 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < nworkers; ++i)
         printf(" w%zu=%llu", i, (unsigned long long)rm.position(bws[i]->ofi.signal().locate));
     printf("  已实现盈亏=%lld 分\n", (long long)rm.realized_pnl());
+    // V5 盯市回撤统计
+    printf("  盯市净值=%lld 分 峰值=%lld 分 回撤=%lld 分 暂停=%s 平仓=%s\n",
+           (long long)rm.equity(), (long long)rm.equity_peak(),
+           (long long)rm.drawdown(),
+           rm.drawdown_paused() ? "是" : "否",
+           rm.drawdown_flatten() ? "是" : "否");
 
     if (fc) munmap(fc, sizeof(FlowControl));
     return 0;

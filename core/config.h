@@ -45,6 +45,9 @@ struct StrategyConfig {
 struct RiskConfig {
     uint64_t max_position = 10000;
     int64_t  max_daily_loss = 100000000;  // 分（默认 100 万元）
+    int64_t  initial_equity = 100000000;  // 初始资金(分, 默认 100 万元), 净值基准
+    int64_t  max_drawdown_pause = 5000000;   // 回撤 5% 触发暂停新单(分)
+    int64_t  max_drawdown_flatten = 10000000;  // 回撤 10% 触发强制平仓(分)
 };
 
 // ── 执行引擎配置 ──

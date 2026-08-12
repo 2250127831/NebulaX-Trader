@@ -281,6 +281,13 @@ add_executable(ut_order_book_own
 target_link_libraries(ut_order_book_own PRIVATE core oms)
 add_test(NAME ut_order_book_own COMMAND ut_order_book_own)
 
+# 盯市回撤风控(V5): 盯市净值/峰值/分档触发(暂停新单/强制平仓)
+add_executable(ut_drawdown
+    tests/unit/test_drawdown.cpp
+)
+target_link_libraries(ut_drawdown PRIVATE core oms risk execution strategy)
+add_test(NAME ut_drawdown COMMAND ut_drawdown)
+
 # SPMC 多消费者广播: 多个策略从通道 A 消费同一批成交
 add_executable(ut_spmc_strategies
     tests/integration/test_spmc_strategies.cpp

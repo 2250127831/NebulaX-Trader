@@ -47,6 +47,9 @@ Config ConfigLoader::load(const std::string& path) {
     if (auto n = root["risk"]) {
         if (n["max_position"])   cfg.risk.max_position   = n["max_position"].as<uint64_t>();
         if (n["max_daily_loss"]) cfg.risk.max_daily_loss = n["max_daily_loss"].as<int64_t>();
+        if (n["initial_equity"]) cfg.risk.initial_equity = n["initial_equity"].as<int64_t>();
+        if (n["max_drawdown_pause"])   cfg.risk.max_drawdown_pause   = n["max_drawdown_pause"].as<int64_t>();
+        if (n["max_drawdown_flatten"]) cfg.risk.max_drawdown_flatten = n["max_drawdown_flatten"].as<int64_t>();
     }
 
     // execution

@@ -76,6 +76,8 @@ static void usage() {
 // TCP server: listen/accept trader 连接, 同一 fd 全双工。
 //   读 49B 'O'(定长流分帧) → decode → 回 'A' Accepted → 回 'E' Executed(全额成交)。
 // OUCH 语义: 模拟交易所对每个有效订单回 A + E(trader 侧只有 E 驱动 OMS 成交)。
+//   'A' 由 encode_ack 分配交易所 Order Reference Number(ref), 'E'/'C' 取同一 ref 回报。
+//   trader 侧重在 order_id/token, ref 是交易所侧订单号(正确链路的职责划分)。
 static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
                              const OuchOrderCodec& codec,
                              std::atomic<bool>& stop,

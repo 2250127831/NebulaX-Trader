@@ -44,8 +44,9 @@ int main() {
     uint64_t oid = om.new_order(order);   // PENDING
     CHECK(oid != 0);
     CHECK(om.status(oid) == OrderStatus::PENDING);
+    uint64_t oid_ref = 0;   // 交易所分配的 Order Reference Number('A' 学习, 供后续回报断言)
 
-    // ── 1. 'A' Accepted → SUBMITTED ──
+    // ── 1. 'A' Accepted → SUBMITTED, 记录交易所分配的 ref ──
     {
         uint8_t ack[OuchOrderCodec::kAckMsgLen];
         size_t alen = 0;
@@ -54,8 +55,11 @@ int main() {
         CHECK(codec.decode_fill(ack, alen, f));
         CHECK(f.type == OuchOrderCodec::kMsgAck);
         CHECK(f.order_id == oid);
+        CHECK(f.exchange_ref != 0);              // 交易所分配 ref
+        oid_ref = f.exchange_ref;
         ex.on_order_report(f);
         CHECK(om.status(oid) == OrderStatus::SUBMITTED);
+        CHECK(om.entry(oid)->exchange_ref == oid_ref);   // OMS 记录交易所订单号
     }
 
     // ── 2. 'E' Executed 半成交 60 → PARTIAL_FILL ──
@@ -67,6 +71,7 @@ int main() {
         CHECK(codec.decode_fill(exec, elen, f));
         CHECK(f.type == OuchOrderCodec::kMsgExec);
         CHECK(f.order_id == oid);
+        CHECK(f.exchange_ref == oid_ref);   // 同一订单同一交易所 ref
         CHECK(f.filled_qty == 60);
         ex.on_order_report(f);
         CHECK(om.status(oid) == OrderStatus::PARTIAL_FILL);
@@ -80,6 +85,7 @@ int main() {
         CHECK(codec.encode_exec(oid, 40, 10000, exec, sizeof(exec), elen));
         Fill f;
         CHECK(codec.decode_fill(exec, elen, f));
+        CHECK(f.exchange_ref == oid_ref);   // 同一订单同一交易所 ref
         ex.on_order_report(f);
         CHECK(om.status(oid) == OrderStatus::FILLED);
         CHECK(rm.position(1) == 100);   // 全成交

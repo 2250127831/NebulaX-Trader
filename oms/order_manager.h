@@ -26,6 +26,7 @@ public:
     struct Entry {
         Order order;
         OrderStatus status;
+        uint64_t exchange_ref = 0;   // 交易所分配的 Order Reference Number('A' 带回, 0=未接受)
         uint64_t filled = 0;         // 已成交量
         uint64_t remaining = 0;      // 剩余未成交量(quantity - filled)
         int64_t  avg_fill_price = 0; // 加权成交均价(分)
@@ -51,11 +52,13 @@ public:
     }
 
     // 订单被交易所接受(OUCH 'A'): PENDING → SUBMITTED(活态)。
-    void on_accept(uint64_t order_id) {
+    // ref: 交易所分配的 Order Reference Number, 记录供对账/审计。
+    void on_accept(uint64_t order_id, uint64_t ref = 0) {
         auto it = orders_.find(order_id);
         if (it == orders_.end()) return;
         if (it->second.status == OrderStatus::PENDING) {
             it->second.status = OrderStatus::SUBMITTED;
+            it->second.exchange_ref = ref;
             it->second.update_time = now();
         }
     }

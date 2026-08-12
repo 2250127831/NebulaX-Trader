@@ -10,7 +10,8 @@
 // 'C' Canceled / 'J' Rejected。
 struct Fill {
     uint8_t  type = 'F';        // 回报类型(A/E/C/J 或自定义 'F')
-    uint64_t order_id = 0;      // 内部订单 id(经 token 映射回)
+    uint64_t order_id = 0;      // 内部订单 id(经 ref/token 映射回)
+    uint64_t exchange_ref = 0;  // 交易所分配的 Order Reference Number('A' 带回, 0=未接受)
     uint64_t filled_qty = 0;    // 该笔成交量
     int64_t  fill_price = 0;    // 成交价(定点整数, 分)
 };

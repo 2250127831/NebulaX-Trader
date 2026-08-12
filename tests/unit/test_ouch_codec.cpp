@@ -28,7 +28,7 @@ int main() {
 
     // ── 1. 帧长 ──
     CHECK(iface->order_msg_len() == 49);
-    CHECK(iface->fill_msg_len() == 34);   // 最小回报帧(Executed)
+    CHECK(iface->fill_msg_len() == 42);   // 最小回报帧(Executed)
 
     // ── 2. 'O' Enter Order 编解码 + token 映射 ──
     Order o{};
@@ -63,30 +63,52 @@ int main() {
     CHECK(r.price == 10000);                   // OUCH ×10000 → 分
     CHECK(r.symbol_id == 65535);
 
-    // ── 3. 'E' Executed 回报解码(token → order_id) ──
-    // encode_exec 用同一 codec(登记了 token 42)
+    // ── 3. 'E' Executed 回报解码(ref 关联) ──
+    // encode_exec 用同一 codec(交易所侧分配 ref)
     uint8_t exec[64];
     size_t elen = 0;
     CHECK(codec.encode_exec(42, 500, 10000, exec, sizeof(exec), elen));
-    CHECK(elen == 34);
+    CHECK(elen == 42);
     CHECK(exec[0] == 'E');
     Fill f;
     CHECK(iface->decode_fill(exec, elen, f));
     CHECK(f.type == 'E');
-    CHECK(f.order_id == 42);                   // token 查表 → order_id
+    CHECK(f.order_id == 42);                   // token 解析回 → order_id
+    CHECK(f.exchange_ref != 0);                // 交易所分配的 ref 非零
+    uint64_t ref42 = f.exchange_ref;
     CHECK(f.filled_qty == 500);
     CHECK(f.fill_price == 10000);              // OUCH ×10000 → 分
 
-    // ── 4. 'A' Accepted 回报解码 ──
+    // ── 4. 'A' Accepted 回报解码 + ref 学习 ──
     uint8_t ack[64];
     size_t alen = 0;
     CHECK(codec.encode_ack(o, ack, sizeof(ack), alen));
-    CHECK(alen == 31);
+    CHECK(alen == 39);
     CHECK(ack[0] == 'A');
     Fill fa;
     CHECK(iface->decode_fill(ack, alen, fa));
     CHECK(fa.type == 'A');
     CHECK(fa.order_id == 42);
+    CHECK(fa.exchange_ref == ref42);           // 同一订单同一 ref(交易所分配, 稳定贯穿)
+
+    // 'A' 之后 'E' 按 ref 关联到同一 order_id(ref_to_id_ 已登记), ref 一致
+    uint8_t exec2[64];
+    size_t elen2 = 0;
+    CHECK(codec.encode_exec(42, 200, 10000, exec2, sizeof(exec2), elen2));
+    Fill f2;
+    CHECK(iface->decode_fill(exec2, elen2, f2));
+    CHECK(f2.type == 'E');
+    CHECK(f2.order_id == 42);
+    CHECK(f2.exchange_ref == ref42);           // 同一 ref 贯穿
+
+    // 不同订单 → 交易所分配不同 ref
+    uint8_t exec3[64];
+    size_t elen3 = 0;
+    CHECK(codec.encode_exec(99, 10, 10000, exec3, sizeof(exec3), elen3));
+    Fill f3;
+    CHECK(iface->decode_fill(exec3, elen3, f3));
+    CHECK(f3.order_id == 99);
+    CHECK(f3.exchange_ref != ref42);           // 不同订单不同 ref
 
     // ── 5. 校验: 错误 checksum / 未知类型 / 长度不足 ──
     uint8_t bad[49];

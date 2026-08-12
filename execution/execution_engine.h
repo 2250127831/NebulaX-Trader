@@ -109,8 +109,8 @@ public:
         const Order* o = order_manager_.order(f.order_id);
         if (!o) return;
         switch (f.type) {
-            case OuchOrderCodec::kMsgAck:    // 'A' Accepted: 订单进入活态
-                order_manager_.on_accept(f.order_id);
+            case OuchOrderCodec::kMsgAck:    // 'A' Accepted: 进入活态, 记录交易所分配的 ref
+                order_manager_.on_accept(f.order_id, f.exchange_ref);
                 break;
             case OuchOrderCodec::kMsgExec:   // 'E' Executed: 成交(可多次, 累积到 FILLED)
                 order_manager_.on_fill(f.order_id, f.filled_qty, f.fill_price);

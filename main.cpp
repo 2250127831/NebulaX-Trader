@@ -561,11 +561,19 @@ int main(int argc, char* argv[]) {
                     else if (stream[0] == OuchOrderCodec::kMsgExec) mlen = OuchOrderCodec::kExecMsgLen;
                     else if (stream[0] == OuchOrderCodec::kMsgCancel) mlen = OuchOrderCodec::kCancelMsgLen;
                     else if (stream[0] == OuchOrderCodec::kMsgReject) mlen = OuchOrderCodec::kRejectMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgBook) mlen = OuchOrderCodec::kBookMsgLen;
                     else { stream.erase(stream.begin()); continue; }   // 未知字节, 丢弃
                     if (stream.size() < mlen) break;   // 消息未完整, 等更多数据
-                    Fill f;
-                    if (order_codec.decode_fill(stream.data(), mlen, f))
-                        ex.on_order_report(f);   // 按 type 分发(A 接受/E 成交/C 撤/J 拒)
+                    if (stream[0] == OuchOrderCodec::kMsgBook) {
+                        // 'B' 盘口响应: 交给盘口查询等待方
+                        BookQuote bq;
+                        if (order_codec.decode_book(stream.data(), mlen, bq))
+                            ex.on_book_quote(bq);
+                    } else {
+                        Fill f;
+                        if (order_codec.decode_fill(stream.data(), mlen, f))
+                            ex.on_order_report(f);   // 按 type 分发(A 接受/E 成交/C 撤/J 拒)
+                    }
                     stream.erase(stream.begin(), stream.begin() + mlen);   // 消费完整消息
                 }
             } else break;

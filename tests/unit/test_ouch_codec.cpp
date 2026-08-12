@@ -128,6 +128,60 @@ int main() {
     CHECK(iface->encode_order(o, buf2, sizeof(buf2), len2));
     CHECK(std::memcmp(buf + 1, buf2 + 1, 14) == 0);   // 同一 token
 
+    // ── 7. TIF 按订单类型(撮合引擎契约: LIMIT→'D', MARKET→'Y') ──
+    CHECK(buf[34] == 'D');   // o.type=LIMIT → TIF 'D'(限价挂簿)
+    Order mkt = o;
+    mkt.order_id = 43;
+    mkt.type = OrderType::MARKET;
+    uint8_t mbuf[64];
+    size_t mlen_ = 0;
+    CHECK(iface->encode_order(mkt, mbuf, sizeof(mbuf), mlen_));
+    CHECK(mbuf[34] == 'Y');   // MARKET → TIF 'Y'(市价兼容)
+    // decode_order TIF→type: 'D'→LIMIT, 'Y'→MARKET
+    Order rd;
+    CHECK(iface->decode_order(buf, len, rd));
+    CHECK(rd.type == OrderType::LIMIT);
+    Order rm;
+    CHECK(iface->decode_order(mbuf, mlen_, rm));
+    CHECK(rm.type == OrderType::MARKET);
+
+    // ── 8. 'Q' Book Query 编解码往返 ──
+    uint8_t qbuf[32];
+    size_t qlen = 0;
+    CHECK(iface->encode_book_query(65535, qbuf, sizeof(qbuf), qlen));
+    CHECK(qlen == 13);
+    CHECK(qbuf[0] == 'Q');
+    CHECK(qbuf[11] == ' ');   // 保留字节空格
+    uint64_t qsym = 0;
+    CHECK(codec.decode_book_query(qbuf, qlen, qsym));
+    CHECK(qsym == 65535);
+    // checksum 破坏 → decode 失败
+    uint8_t qbad[13];
+    memcpy(qbad, qbuf, 13);
+    qbad[12] = static_cast<uint8_t>(qbad[12] + 1);
+    CHECK(!codec.decode_book_query(qbad, 13, qsym));
+
+    // ── 9. 'B' Book 编解码往返(撮合引擎 encode → Trader decode) ──
+    uint8_t bbuf[64];
+    size_t blen = 0;
+    CHECK(codec.encode_book(65535, 10000, 300, 10500, 200, bbuf, sizeof(bbuf), blen));
+    CHECK(blen == 34);
+    CHECK(bbuf[0] == 'B');
+    BookQuote bq;
+    CHECK(iface->decode_book(bbuf, blen, bq));
+    CHECK(bq.symbol_id == 65535);
+    CHECK(bq.bid == 10000);        // OUCH ×10000 → 分
+    CHECK(bq.bid_vol == 300);
+    CHECK(bq.ask == 10500);
+    CHECK(bq.ask_vol == 200);
+    // 破坏 checksum → decode 失败
+    uint8_t bbad[34];
+    memcpy(bbad, bbuf, 34);
+    bbad[33] = static_cast<uint8_t>(bbad[33] + 1);
+    CHECK(!iface->decode_book(bbad, 34, bq));
+    // 未知类型 / 长度不足
+    CHECK(!iface->decode_book(bbuf, 33, bq));
+
     if (g_failures == 0) {
         printf("OUCH 4.2 codec 单测 PASS ✓\n");
         return 0;

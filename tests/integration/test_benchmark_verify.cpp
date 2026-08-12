@@ -394,12 +394,19 @@ int main(int argc, char* argv[]) {
                     else if (stream[0] == OuchOrderCodec::kMsgExec) mlen = OuchOrderCodec::kExecMsgLen;
                     else if (stream[0] == OuchOrderCodec::kMsgCancel) mlen = OuchOrderCodec::kCancelMsgLen;
                     else if (stream[0] == OuchOrderCodec::kMsgReject) mlen = OuchOrderCodec::kRejectMsgLen;
+                    else if (stream[0] == OuchOrderCodec::kMsgBook) mlen = OuchOrderCodec::kBookMsgLen;
                     else { stream.erase(stream.begin()); continue; }
                     if (stream.size() < mlen) break;
-                    Fill f;
-                    if (order_codec.decode_fill(stream.data(), mlen, f)) {
-                        ex.on_order_report(f);   // 按 type 分发(A/E/C/J)
-                        if (f.type == OuchOrderCodec::kMsgExec) ++fill_count;
+                    if (stream[0] == OuchOrderCodec::kMsgBook) {
+                        BookQuote bq;
+                        if (order_codec.decode_book(stream.data(), mlen, bq))
+                            ex.on_book_quote(bq);
+                    } else {
+                        Fill f;
+                        if (order_codec.decode_fill(stream.data(), mlen, f)) {
+                            ex.on_order_report(f);   // 按 type 分发(A/E/C/J)
+                            if (f.type == OuchOrderCodec::kMsgExec) ++fill_count;
+                        }
                     }
                     stream.erase(stream.begin(), stream.begin() + mlen);
                 }

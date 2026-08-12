@@ -16,6 +16,16 @@ struct Fill {
     int64_t  fill_price = 0;    // 成交价(定点整数, 分)
 };
 
+// ── 盘口快照 ──
+// 协议无关的 best bid/ask 中间表示(内部分)。'B' Book 回报 decode 后填充。
+struct BookQuote {
+    uint64_t symbol_id = 0;
+    int64_t  bid = 0;           // 买一价(分)
+    uint64_t bid_vol = 0;       // 买一量
+    int64_t  ask = 0;           // 卖一价(分)
+    uint64_t ask_vol = 0;       // 卖一量
+};
+
 // ── 订单协议编解码接口 ──
 // 抽象"内部 Order/Fill ↔ 协议字节"边界。业务代码(OMS/Risk/ExecutionEngine)只消费内部
 // Order/Fill 结构, 不碰协议字节; 换协议(自定义 'O'/'F' → OUCH 4.2 → FIX/国内私有)只换
@@ -50,4 +60,18 @@ public:
     // 撤单请求序列化(交易系统 → 交易所)。成功写 out_len 字节, 返回 true。
     virtual bool encode_cancel_request(uint64_t order_id, uint8_t* buf, size_t cap,
                                        size_t& out_len) const = 0;
+
+    // 盘口查询请求序列化(交易系统 → 交易所): 'Q' Book Query。
+    // 默认不支持(CustomOrderCodec 等非盘口查询协议 return false)。
+    virtual bool encode_book_query(uint64_t symbol_id, uint8_t* buf, size_t cap,
+                                   size_t& out_len) const {
+        (void)symbol_id; (void)buf; (void)cap; (void)out_len;
+        return false;
+    }
+    // 盘口回报反序列化(交易所 → 交易系统): 'B' Book → BookQuote。
+    // 默认不支持 return false。
+    virtual bool decode_book(const uint8_t* buf, size_t len, BookQuote& out) const {
+        (void)buf; (void)len; (void)out;
+        return false;
+    }
 };

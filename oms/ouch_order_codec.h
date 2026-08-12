@@ -44,12 +44,16 @@ public:
     static constexpr size_t kCancelMsgLen   = 39;   // 'C' Canceled(回报)
     static constexpr size_t kRejectMsgLen   = 36;   // 'J' Rejected(回报)
     static constexpr size_t kCancelReqLen   = 19;   // 'X' Cancel Order(请求)
+    static constexpr size_t kBookQueryMsgLen = 13;  // 'Q' Book Query(请求)
+    static constexpr size_t kBookMsgLen      = 34;  // 'B' Book(盘口回报)
     static constexpr uint8_t kMsgOrder  = 'O';
     static constexpr uint8_t kMsgAck    = 'A';
     static constexpr uint8_t kMsgExec   = 'E';
     static constexpr uint8_t kMsgCancel = 'C';
     static constexpr uint8_t kMsgReject = 'J';
     static constexpr uint8_t kMsgCancelReq = 'X';
+    static constexpr uint8_t kMsgBookQuery = 'Q';
+    static constexpr uint8_t kMsgBook = 'B';
 
     size_t order_msg_len() const override { return kOrderMsgLen; }
     size_t fill_msg_len() const override { return kExecMsgLen; }   // 最小回报帧(用于缓冲)
@@ -68,7 +72,8 @@ public:
         snprintf(book, sizeof(book), "%llu", (unsigned long long)o.symbol_id);
         std::memcpy(buf + 20, book, strlen(book));
         be32(buf + 30, static_cast<int32_t>(o.price * 100));   // 分 → OUCH ×10000
-        buf[34] = 'Y';          // timeInForce: 当日
+        // timeInForce: 按订单类型(撮合引擎契约: 'D'限价挂簿 / 'I'IOC / 'F'FOK / 'Y'市价兼容)
+        buf[34] = (o.type == OrderType::LIMIT || o.type == OrderType::ICEBERG) ? 'D' : 'Y';
         buf[41] = 'N';          // display: 非显示(匿名单)
         buf[42] = 'A';          // capacity: 代理
         buf[43] = 'N';          // isc: 无
@@ -97,7 +102,8 @@ public:
         std::memcpy(book, buf + 20, 10); book[10] = '\0';
         out.symbol_id = strtoull(book, nullptr, 10);
         out.price = static_cast<int64_t>(be32(buf + 30)) / 100;   // OUCH ×10000 → 分
-        out.type = OrderType::MARKET;
+        // TIF → 订单类型('D'=限价挂簿, 其余 IOC/FOK/市价 → MARKET; 'I'/'F' 在 OrderType 不可表达)
+        out.type = (buf[34] == 'D') ? OrderType::LIMIT : OrderType::MARKET;
         out.timestamp = 0;
         return true;
     }
@@ -227,6 +233,67 @@ public:
         be32(buf + 15, 0);   // shares=0 → 撤全部剩余
         buf[18] = checksum(buf, kCancelReqLen - 1);
         out_len = kCancelReqLen;
+        return true;
+    }
+
+    // 'Q' Book Query(13B): 盘口查询请求(交易系统 → 交易所)。
+    // [0]'Q' + [1..10]orderBook(10B locate 数字左对齐) + [11]保留(空格) + [12]checksum
+    bool encode_book_query(uint64_t symbol_id, uint8_t* buf, size_t cap,
+                           size_t& out_len) const override {
+        if (!buf || cap < kBookQueryMsgLen) return false;
+        std::memset(buf, ' ', kBookQueryMsgLen);
+        buf[0] = kMsgBookQuery;
+        char book[11];
+        snprintf(book, sizeof(book), "%llu", (unsigned long long)symbol_id);
+        std::memcpy(buf + 1, book, strlen(book));
+        buf[12] = checksum(buf, kBookQueryMsgLen - 1);
+        out_len = kBookQueryMsgLen;
+        return true;
+    }
+
+    // 'Q' Book Query 反序列化(撮合引擎侧): → symbol_id
+    bool decode_book_query(const uint8_t* buf, size_t len, uint64_t& symbol_id) const {
+        if (len < kBookQueryMsgLen || buf[0] != kMsgBookQuery) return false;
+        if (buf[12] != checksum(buf, kBookQueryMsgLen - 1)) return false;
+        char book[11];
+        std::memcpy(book, buf + 1, 10); book[10] = '\0';
+        symbol_id = strtoull(book, nullptr, 10);
+        return true;
+    }
+
+    // 'B' Book(34B): 盘口回报(撮合引擎侧编码)。bid/ask 为 OUCH ×10000(= 分×100)。
+    // [0]'B' + [1..10]orderBook + [11..14]bid + [15..18]bidVol + [19..22]ask
+    // + [23..26]askVol + [27..32]保留(空格) + [33]checksum
+    bool encode_book(uint64_t symbol_id, int64_t bid, uint64_t bid_vol,
+                     int64_t ask, uint64_t ask_vol, uint8_t* buf, size_t cap,
+                     size_t& out_len) const {
+        if (!buf || cap < kBookMsgLen) return false;
+        std::memset(buf, ' ', kBookMsgLen);
+        buf[0] = kMsgBook;
+        char book[11];
+        snprintf(book, sizeof(book), "%llu", (unsigned long long)symbol_id);
+        std::memcpy(buf + 1, book, strlen(book));
+        be32(buf + 11, static_cast<int32_t>(bid * 100));
+        be32(buf + 15, static_cast<uint32_t>(bid_vol));
+        be32(buf + 19, static_cast<int32_t>(ask * 100));
+        be32(buf + 23, static_cast<uint32_t>(ask_vol));
+        buf[33] = checksum(buf, kBookMsgLen - 1);
+        out_len = kBookMsgLen;
+        return true;
+    }
+
+    // 'B' Book 反序列化(Trader 侧): → BookQuote。bid/ask OUCH ×10000 → 分。
+    bool decode_book(const uint8_t* buf, size_t len, BookQuote& out) const override {
+        if (len < kBookMsgLen || buf[0] != kMsgBook) return false;
+        if (buf[33] != checksum(buf, kBookMsgLen - 1)) return false;
+        out = BookQuote{};
+        char book[11];
+        std::memcpy(book, buf + 1, 10); book[10] = '\0';
+        out.symbol_id = strtoull(book, nullptr, 10);
+        out.bid    = static_cast<int64_t>(be32(buf + 11)) / 100;
+        out.bid_vol = be32(buf + 15);
+        out.ask    = static_cast<int64_t>(be32(buf + 19)) / 100;
+        out.ask_vol = be32(buf + 23);
         return true;
     }
 

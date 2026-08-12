@@ -37,7 +37,8 @@
 #include "market/pipeline/byte_ring_parser.h"
 #include "market/pipeline/mold_udp_unpacker.h"
 #include "oms/order_manager.h"
-#include "oms/order_protocol.h"
+#include "oms/i_order_codec.h"
+#include "oms/custom_order_codec.h"
 #include "risk/risk_manager.h"
 #include "strategy/base/strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
@@ -376,6 +377,11 @@ int main(int argc, char* argv[]) {
     ExecutionEngine ex(om, rm);
     ex.set_base_qty(cfg.execution.base_qty);
 
+    // V5 协议解耦: 订单字节经 IOrderCodec 编解码, 业务逻辑不碰协议字节。
+    // 换协议(自定义 'O'/'F' → OUCH 4.2)只换 codec 实现。
+    CustomOrderCodec order_codec;
+    ex.set_codec(&order_codec);
+
     // 订单发送端（→ 模拟交易所）
     auto order_send_ring = std::make_unique<uint8_t[]>(1 << 20);
     auto order_sender = std::make_unique<IoUringSender>(
@@ -542,7 +548,7 @@ int main(int argc, char* argv[]) {
             if (n > 0) {
                 uint64_t oid = 0, qty = 0;
                 int64_t price = 0;
-                if (decode_fill(buf, (size_t)n, oid, qty, price))
+                if (order_codec.decode_fill(buf, (size_t)n, oid, qty, price))
                     ex.on_order_fill(oid, qty, price);
             } else break;
         }

@@ -129,7 +129,8 @@ target_include_directories(strategy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(oms
     oms/order.h
     oms/order_manager.h
-    oms/order_protocol.h
+    oms/i_order_codec.h
+    oms/custom_order_codec.h
 )
 
 target_link_libraries(oms PUBLIC core)
@@ -249,6 +250,13 @@ add_executable(ut_execution
 )
 target_link_libraries(ut_execution PRIVATE core oms risk execution strategy)
 add_test(NAME ut_execution COMMAND ut_execution)
+
+# 订单协议 codec(V5 解耦): IOrderCodec 接口 + CustomOrderCodec 编解码往返/校验
+add_executable(ut_order_codec
+    tests/unit/test_order_codec.cpp
+)
+target_link_libraries(ut_order_codec PRIVATE core oms)
+add_test(NAME ut_order_codec COMMAND ut_order_codec)
 
 # SPMC 多消费者广播: 多个策略从通道 A 消费同一批成交
 add_executable(ut_spmc_strategies

@@ -2,7 +2,7 @@
 
 #include "strategy/base/signal.h"
 #include "oms/order_manager.h"
-#include "oms/order_protocol.h"
+#include "oms/i_order_codec.h"
 #include "risk/risk_manager.h"
 #include "core/net/i_market_data_sender.h"
 
@@ -17,9 +17,12 @@
 //   即满强度下单 base_qty，半强度下 base_qty 的一半；NONE 不下单。
 //
 // 发送模式：
-//   - 接了 sender(IMarketDataSender)：订单序列化后真实发送，成交回报经 on_order_fill
+//   - 接了 sender(IMarketDataSender)：订单经 codec 序列化后真实发送，成交回报经 on_order_fill
 //     从交易所返回驱动 OMS/Risk(真实闭环)。
 //   - 未接 sender：退回进程内模拟成交(单测验证业务逻辑用，不涉及网络)。
+//
+// 协议解耦(V5): 订单字节经 IOrderCodec 编码, 业务逻辑只依赖内部 Order。
+// 换协议(自定义 'O'/'F' → OUCH 4.2)只换 codec, 本类零改动。
 //
 // 线程安全：submit_signal(下单线程)与 on_order_fill(回报线程)并发调用，
 // OMS/Risk 内部容器非线程安全，访问统一串行化(单互斥锁)。
@@ -31,6 +34,7 @@ public:
     // 配置
     void set_base_qty(uint64_t qty) { base_qty_ = qty; }
     void set_sender(IMarketDataSender* sender) { sender_ = sender; }
+    void set_codec(IOrderCodec* codec) { codec_ = codec; }
 
     // 提交一个策略信号，返回订单 id。无信号(side NONE)/无价格 → 0(不下单)。
     // 风控拒绝 → 订单登记为 REJECTED，返回其 id。
@@ -52,7 +56,7 @@ public:
         order.quantity    = qty;
         order.timestamp   = sig.timestamp;
 
-        uint8_t buf[kOrderMsgLen];
+        uint8_t buf[256];   // 订单帧缓冲(最大协议帧长, 实际以 codec order_msg_len 为准)
         uint64_t id;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -65,9 +69,14 @@ public:
                 // 发送在锁内: IoUringSender 内部是 SPSCByteRing 非线程安全,
                 // 分簿后多 worker 并发 submit_signal → 锁内串行化 send。
                 // 下单频率万级, io_uring SQE 提交非阻塞, 锁内可接受。
-                encode_order(order, buf);
-                ssize_t r = sender_->send(buf, kOrderMsgLen);
-                if (r != (ssize_t)kOrderMsgLen)
+                if (!codec_) { order_manager_.on_reject(id); return id; }
+                size_t out_len = 0;
+                if (!codec_->encode_order(order, buf, sizeof(buf), out_len)) {
+                    order_manager_.on_reject(id);         // 编码失败
+                    return id;
+                }
+                ssize_t r = sender_->send(buf, out_len);
+                if (r != (ssize_t)out_len)
                     order_manager_.on_reject(id);         // 发送失败
                 // 发送成功：保持 PENDING，等交易所成交回报
             } else {
@@ -93,6 +102,7 @@ private:
     OrderManager& order_manager_;
     RiskManager&  risk_manager_;
     IMarketDataSender* sender_ = nullptr;
+    IOrderCodec* codec_ = nullptr;   // 协议编解码(内部 Order ↔ 协议字节)
     uint64_t base_qty_ = 100;   // 满强度基准下单量(股)
     std::mutex mtx_;
 };

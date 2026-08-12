@@ -1,5 +1,6 @@
 #include "core/ipc/flow_control.h"
-#include "oms/order_protocol.h"
+#include "oms/custom_order_codec.h"
+#include "oms/i_order_codec.h"
 
 #include <atomic>
 #include <cstdio>
@@ -75,8 +76,9 @@ static void usage() {
 // ── 模拟交易所线程 ──
 // 理想状态：收到订单立即全额成交，回报发回交易系统的成交回报端口。
 // 回报端口来源: 有共享内存→读 fc->order_ret_port; 无共享内存(--no-shm)→参数 ret_port。
-// 定长协议见 oms/order_protocol.h。
+// V5 协议解耦: 订单字节经 IOrderCodec 编解码, 与 trader 用同一 codec 保证协议一致。
 static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
+                             const IOrderCodec& codec,
                              std::atomic<bool>& stop,
                              std::atomic<uint64_t>& orders_received) {
     int osock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -100,15 +102,16 @@ static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
         ssize_t n = recvfrom(osock, buf, sizeof(buf), 0,
                              reinterpret_cast<sockaddr*>(&from), &flen);
         if (n < 0) continue;   // 超时(无订单)
-        if (n < (ssize_t)kOrderMsgLen || buf[0] != kMsgOrder) continue;
 
         Order o{};
-        if (!decode_order(buf, static_cast<size_t>(n), o)) continue;
+        if (!codec.decode_order(buf, static_cast<size_t>(n), o)) continue;
         ++orders_received;
 
         // 理想状态：全额成交，按订单价回报
-        uint8_t fill[kFillMsgLen];
-        encode_fill(o.order_id, o.quantity, o.price, fill);
+        uint8_t fill[256];
+        size_t fill_len = 0;
+        if (!codec.encode_fill(o.order_id, o.quantity, o.price, fill, sizeof(fill), fill_len))
+            continue;
 
         uint64_t rp = (fc != nullptr)
             ? fc->order_ret_port.load(std::memory_order_acquire) : ret_port;
@@ -117,7 +120,7 @@ static void run_sim_exchange(int order_port, FlowControl* fc, uint16_t ret_port,
         ret.sin_family = AF_INET;
         ret.sin_port   = htons(static_cast<uint16_t>(rp));
         inet_pton(AF_INET, "127.0.0.1", &ret.sin_addr);
-        sendto(osock, fill, kFillMsgLen, 0,
+        sendto(osock, fill, fill_len, 0,
                reinterpret_cast<sockaddr*>(&ret), sizeof(ret));
     }
     close(osock);
@@ -170,10 +173,12 @@ int main(int argc, char* argv[]) {
     inet_pton(AF_INET, cfg.host, &addr.sin_addr);
 
     // ── 模拟交易所线程：收订单、立即回全额成交 ──
+    // V5 协议解耦: codec 与 trader 侧一致(默认自定义 'O'/'F' 协议)。
+    CustomOrderCodec order_codec;
     std::atomic<bool> order_stop{false};
     std::atomic<uint64_t> orders_received{0};
     std::thread sim_exchange(run_sim_exchange, cfg.order_port, fc,
-                             cfg.order_ret_port,
+                             cfg.order_ret_port, std::cref(order_codec),
                              std::ref(order_stop), std::ref(orders_received));
 
     // ── 等待 NX-Trader 就绪（--no-shm 时直接发，无握手）──

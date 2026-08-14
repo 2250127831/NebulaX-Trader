@@ -102,11 +102,17 @@ NebulaX-Trader 希望通过工程实践探索完整交易链路中的性能优�
 
 # 项目整体架构
 
-## 目标架构
+## 当前架构（V5）
+
+![NebulaX-Trader 架构图](docs/images/NebulaX-Trader 架构图.png)
+
+## 演进历程
+
+### 目标架构
 
 ![目标架构图](docs/images/目标架构图.png)
 
-## V1 架构
+### V1 架构
 
 ![V1架构图](docs/images/V1架构图.png)
 
@@ -136,6 +142,7 @@ NebulaX-Trader
 │   ├── benchmark/                        # 性能测试报告
 │   │   └── trader_benchmark_usage.md      # 压测客户端使用说明
 │   └── images/
+│       ├── NebulaX-Trader 架构图.png       # 当前架构（V5）
 │       ├── V1架构图.png
 │       └── 目标架构图.png
 ├── scripts/                              # 工具脚本

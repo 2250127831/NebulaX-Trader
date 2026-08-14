@@ -43,21 +43,24 @@ order_book:
   workers: 4
 
 strategy:
-  # 主策略（定方向）
-  # volume_breakout : 成交量突破
-  # trend           : 趋势跟踪（需多根K线）
-  # momentum        : 动量（需多根K线）
-  primary: volume_breakout
+  # 启用的策略组合（编译期绑定, 启动期固定; 按序对应槽）
+  # 支持: ofi（订单流失衡） / obi（盘口失衡）; 空列表 = 仅收行情不交易
+  strategies: [ofi, obi]
 
-  # 成交量突破参数
+  # 主策略（须在 strategies 中; 决定下单标的/seq, 不单独定方向）
+  primary: ofi
+
+  # 各策略投票权重（加权净投票定方向; 未列缺省 1.0）
+  weights: {ofi: 1.0, obi: 0.6}
+
+  # 净投票阈值: 净信号 > 阈值→买, < -阈值→卖, 区间内观望。0 = 任一策略有信号即下（宽松）
+  vote_threshold: 0.0
+
+  # 成交量突破参数（volume_breakout 接入白名单时启用）
   vol_window: 100
   vol_threshold: 5000
 
-  # 从策略（定强度）
-  use_obi: true
-  use_ofi: true
-
-  # 低频主策略的 K线聚合（每 N 笔成交一根，与时间无关）
+  # K线策略参数（kline 策略接入白名单时启用, 每 N 笔成交一根, 与时间无关）
   kline_ticks: 10
 
 risk:

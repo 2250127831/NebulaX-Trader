@@ -9,12 +9,18 @@
 // 直接消费逐笔成交(tick)。当前价突破最近 N 笔的高点 → 上破 → BUY；
 // 跌破低点 → 下破 → SELL。
 // 真正的 tick 消费者，用于验证 SPMC 多消费者广播。
-class PriceBreakoutStrategy : public Strategy {
+class PriceBreakoutStrategy : public StrategyT<PriceBreakoutStrategy> {
 public:
     explicit PriceBreakoutStrategy(size_t window = 50)
         : window_(window) {}
 
-    void on_event(const MarketEvent& ev) override {
+    // 框架统一入口(CRTP): 只消费成交事件, 不需要 BookContext(仅转发)。
+    void on_market(const MarketEvent& ev, const BookContext& ctx) {
+        (void)ctx;
+        on_event(ev);
+    }
+
+    void on_event(const MarketEvent& ev) {
         if (ev.type != MarketEvent::Type::TRADE &&
             ev.type != MarketEvent::Type::EXECUTE) return;
         int64_t price = ev.trade.price;
@@ -52,7 +58,7 @@ public:
         if (prices_.size() > window_) prices_.pop_front();
     }
 
-    Signal signal() const override {
+    Signal signal() const {
         return Signal{.side = current_, .locate = locate_,
                       .price = last_price_, .timestamp = last_ts_,
                       .strength = strength_};

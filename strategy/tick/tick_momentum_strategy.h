@@ -10,12 +10,18 @@
 //   下行动量 → SELL
 // 用 VWAP(成交量加权均价)表示近期/较早价格，避免单笔噪音。
 // 真正的 tick 消费者，用于验证 SPMC 多消费者广播。
-class TickMomentumStrategy : public Strategy {
+class TickMomentumStrategy : public StrategyT<TickMomentumStrategy> {
 public:
     explicit TickMomentumStrategy(size_t window = 20, int64_t threshold = 10)
         : window_(window), threshold_(threshold) {}
 
-    void on_event(const MarketEvent& ev) override {
+    // 框架统一入口(CRTP): 只消费成交事件, 不需要 BookContext(仅转发)。
+    void on_market(const MarketEvent& ev, const BookContext& ctx) {
+        (void)ctx;
+        on_event(ev);
+    }
+
+    void on_event(const MarketEvent& ev) {
         if (ev.type != MarketEvent::Type::TRADE &&
             ev.type != MarketEvent::Type::EXECUTE) return;
         int64_t price = ev.trade.price;
@@ -64,7 +70,7 @@ public:
         }
     }
 
-    Signal signal() const override {
+    Signal signal() const {
         return Signal{.side = current_, .locate = locate_,
                       .price = last_price_, .timestamp = last_ts_,
                       .strength = strength_};

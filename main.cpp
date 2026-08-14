@@ -40,17 +40,23 @@
 #include "oms/i_order_codec.h"
 #include "oms/ouch_order_codec.h"
 #include "risk/risk_manager.h"
+#include "strategy/base/arbitrate.h"
 #include "strategy/base/strategy.h"
 #include "strategy/tick/order_book_imbalance_strategy.h"
 #include "strategy/tick/order_flow_imbalance_strategy.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <thread>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <sys/mman.h>
@@ -107,12 +113,18 @@ struct SignalSlot {
 // 下单节奏(V1.5 定稿): 方向翻转 → 必下; 方向不变 → 强度相对上次下单跳变 ≥ 阈值才再下。
 static constexpr int64_t kStrengthStep = 500;   // 千分比定点(500 = 5% 满强度)
 
-// ── 单 book_worker: 自己的簿/策略/信号槽 + 独立仲裁 ──
+// ── 单 book_worker: 自己的簿/策略列表/信号槽 + 独立仲裁 ──
+// 模板化: Strategies 编译期绑定(CRTP 策略, 无虚调用), 每策略一个信号槽。
+// 仲裁契约: 全部策略信号同向(非 NONE)才下单, 以 slot0 = primary 的 locate/strength/seq 为准。
+template <class... Strategies>
 struct BookWorker {
     OrderBookConsumer obc;                    // 自己关心的标的簿(共享池/索引)
-    OrderBookImbalanceStrategy obi;
-    OrderFlowImbalanceStrategy ofi;
-    SignalSlot sig_ofi, sig_obi;              // 自己标的的信号槽
+    std::tuple<Strategies...> strategies_;    // 策略列表(编译期绑定)
+    std::array<SignalSlot, sizeof...(Strategies)> slots_;   // 每策略一个信号槽
+    // 仲裁运行时配置(init 从 cfg.strategy 解析): 各策略权重(万分比) + 主策略索引 + 净投票阈值
+    std::array<int64_t, sizeof...(Strategies)> weight_bp_{};
+    size_t primary_idx_ = 0;
+    int64_t threshold_bp_ = 0;
     std::atomic<OrderSide> last_order_side{OrderSide::NONE};
     std::atomic<int64_t> last_order_str{-1};
     size_t arb_sample_cnt = 0;                // 本线程私有, 非原子安全
@@ -129,40 +141,54 @@ struct BookWorker {
     void init(ExecutionEngine* e, RiskManager* r, const Config* c,
               std::atomic<size_t>* tc, std::atomic<size_t>* be) {
         ex = e; rm = r; cfg = c; trade_count = tc; book_events = be;
+        // 仲裁运行时配置: 权重按策略名对应槽(未列缺省 1.0 = 10000), primary 索引, 净投票阈值
+        const auto& st = c->strategy.strategies;
+        for (size_t i = 0; i < sizeof...(Strategies) && i < st.size(); ++i) {
+            auto it = c->strategy.weights_bp.find(st[i]);
+            weight_bp_[i] = (it != c->strategy.weights_bp.end()) ? it->second : 10000;
+            if (st[i] == c->strategy.primary) primary_idx_ = i;
+        }
+        threshold_bp_ = c->strategy.vote_threshold_bp;
     }
 
-    // 统一仲裁: 读本 worker 两信号槽, 同向才下。独立仲裁 → 时序天然正确(决策5)。
+    // 统一仲裁: 加权净投票定方向(可配置权重/主策略/阈值), 独立仲裁 → 时序天然正确(决策5)。
     // 下单节奏: 方向翻转必下; 方向不变仅强度跳变 ≥ 阈值才下(last_order_str 是
     // 上次下单时强度, 保证"强→弱"不回补)。
     void arbitrate() {
         // [LensX 级别3] 仲裁函数起点/终点: 抽中才打(同一次调用内局部变量保证成对)。
         bool arb_sample = (arb_sample_cnt++ % lensx::kSample == 0);
         if (arb_sample) lensx::mark_arb_start();
-        OrderSide so = sig_ofi.side.load(std::memory_order_acquire);
-        OrderSide sb = sig_obi.side.load(std::memory_order_acquire);
-        // 仲裁: 两信号同向才下(OFI/OBI)。V1.5 删 TD 后仲裁即两信号。
-        bool ok = (so != OrderSide::NONE && so == sb);
-        if (ok) {
-            // 用 OFI 方向(方向一致时任一方向都成立, 取 OFI)
-            uint64_t locate = sig_ofi.locate.load(std::memory_order_acquire);
-            int64_t strength = sig_ofi.strength.load(std::memory_order_acquire);
+        // 构造净投票输入(槽 → ArbSignal), 调纯函数决策
+        ArbSignal sigs[sizeof...(Strategies) > 0 ? sizeof...(Strategies) : 1];
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            sigs[i].side     = slots_[i].side.load(std::memory_order_acquire);
+            sigs[i].locate   = slots_[i].locate.load(std::memory_order_acquire);
+            sigs[i].strength = slots_[i].strength.load(std::memory_order_acquire);
+            sigs[i].seq      = slots_[i].seq.load(std::memory_order_acquire);
+        }
+        ArbDecision d = arbitrate_decide(sigs, slots_.size(),
+                                         weight_bp_.data(), primary_idx_, threshold_bp_);
+        if (d.act) {
+            OrderSide dir = d.dir;
+            uint64_t locate = d.locate;
+            int64_t strength = d.strength;
             uint64_t pos = rm->position(locate);
-            bool blocked = (so == OrderSide::BUY && pos >= cfg->risk.max_position) ||
-                           (so == OrderSide::SELL && pos == 0);
+            bool blocked = (dir == OrderSide::BUY && pos >= cfg->risk.max_position) ||
+                           (dir == OrderSide::SELL && pos == 0);
             // 下单触发(强度阈值触发): 方向翻转必下; 方向不变仅强度跳变 ≥ 阈值才下。
             int64_t last_str = last_order_str.load();
-            bool fresh_dir  = (so != last_order_side.load());
+            bool fresh_dir  = (dir != last_order_side.load());
             bool strength_ge = (strength >= last_str + kStrengthStep);
             if (!blocked && (fresh_dir || strength_ge)) {
-                // [LensX 级别4] 下单决策→执行完毕(key=sig_ofi.seq 信号触发seq, 抽样)。
+                // [LensX 级别4] 下单决策→执行完毕(key=primary.seq 信号触发seq, 抽样)。
                 // 抽样判断在调用点(抽中才调), 避免 uprobe 每次命中拖垮吞吐。
-                uint64_t order_seq = sig_ofi.seq.load(std::memory_order_acquire);
+                uint64_t order_seq = d.seq;
                 if (order_seq % lensx::kSample == 0) lensx::mark_order_start(order_seq);
-                Signal decision{.side = so, .locate = locate,
+                Signal decision{.side = dir, .locate = locate,
                                 .price = 0, .timestamp = 0, .strength = strength};
                 uint64_t oid = ex->submit_signal(decision, 1);
                 if (oid != 0) {
-                    last_order_side.store(so);
+                    last_order_side.store(dir);
                     last_order_str.store(strength);
                 }
                 if (order_seq % lensx::kSample == 0) lensx::mark_order_end(order_seq);
@@ -171,7 +197,7 @@ struct BookWorker {
         if (arb_sample) lensx::mark_arb_end();
     }
 
-    // 处理一个归属本 worker 的事件: 重建簿 → OFI/OBI 信号 → 仲裁下单。
+    // 处理一个归属本 worker 的事件: 重建簿 → BookContext → 逐策略信号 → 仲裁下单。
     void process(const MarketEvent& ev) {
         // [LensX 消息级] 处理起点。每条消息仅 owner worker 打一次
         // (抽样配对 alloc→process 1:1, 勿在每个 worker 的 pop 处都打)。
@@ -182,47 +208,55 @@ struct BookWorker {
         obc.on_event(ev);
         book_events->fetch_add(1, std::memory_order_relaxed);
         const OrderBook* book = obc.book(ev.locate);
-        // V5 盯市: 盘口有效时喂中间价给风控(回撤按盯市净值计算)
-        if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
-            rm->mark(ev.locate, (book->best_bid() + book->best_ask()) / 2);
+        // 框架算一次 BookContext(方向 + BBO + 现价), 各策略共享, 避免每策略查簿。
+        BookContext ctx;
+        ctx.book = book;
+        ctx.seq = ev.seq_id;
+        if (book && book->best_bid() >= 0 && book->best_ask() >= 0) {
+            ctx.bid = book->best_bid(); ctx.bid_vol = book->best_bid_volume();
+            ctx.ask = book->best_ask(); ctx.ask_vol = book->best_ask_volume();
+            ctx.mid = (ctx.bid + ctx.ask) / 2;
+        }
         // 方向：A/U 自带 side；D/X/E 查簿
-        OrderSide side = OrderSide::NONE;
         if (ev.type == MarketEvent::Type::ADD ||
             ev.type == MarketEvent::Type::REPLACE) {
-            side = ev.order.side;
+            ctx.side = ev.order.side;
         } else if (book) {
             if (ev.type == MarketEvent::Type::TRADE ||
                 ev.type == MarketEvent::Type::EXECUTE)
-                side = book->side_of(ev.trade.order_ref);
+                ctx.side = book->side_of(ev.trade.order_ref);
             else
-                side = book->side_of(ev.order.order_ref);
+                ctx.side = book->side_of(ev.order.order_ref);
         }
-        if (side != OrderSide::NONE && cfg->strategy.use_ofi) {
-            ofi.on_event(ev, side);
-            if (book && book->best_bid() >= 0 && book->best_ask() >= 0)
-                ofi.set_last_price((book->best_bid() + book->best_ask()) / 2);
-        }
-        if (book && cfg->strategy.use_obi) {
-            obi.on_book(ev.locate, book->best_bid(), book->best_bid_volume(),
-                        book->best_ask(), book->best_ask_volume(), ev.timestamp);
-        }
+        // V5 盯市: 盘口有效时喂中间价给风控(回撤按盯市净值计算)
+        if (ctx.bid >= 0 && ctx.ask >= 0)
+            rm->mark(ev.locate, ctx.mid);
+        // 逐策略 on_market(方向/盘口门控由策略内部保证) + 信号 → 原子槽
+        feed(ev, ctx, std::index_sequence_for<Strategies...>{});
+        arbitrate();   // 写完各策略信号, 检查是否齐 → 仲裁下单
+    }
 
-        // 更新信号槽(arbitrate 读): OFI/OBI 信号 → 原子槽, 带触发 seq
-        if (cfg->strategy.use_ofi) {
-            Signal s = ofi.signal();
-            sig_ofi.side.store(s.side, std::memory_order_release);
-            sig_ofi.locate.store(s.locate, std::memory_order_release);
-            sig_ofi.strength.store(s.strength, std::memory_order_release);
-            sig_ofi.seq.store(ev.seq_id, std::memory_order_release);
-        }
-        if (cfg->strategy.use_obi) {
-            Signal s = obi.signal();
-            sig_obi.side.store(s.side, std::memory_order_release);
-            sig_obi.locate.store(s.locate, std::memory_order_release);
-            sig_obi.strength.store(s.strength, std::memory_order_release);
-            sig_obi.seq.store(ev.seq_id, std::memory_order_release);
-        }
-        arbitrate();   // 写完 OFI/OBI 信号, 检查是否齐 → 仲裁下单
+    // 编译期展开: 每策略 on_market + signal → 对应槽(无虚调用, CRTP 内联)。
+    template <size_t... Is>
+    void feed(const MarketEvent& ev, const BookContext& ctx, std::index_sequence<Is...>) {
+        (feed_one<Is>(ev, ctx), ...);
+    }
+    template <size_t I>
+    void feed_one(const MarketEvent& ev, const BookContext& ctx) {
+        std::get<I>(strategies_).on_market(ev, ctx);
+        Signal s = std::get<I>(strategies_).signal();
+        slots_[I].side.store(s.side, std::memory_order_release);
+        slots_[I].locate.store(s.locate, std::memory_order_release);
+        slots_[I].strength.store(s.strength, std::memory_order_release);
+        slots_[I].seq.store(ev.seq_id, std::memory_order_release);
+    }
+
+    // 读第 i 个槽的当前信号(汇总/查询用; slot0 = primary)。
+    Signal slot_signal(size_t i) const {
+        return Signal{.side = slots_[i].side.load(std::memory_order_acquire),
+                      .locate = slots_[i].locate.load(std::memory_order_acquire),
+                      .price = 0, .timestamp = 0,
+                      .strength = slots_[i].strength.load(std::memory_order_acquire)};
     }
 };
 
@@ -260,28 +294,37 @@ static std::unique_ptr<IMarketDataReceiver> make_receiver(const MarketConfig& m)
     return std::make_unique<IoUringReceiver>(m.port);   // 默认 io_uring
 }
 
-int main(int argc, char* argv[]) {
+// ── 策略组合 → 模板实例化 ──
+using OFI = OrderFlowImbalanceStrategy;
+using OBI = OrderBookImbalanceStrategy;
+
+// 运行主体模板: 按编译期绑定的策略组合实例化 BookWorker<Strategies...>。
+// 启动期由 config.strategy.strategies 白名单 dispatch 到具体组合(不运行时插拔)。
+template <class... Strategies>
+int run_strategies(const Config& cfg, bool no_shm) {
     pin_cpu(kPinIdle);   // 主线程低频(配置/汇总), 与 fill 共享 P 核 9
-    // ── 解析参数 + 加载配置 ──
-    std::string config_path = "config/default.yaml";
-    bool no_shm = false;
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) config_path = argv[++i];
-        else if (strcmp(argv[i], "--no-shm") == 0) no_shm = true;
-        else { usage(argv[0]); return 1; }
-    }
-    Config cfg;
-    try {
-        cfg = ConfigLoader::load(config_path);
-    } catch (const std::exception& e) {
-        printf("配置加载失败: %s\n", e.what());
+
+    // 校验主策略在启用列表中(否则 primary 索引回退 slot0 是静默错误)
+    if (!cfg.strategy.strategies.empty() &&
+        std::find(cfg.strategy.strategies.begin(), cfg.strategy.strategies.end(),
+                  cfg.strategy.primary) == cfg.strategy.strategies.end()) {
+        fprintf(stderr, "主策略 %s 不在启用的策略列表(须是 strategies 之一)\n",
+                cfg.strategy.primary.c_str());
         return 1;
     }
 
+    // 打印启用的策略名
+    std::string strat_names;
+    for (const auto& n : cfg.strategy.strategies) {
+        if (!strat_names.empty()) strat_names += "+";
+        strat_names += n;
+    }
+    if (strat_names.empty()) strat_names = "(空)";
+
     printf("NebulaX-Trader v0.1.0\n");
-    printf("  网络后端: %s  行情端口: %u  模拟交易所收单: %u  回报: %u  主策略: %s\n",
+    printf("  网络后端: %s  行情端口: %u  模拟交易所收单: %u  回报: %u  策略: %s\n",
            cfg.market.backend.c_str(), cfg.market.port, cfg.execution.order_port,
-           cfg.execution.order_ret_port, cfg.strategy.primary.c_str());
+           cfg.execution.order_ret_port, strat_names.c_str());
 
     // ── 清理共享内存残留（避免复用旧计数器）──
     if (!no_shm) shm_unlink(FLOW_SHM_PATH);
@@ -367,10 +410,10 @@ int main(int argc, char* argv[]) {
     OrderPool shared_pool(cfg.order_book.pool_slots);
     OrderMap  shared_index(cfg.order_book.pool_slots);
     // BookWorker 含引用成员(OrderBookConsumer)不可移动 → unique_ptr 规避 vector 重分配。
-    std::vector<std::unique_ptr<BookWorker>> bws;
+    std::vector<std::unique_ptr<BookWorker<Strategies...>>> bws;
     bws.reserve(nworkers);
     for (size_t i = 0; i < nworkers; ++i)
-        bws.emplace_back(std::make_unique<BookWorker>(shared_pool, shared_index));
+        bws.emplace_back(std::make_unique<BookWorker<Strategies...>>(shared_pool, shared_index));
 
     // ── 交易侧：风控 + OMS + 执行引擎 ──
     OrderManager om;
@@ -673,19 +716,32 @@ int main(int argc, char* argv[]) {
     printf("\n=== 运行汇总 ===\n");
     printf("成交事件:   %zu\n", trade_count.load());
     printf("事件处理:   %zu  (book_workers=%zu)\n", book_events.load(), nworkers);
-    for (size_t i = 0; i < nworkers; ++i)
-        printf("  worker%zu: 处理=%llu 注册=%llu  OFI=%lld信号=%d  OBI信号=%d\n",
+    for (size_t i = 0; i < nworkers; ++i) {
+        Signal s0 = bws[i]->slot_signal(0);   // slot0 = primary
+        int64_t ofi_val = 0;
+        bool slot0_is_ofi = false;
+        if constexpr (sizeof...(Strategies) >= 1) {
+            using S0 = std::decay_t<decltype(std::get<0>(bws[i]->strategies_))>;
+            if constexpr (std::is_same_v<S0, OFI>) {   // 窗口值仅 OFI 有, 编译期特判
+                ofi_val = std::get<0>(bws[i]->strategies_).ofi();
+                slot0_is_ofi = true;
+            }
+        }
+        printf("  worker%zu: 处理=%llu 注册=%llu  primary信号=%d 强度=%lld%s",
                i, (unsigned long long)cared_counts[i].load(),
                (unsigned long long)registered_counts[i].load(),
-               (long long)bws[i]->ofi.ofi(), (int)bws[i]->ofi.signal().side,
-               (int)bws[i]->obi.signal().side);
+               (int)s0.side, (long long)s0.strength,
+               slot0_is_ofi ? " OFI窗口=" : "");
+        if (slot0_is_ofi) printf("%lld", (long long)ofi_val);
+        printf("\n");
+    }
     printf("订单:       %zu  成交=%zu 风控拒=%zu\n",
            om.order_count(),
            om.count_by_status(OrderStatus::FILLED),
            om.count_by_status(OrderStatus::REJECTED));
-    printf("持仓(各worker信号标的):");
+    printf("持仓(各worker primary信号标的):");
     for (size_t i = 0; i < nworkers; ++i)
-        printf(" w%zu=%llu", i, (unsigned long long)rm.position(bws[i]->ofi.signal().locate));
+        printf(" w%zu=%llu", i, (unsigned long long)rm.position(bws[i]->slot_signal(0).locate));
     printf("  已实现盈亏=%lld 分\n", (long long)rm.realized_pnl());
     // V5 盯市回撤统计
     printf("  盯市净值=%lld 分 峰值=%lld 分 回撤=%lld 分 暂停=%s 平仓=%s\n",
@@ -696,4 +752,38 @@ int main(int argc, char* argv[]) {
 
     if (fc) munmap(fc, sizeof(FlowControl));
     return 0;
+}
+
+// ── 入口: 解析参数 + 加载配置 → 按策略组合 dispatch 到编译期实例化 ──
+int main(int argc, char* argv[]) {
+    std::string config_path = "config/default.yaml";
+    bool no_shm = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) config_path = argv[++i];
+        else if (strcmp(argv[i], "--no-shm") == 0) no_shm = true;
+        else { usage(argv[0]); return 1; }
+    }
+    Config cfg;
+    try {
+        cfg = ConfigLoader::load(config_path);
+    } catch (const std::exception& e) {
+        printf("配置加载失败: %s\n", e.what());
+        return 1;
+    }
+
+    // 白名单组合(不运行时插拔; 槽序 = 仲裁优先级, 首个为 primary)。
+    // 空列表 = 仅收行情不交易(替代旧 use_*:false 的"全停"语义)。
+    const auto& st = cfg.strategy.strategies;
+    if (st == std::vector<std::string>{"ofi", "obi"})
+        return run_strategies<OFI, OBI>(cfg, no_shm);
+    if (st == std::vector<std::string>{"ofi"})
+        return run_strategies<OFI>(cfg, no_shm);
+    if (st == std::vector<std::string>{"obi"})
+        return run_strategies<OBI>(cfg, no_shm);
+    if (st.empty()) {
+        fprintf(stderr, "策略列表为空，仅收行情不交易\n");
+        return run_strategies<>(cfg, no_shm);
+    }
+    fprintf(stderr, "不支持的策略组合(支持 [ofi,obi]/[ofi]/[obi]/[])\n");
+    return 1;
 }

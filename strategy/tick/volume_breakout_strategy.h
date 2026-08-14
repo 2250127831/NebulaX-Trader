@@ -9,12 +9,18 @@
 //   累计量 > threshold → BUY(放量上攻)
 //   否则 → NONE
 // 这是真正的 tick 消费者，用于验证 SPMC 多消费者广播。
-class VolumeBreakoutStrategy : public Strategy {
+class VolumeBreakoutStrategy : public StrategyT<VolumeBreakoutStrategy> {
 public:
     explicit VolumeBreakoutStrategy(size_t window = 100, uint64_t threshold = 5000)
         : window_(window), threshold_(threshold) {}
 
-    void on_event(const MarketEvent& ev) override {
+    // 框架统一入口(CRTP): 只消费成交事件, 不需要 BookContext(仅转发)。
+    void on_market(const MarketEvent& ev, const BookContext& ctx) {
+        (void)ctx;
+        on_event(ev);
+    }
+
+    void on_event(const MarketEvent& ev) {
         if (ev.type != MarketEvent::Type::TRADE &&
             ev.type != MarketEvent::Type::EXECUTE) return;
         locate_ = ev.locate;
@@ -41,7 +47,7 @@ public:
         }
     }
 
-    Signal signal() const override {
+    Signal signal() const {
         return Signal{.side = current_, .locate = locate_,
                       .price = last_price_, .timestamp = last_ts_,
                       .strength = strength_};

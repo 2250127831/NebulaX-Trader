@@ -15,10 +15,16 @@
 //
 // 高频策略：消费逐笔委托(通道B)，不看成交，比成交更早感知方向。
 // 依赖 OrderBookConsumer 重建的盘口，通过 on_book() 喂盘口快照。
-class OrderBookImbalanceStrategy : public Strategy {
+class OrderBookImbalanceStrategy : public StrategyT<OrderBookImbalanceStrategy> {
 public:
     explicit OrderBookImbalanceStrategy(double threshold = 0.3)
         : threshold_(threshold) {}
+
+    // 框架统一入口(CRTP): 盘口无效(book==nullptr)时不喂, 避免用无效 BBO 污染信号。
+    void on_market(const MarketEvent& ev, const BookContext& ctx) {
+        if (ctx.book)
+            on_book(ev.locate, ctx.bid, ctx.bid_vol, ctx.ask, ctx.ask_vol, ev.timestamp);
+    }
 
     // 盘口变化时由消费者调用：喂当前盘口快照
     void on_book(uint64_t locate, int64_t bid_price, uint64_t bid_vol,
@@ -47,13 +53,13 @@ public:
     }
 
     // 逐笔委托事件（通道B）：由消费者重建盘口后调 on_book
-    void on_event(const MarketEvent& ev) override {
+    void on_event(const MarketEvent& ev) {
         // 本策略不做事件内联处理，盘口重建由 OrderBookConsumer 完成，
         // 消费方在重建后调用 on_book()。这里保留接口契约。
         (void)ev;
     }
 
-    Signal signal() const override {
+    Signal signal() const {
         return Signal{.side = current_, .locate = locate_,
                       .price = (current_ == OrderSide::BUY) ? bid_price_ : ask_price_,
                       .timestamp = timestamp_, .strength = strength_};

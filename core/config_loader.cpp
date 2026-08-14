@@ -35,12 +35,19 @@ Config ConfigLoader::load(const std::string& path) {
 
     // strategy
     if (auto n = root["strategy"]) {
-        if (n["primary"])         cfg.strategy.primary         = n["primary"].as<std::string>();
-        if (n["vol_window"])      cfg.strategy.vol_window      = n["vol_window"].as<size_t>();
-        if (n["vol_threshold"])   cfg.strategy.vol_threshold   = n["vol_threshold"].as<uint64_t>();
-        if (n["use_obi"])         cfg.strategy.use_obi         = n["use_obi"].as<bool>();
-        if (n["use_ofi"])         cfg.strategy.use_ofi         = n["use_ofi"].as<bool>();
-        if (n["kline_ticks"])     cfg.strategy.kline_ticks     = n["kline_ticks"].as<size_t>();
+        if (n["strategies"])      cfg.strategy.strategies     = n["strategies"].as<std::vector<std::string>>();
+        if (n["primary"])         cfg.strategy.primary        = n["primary"].as<std::string>();
+        if (n["weights"]) {   // yaml double → 万分比定点整数(10000=1.0)
+            for (const auto& kv : n["weights"]) {
+                std::string name = kv.first.as<std::string>();
+                double w = kv.second.as<double>();
+                cfg.strategy.weights_bp[name] = (int64_t)(w * 10000.0);
+            }
+        }
+        if (n["vote_threshold"]) cfg.strategy.vote_threshold_bp = (int64_t)(n["vote_threshold"].as<double>() * 10000.0);
+        if (n["vol_window"])     cfg.strategy.vol_window       = n["vol_window"].as<size_t>();
+        if (n["vol_threshold"])  cfg.strategy.vol_threshold    = n["vol_threshold"].as<uint64_t>();
+        if (n["kline_ticks"])    cfg.strategy.kline_ticks      = n["kline_ticks"].as<size_t>();
     }
 
     // risk

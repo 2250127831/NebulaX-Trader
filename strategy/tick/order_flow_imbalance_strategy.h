@@ -31,10 +31,16 @@
 // 强度：窗口 OFI 超阈值后分段线性(净流越强强度越高, 到 kSaturate×threshold 封顶满)。
 //   连续化强度让"同方向强度爬坡"可被仲裁的强度阈值触发捕捉(牛市多次加仓);
 //   旧公式(超阈值即满)导致同向强度恒满, 强度触发退化为只方向翻转。
-class OrderFlowImbalanceStrategy : public Strategy {
+class OrderFlowImbalanceStrategy : public StrategyT<OrderFlowImbalanceStrategy> {
 public:
     explicit OrderFlowImbalanceStrategy(int64_t threshold = 500)
         : threshold_(threshold) {}
+
+    // 框架统一入口(CRTP): 方向为 NONE(查不到)的事件不喂窗口, 盘口有效才更新现价。
+    void on_market(const MarketEvent& ev, const BookContext& ctx) {
+        if (ctx.side != OrderSide::NONE) on_event(ev, ctx.side);
+        if (ctx.bid >= 0 && ctx.ask >= 0) set_last_price(ctx.mid);
+    }
 
     // 强度饱和倍数: 窗口净流达到 kSaturate×threshold 时强度封顶满。
     //   2 = 两倍阈值满强度。调大 → 强度更平缓(更多中间档, 触发更频繁);
@@ -92,13 +98,13 @@ public:
         }
     }
 
-    // Strategy 接口：单参 on_event（OFI 需要方向，走上面的双参重载）
-    void on_event(const MarketEvent& ev) override {
+    // 单参 on_event（历史测试/调用方用；方向由框架查好经双参/on_market 传入）
+    void on_event(const MarketEvent& ev) {
         // 无法确定方向：查簿逻辑在消费侧完成，这里不实现
         (void)ev;
     }
 
-    Signal signal() const override {
+    Signal signal() const {
         return Signal{.side = current_, .locate = locate_,
                       .price = last_price_, .timestamp = last_ts_,
                       .strength = strength_};

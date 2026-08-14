@@ -1,8 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
-#include <cstdint>
 
 // ── 行情配置 ──
 struct MarketConfig {
@@ -30,15 +31,17 @@ struct OrderBookConfig {
 
 // ── 策略配置 ──
 struct StrategyConfig {
-    // 主策略：成交量突破 / 趋势 / 动量
-    std::string primary = "volume_breakout";
-    size_t      vol_window = 100;       // 量突窗口
+    // 启用的策略组合(编译期绑定, 启动期固定; 按序对应槽)。
+    // 白名单: ofi / obi; 空列表 = 仅收行情不交易。
+    std::vector<std::string> strategies = {"ofi", "obi"};
+    std::string primary = "ofi";                 // 主策略(须在 strategies 中, 启动校验);
+                                                 // 决定下单标的/seq, 不单独定方向。
+    std::map<std::string, int64_t> weights_bp;   // 策略名 → 投票权重(万分比, 10000=1.0);
+                                                 // 未列缺省 1.0(公平投票)。
+    int64_t vote_threshold_bp = 0;               // 净投票阈值(万分比); 0 = 任一策略有信号即按净信号下。
+    size_t      vol_window = 100;       // 量突窗口(volume_breakout 参数, 接入白名单时启用)
     uint64_t    vol_threshold = 5000;   // 量突阈值
-    // 从策略
-    bool        use_obi = true;         // 盘口失衡
-    bool        use_ofi = true;         // 订单流失衡
-    // 低频主策略候选（K线）
-    size_t      kline_ticks = 10;       // 每 N 笔成交一根 K线
+    size_t      kline_ticks = 10;       // 每 N 笔成交一根 K线(K线策略参数)
 };
 
 // ── 风控配置 ──

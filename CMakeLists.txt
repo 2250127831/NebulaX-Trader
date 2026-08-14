@@ -240,6 +240,18 @@ add_executable(ut_ofi
 target_link_libraries(ut_ofi PRIVATE core strategy)
 add_test(NAME ut_ofi COMMAND ut_ofi)
 
+add_executable(ut_strategy_contract
+    tests/unit/test_strategy_contract.cpp
+)
+target_link_libraries(ut_strategy_contract PRIVATE core strategy)
+add_test(NAME ut_strategy_contract COMMAND ut_strategy_contract)
+
+add_executable(ut_arbitrate
+    tests/unit/test_arbitrate.cpp
+)
+target_link_libraries(ut_arbitrate PRIVATE core strategy)
+add_test(NAME ut_arbitrate COMMAND ut_arbitrate)
+
 add_executable(ut_signal_combiner
     tests/unit/test_signal_combiner.cpp
 )
